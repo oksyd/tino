@@ -130,7 +130,7 @@ expand-env
 
 Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 
-- `--write-restrict`, `--write-allow`, `--write-preset`, `--write-no-dev`
+- `--write-restrict`, `--write-allow`, `--write-preset` require Landlock ABI v3+ (Linux 6.2+) to cover file truncation; `--write-no-dev` modifies these restrictions
 - `--restrict-warn-only` applies to all requested Landlock access restrictions
 - `--bind-tcp-allow`, `--connect-tcp-allow` require Landlock ABI v4+
 - `--device-ioctl-allow` requires Landlock ABI v5+
@@ -140,10 +140,16 @@ Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 `--write-allow` and `--write-preset` enable write restriction automatically.
 Use `--write-restrict` when you want write restriction without adding writable
 paths. `/dev` remains writable unless `--write-no-dev` is set.
+On older kernels, requested write restrictions prevent the child from starting.
+With `--restrict-warn-only`, tino reports the unsupported restriction and starts
+the child without applying the requested Landlock restrictions.
 
 Use absolute filesystem paths for write and device `ioctl` allowlists.
 `--exec-allow` accepts either an absolute path or a command name resolved from
 `PATH`.
+Command names allow matching executable files across `PATH`, including fallback
+candidates when an earlier match cannot run. Use an absolute path to allow a
+specific file.
 
 Example:
 

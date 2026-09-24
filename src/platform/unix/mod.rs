@@ -29,14 +29,14 @@ use child::{
     resolve_command_args, spawn_child,
 };
 use landlock::LandlockConfig;
-use signals::{send_signal, setup_signal_delivery};
+use signals::{ChildReapingRestore, send_signal, setup_signal_delivery};
+#[cfg(test)]
+use sys::Signal;
 use sys::{
     Errno, Pid, PollFd, PollFlags, PollTimeout, SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM,
     SIGTTIN, SIGTTOU, SigSet, SignalFd, WaitStatus, poll_fds, process_group_exists,
     waitpid_any_nohang,
 };
-#[cfg(test)]
-use sys::Signal;
 
 type ExitCodeRemap = super::ExitCodeRemap;
 
@@ -71,6 +71,9 @@ pub(super) struct LandlockExplain {
 pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     let (previous_mask, mut signal_fd) = setup_signal_delivery()?;
     let _signal_mask_restore = SignalMaskRestore::new(&previous_mask);
+    // Reset inherited SIG_IGN/SA_NOCLDWAIT before fork, and restore the caller's
+    // disposition before unblocking signals when supervision ends.
+    let _child_reaping_restore = ChildReapingRestore::enable()?;
     let child_pdeath = pdeath_signal(&cli)?;
     let effective_cmd =
         resolve_command_args(&cli.cmd, cli.expand_env).context("prepare child command")?;
@@ -116,8 +119,8 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         }
     }
 
-    let (cmd_c, argv_c) = prepare_resolved_command(&effective_cmd)
-        .context("prepare child command")?;
+    let (cmd_c, argv_c) =
+        prepare_resolved_command(&effective_cmd).context("prepare child command")?;
     let _parent_prctl = configure_parent_prctl(&cli)?;
     let child_pid = spawn_child(
         &previous_mask,
@@ -252,9 +255,7 @@ fn build_landlock_config_for_args(
         insert_landlock_writable_dir(&mut unique, path, false)?;
     }
 
-    if exec_requested
-        && let Some(program) = effective_cmd.first()
-    {
+    if exec_requested && let Some(program) = effective_cmd.first() {
         insert_landlock_main_exec_path(&mut exec_allow, program)?;
     }
 
@@ -369,10 +370,7 @@ fn insert_landlock_writable_dir(
     Ok(())
 }
 
-fn insert_landlock_exec_path(
-    unique: &mut BTreeSet<Vec<u8>>,
-    raw: &str,
-) -> Result<()> {
+fn insert_landlock_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
     let mut visited = BTreeSet::new();
     insert_landlock_exec_path_inner(unique, raw, &mut visited, ExecAllowMode::Strict)
 }
@@ -388,6 +386,13 @@ fn insert_landlock_exec_path_inner(
     visited: &mut BTreeSet<PathBuf>,
     mode: ExecAllowMode,
 ) -> Result<()> {
+    if !raw.contains('/') {
+        let candidates = executable_paths_in_search_path(raw, &exec_search_path(), None);
+        if candidates.is_empty() && mode == ExecAllowMode::Strict {
+            bail!("resolve exec allow path '{}' from PATH", escape_str(raw));
+        }
+        return insert_exec_search_candidates(unique, candidates, visited);
+    }
     let resolved = match mode {
         ExecAllowMode::Strict => Some(resolve_exec_allow_path(raw)?),
         ExecAllowMode::Auto => resolve_main_exec_allow_path(raw)?,
@@ -396,6 +401,25 @@ fn insert_landlock_exec_path_inner(
         return Ok(());
     };
     insert_resolved_exec_path(unique, resolved, visited, mode)
+}
+
+fn insert_exec_search_candidates(
+    unique: &mut BTreeSet<Vec<u8>>,
+    candidates: Vec<PathBuf>,
+    visited: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    // execvp can continue after EACCES or a missing script/ELF interpreter.
+    // Authorize each matching file and its dependencies, without granting the
+    // containing directories or rejecting an earlier, unusable candidate.
+    for path in candidates {
+        let Some(resolved) = resolve_exec_allow_path_from_path(path, ExecAllowMode::Auto)? else {
+            continue;
+        };
+        if is_executable_file(&resolved.metadata) {
+            insert_resolved_exec_path(unique, resolved, visited, ExecAllowMode::Auto)?;
+        }
+    }
+    Ok(())
 }
 
 fn insert_resolved_exec_path(
@@ -415,6 +439,9 @@ fn insert_resolved_exec_path(
             match interpreter {
                 ExecInterpreter::Candidate(path) => {
                     insert_landlock_exec_path_candidate(unique, path, visited, mode)?;
+                }
+                ExecInterpreter::SearchCandidates(paths) => {
+                    insert_exec_search_candidates(unique, paths, visited)?;
                 }
                 ExecInterpreter::Missing { .. } | ExecInterpreter::Unresolved { .. }
                     if mode == ExecAllowMode::Auto => {}
@@ -471,26 +498,22 @@ fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
     metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
-fn insert_landlock_device_ioctl_path(
-    unique: &mut BTreeSet<Vec<u8>>,
-    raw: &str,
-) -> Result<()> {
+fn insert_landlock_device_ioctl_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
-    let canonical = canonicalize_allow_path(raw, false, "device ioctl allow path")?
-        .ok_or_else(|| {
+    let canonical =
+        canonicalize_allow_path(raw, false, "device ioctl allow path")?.ok_or_else(|| {
             Error::msg(format!(
                 "device ioctl allow path '{}' could not be resolved",
                 escape_path(Path::new(raw))
             ))
         })?;
-    let metadata = std::fs::metadata(&canonical)
-        .with_context(|| {
-            format!(
-                "inspect device ioctl allow path '{}'",
-                escape_path(&canonical)
-            )
-        })?;
+    let metadata = std::fs::metadata(&canonical).with_context(|| {
+        format!(
+            "inspect device ioctl allow path '{}'",
+            escape_path(&canonical)
+        )
+    })?;
     let file_type = metadata.file_type();
     if !metadata.is_dir() && !file_type.is_char_device() && !file_type.is_block_device() {
         bail!(
@@ -502,11 +525,7 @@ fn insert_landlock_device_ioctl_path(
     Ok(())
 }
 
-fn canonicalize_allow_path(
-    raw: &str,
-    allow_missing: bool,
-    kind: &str,
-) -> Result<Option<PathBuf>> {
+fn canonicalize_allow_path(raw: &str, allow_missing: bool, kind: &str) -> Result<Option<PathBuf>> {
     let path = PathBuf::from(raw);
     match std::fs::canonicalize(&path) {
         Ok(canonical) => Ok(Some(canonical)),
@@ -546,12 +565,8 @@ fn resolve_main_exec_allow_path(raw: &str) -> Result<Option<ResolvedExecAllowPat
 }
 
 fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<ResolvedExecAllowPath> {
-    let canonical = std::fs::canonicalize(resolved).with_context(|| {
-        format!(
-            "canonicalize exec allow path '{}'",
-            escape_path(resolved)
-        )
-    })?;
+    let canonical = std::fs::canonicalize(resolved)
+        .with_context(|| format!("canonicalize exec allow path '{}'", escape_path(resolved)))?;
     let metadata = std::fs::metadata(&canonical)
         .with_context(|| format!("inspect exec allow path '{}'", escape_path(&canonical)))?;
     if !metadata.is_dir() && !metadata.is_file() {
@@ -624,10 +639,7 @@ fn resolve_exec_allow_path_candidate(raw: &str) -> Result<PathBuf> {
         return Ok(candidate);
     }
 
-    bail!(
-        "resolve exec allow path '{}' from PATH",
-        escape_str(raw)
-    )
+    bail!("resolve exec allow path '{}' from PATH", escape_str(raw))
 }
 
 fn find_executable_in_search_path(
@@ -635,8 +647,19 @@ fn find_executable_in_search_path(
     search_path: &OsString,
     relative_to: Option<&Path>,
 ) -> Option<PathBuf> {
+    executable_paths_in_search_path(raw, search_path, relative_to)
+        .into_iter()
+        .next()
+}
+
+fn executable_paths_in_search_path(
+    raw: &str,
+    search_path: &OsString,
+    relative_to: Option<&Path>,
+) -> Vec<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
+    let mut candidates = Vec::new();
     for dir in std::env::split_paths(&search_path) {
         let candidate = if dir.is_relative() {
             relative_to.map_or_else(|| dir.join(raw), |base| base.join(&dir).join(raw))
@@ -647,10 +670,15 @@ fn find_executable_in_search_path(
             continue;
         };
         if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            return Some(candidate);
+            let Ok(path) = CString::new(candidate.as_os_str().as_bytes()) else {
+                continue;
+            };
+            if sys::check_executable_access(&path).is_ok() {
+                candidates.push(candidate);
+            }
         }
     }
-    None
+    candidates
 }
 
 fn exec_search_path() -> OsString {
@@ -708,15 +736,15 @@ fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
             ElfInterpreter::Interpreter(path) => vec![ExecInterpreter::Candidate(path)],
             ElfInterpreter::NoInterpreter => Vec::new(),
             ElfInterpreter::Invalid => {
-                vec![ExecInterpreter::Candidate(
-                    PathBuf::from(EXECVP_FALLBACK_SHELL),
-                )]
+                vec![ExecInterpreter::Candidate(PathBuf::from(
+                    EXECVP_FALLBACK_SHELL,
+                ))]
             }
         });
     }
-    Ok(vec![ExecInterpreter::Candidate(
-        PathBuf::from(EXECVP_FALLBACK_SHELL),
-    )])
+    Ok(vec![ExecInterpreter::Candidate(PathBuf::from(
+        EXECVP_FALLBACK_SHELL,
+    ))])
 }
 
 const EXEC_PROBE_PREFIX_LEN: usize = 4096;
@@ -754,23 +782,28 @@ fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
 fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
     parse_shebang_exec_interpreters(bytes)
         .into_iter()
-        .map(ExecInterpreter::into_display_path)
+        .flat_map(ExecInterpreter::into_display_paths)
         .collect()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ExecInterpreter {
     Candidate(PathBuf),
+    SearchCandidates(Vec<PathBuf>),
     Missing { command: String },
     Unresolved { reason: &'static str },
 }
 
 impl ExecInterpreter {
-    fn into_display_path(self) -> String {
+    fn into_display_paths(self) -> Vec<String> {
         match self {
-            Self::Candidate(path) => path.to_string_lossy().into_owned(),
-            Self::Missing { command } => command,
-            Self::Unresolved { reason } => reason.to_owned(),
+            Self::Candidate(path) => vec![path.to_string_lossy().into_owned()],
+            Self::SearchCandidates(paths) => paths
+                .into_iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect(),
+            Self::Missing { command } => vec![command],
+            Self::Unresolved { reason } => vec![reason.to_owned()],
         }
     }
 }
@@ -782,9 +815,9 @@ fn parse_shebang_exec_interpreters(bytes: &[u8]) -> Vec<ExecInterpreter> {
     let parts = match shebang {
         Shebang::Parts(parts) => parts,
         Shebang::ExecvpFallback => {
-            return vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL),
-            )];
+            return vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL,
+            ))];
         }
     };
 
@@ -847,9 +880,7 @@ fn parse_shebang(bytes: &[u8]) -> Option<Shebang<'_>> {
 
 fn parse_shebang_line(line: &[u8]) -> Shebang<'_> {
     let line = trim_shebang_space_end(line);
-    let interpreter_start = line
-        .iter()
-        .position(|byte| !is_shebang_space(*byte));
+    let interpreter_start = line.iter().position(|byte| !is_shebang_space(*byte));
     let Some(interpreter_start) = interpreter_start else {
         return Shebang::ExecvpFallback;
     };
@@ -992,23 +1023,12 @@ impl EnvShebangCommand {
             };
             return ExecInterpreter::Candidate(candidate);
         }
-        if let Some(search_path) = &self.search_path
-            && let Some(candidate) =
-                find_executable_in_search_path(&self.command, search_path, self.chdir.as_deref())
-        {
-            return ExecInterpreter::Candidate(candidate);
-        }
-        if self.search_path.is_some() {
-            return ExecInterpreter::Missing {
-                command: self.command.clone(),
-            };
-        }
-        if let Some(chdir) = self.chdir.as_deref() {
-            let search_path = exec_search_path();
-            if let Some(candidate) =
-                find_executable_in_search_path(&self.command, &search_path, Some(chdir))
-            {
-                return ExecInterpreter::Candidate(candidate);
+        if self.search_path.is_some() || self.chdir.is_some() {
+            let search_path = self.search_path.clone().unwrap_or_else(exec_search_path);
+            let candidates =
+                executable_paths_in_search_path(&self.command, &search_path, self.chdir.as_deref());
+            if !candidates.is_empty() {
+                return ExecInterpreter::SearchCandidates(candidates);
             }
             return ExecInterpreter::Missing {
                 command: self.command.clone(),
@@ -1230,26 +1250,14 @@ fn env_shebang_command_fields(
             return env_shebang_command_after_double_dash(&fields[idx..], search_path, chdir);
         }
         if options_allowed && arg.starts_with("--") {
-            match env_long_option_action(
-                arg,
-                fields,
-                &mut idx,
-                &mut search_path,
-                &mut chdir,
-            ) {
+            match env_long_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
             }
         }
         if options_allowed && arg.starts_with('-') {
-            match env_short_option_action(
-                arg,
-                fields,
-                &mut idx,
-                &mut search_path,
-                &mut chdir,
-            ) {
+            match env_short_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
@@ -1592,8 +1600,7 @@ fn env_named_signal_number(signal: &str) -> Option<libc::c_int> {
 }
 
 fn valid_env_signal_number(number: libc::c_int) -> bool {
-    (1..=libc::SIGSYS).contains(&number)
-        || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&number)
+    (1..=libc::SIGSYS).contains(&number) || (libc::SIGRTMIN()..=libc::SIGRTMAX()).contains(&number)
 }
 
 fn env_realtime_signal_number(signal: &str) -> Option<libc::c_int> {
@@ -1811,12 +1818,7 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
         return if elf_read_error_is_invalid(&err) {
             Ok(ElfInterpreter::Invalid)
         } else {
-            Err(err).with_context(|| {
-                format!(
-                    "read ELF program headers '{}'",
-                    escape_path(path)
-                )
-            })
+            Err(err).with_context(|| format!("read ELF program headers '{}'", escape_path(path)))
         };
     }
 
@@ -1863,21 +1865,11 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
             )
         } else {
             (
-                match read_u64_usize(
-                    &phdrs,
-                    start + 8,
-                    little_endian,
-                    "ELF segment offset",
-                ) {
+                match read_u64_usize(&phdrs, start + 8, little_endian, "ELF segment offset") {
                     Ok(value) => value,
                     Err(_) => return Ok(ElfInterpreter::Invalid),
                 },
-                match read_u64_usize(
-                    &phdrs,
-                    start + 32,
-                    little_endian,
-                    "ELF segment size",
-                ) {
+                match read_u64_usize(&phdrs, start + 32, little_endian, "ELF segment size") {
                     Ok(value) => value,
                     Err(_) => return Ok(ElfInterpreter::Invalid),
                 },
@@ -1919,9 +1911,7 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
             return if elf_read_error_is_invalid(&err) {
                 Ok(ElfInterpreter::Invalid)
             } else {
-                Err(err).with_context(|| {
-                    format!("read ELF interpreter '{}'", escape_path(path))
-                })
+                Err(err).with_context(|| format!("read ELF interpreter '{}'", escape_path(path)))
             };
         }
         let Some(interpreter_path) = elf_interpreter_path(&interp) else {
@@ -1940,16 +1930,10 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
 }
 
 fn elf_load_segment_is_valid(filesz: usize, vaddr: u64, memsz: u64) -> bool {
-    u64::try_from(filesz).is_ok_and(|filesz| filesz <= memsz)
-        && vaddr.checked_add(memsz).is_some()
+    u64::try_from(filesz).is_ok_and(|filesz| filesz <= memsz) && vaddr.checked_add(memsz).is_some()
 }
 
-fn elf_entry_is_in_executable_load_segment(
-    entry: u64,
-    vaddr: u64,
-    memsz: u64,
-    flags: u32,
-) -> bool {
+fn elf_entry_is_in_executable_load_segment(entry: u64, vaddr: u64, memsz: u64, flags: u32) -> bool {
     const PF_X: u32 = 1;
 
     flags & PF_X != 0
@@ -1981,9 +1965,9 @@ fn elf_file_range_is_valid(offset: usize, filesz: usize, file_len: u64) -> bool 
 fn read_exact_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
     let mut len = 0usize;
     while len < buf.len() {
-        let read_offset = offset.checked_add(len as u64).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow")
-        })?;
+        let read_offset = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow"))?;
         match file.read_at(&mut buf[len..], read_offset) {
             Ok(0) => {
                 return Err(io::Error::new(
@@ -2508,8 +2492,7 @@ mod tests {
 
     impl Drop for PathEnvGuard {
         fn drop(&mut self) {
-            let original =
-                std::mem::replace(&mut self.original, ExecSearchPathOverride::Inherit);
+            let original = std::mem::replace(&mut self.original, ExecSearchPathOverride::Inherit);
             TEST_EXEC_SEARCH_PATH.with(|path| {
                 let _ = path.replace(original);
             });
@@ -2735,7 +2718,10 @@ mod tests {
             .map(|path| path.as_c_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(allowed, vec![target.canonicalize().unwrap().display().to_string()]);
+        assert_eq!(
+            allowed,
+            vec![target.canonicalize().unwrap().display().to_string()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2893,7 +2879,10 @@ mod tests {
             .map(|path| path.as_c_str().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
 
-        assert_eq!(allowed, vec![root.canonicalize().unwrap().display().to_string()]);
+        assert_eq!(
+            allowed,
+            vec![root.canonicalize().unwrap().display().to_string()]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2906,10 +2895,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tino-resolved-exec-{}-{nanos}",
-            std::process::id(),
-        ));
+        let root = std::env::temp_dir()
+            .join(format!("tino-resolved-exec-{}-{nanos}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create resolved exec test dir");
         let program = root.join("program");
@@ -2960,7 +2947,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let missing = format!("definitely-missing-tino-interpreter-{}-{nanos}", std::process::id());
+        let missing = format!(
+            "definitely-missing-tino-interpreter-{}-{nanos}",
+            std::process::id()
+        );
         let root = std::env::temp_dir().join(format!(
             "tino-main-exec-missing-env-{}-{nanos}",
             std::process::id(),
@@ -3309,7 +3299,13 @@ mod tests {
             "script itself must still be auto-allowed: {allowed:?}"
         );
         assert!(
-            !allowed.contains(&interpreter_dir.canonicalize().unwrap().display().to_string()),
+            !allowed.contains(
+                &interpreter_dir
+                    .canonicalize()
+                    .unwrap()
+                    .display()
+                    .to_string()
+            ),
             "directory shebang interpreter must not broaden exec allowlist: {allowed:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -3404,7 +3400,8 @@ mod tests {
         let auto = resolve_main_exec_allow_path_candidate("sh")
             .expect("resolve main exec candidate")
             .expect("default exec path should find sh");
-        let explicit = resolve_exec_allow_path_candidate("sh").expect("resolve explicit exec allow");
+        let explicit =
+            resolve_exec_allow_path_candidate("sh").expect("resolve explicit exec allow");
 
         assert_eq!(auto.file_name().and_then(|name| name.to_str()), Some("sh"));
         assert_eq!(
@@ -3430,11 +3427,8 @@ mod tests {
     fn explicit_exec_allow_missing_path_escapes_control_bytes() {
         let mut unique = BTreeSet::new();
 
-        let err = insert_landlock_exec_path(
-            &mut unique,
-            "/definitely/missing/tino-\u{1b}[31m",
-        )
-        .expect_err("explicit missing exec allow path must fail");
+        let err = insert_landlock_exec_path(&mut unique, "/definitely/missing/tino-\u{1b}[31m")
+            .expect_err("explicit missing exec allow path must fail");
         let message = format!("{err:#}");
 
         assert!(message.contains(r"\x1b"));
@@ -3494,7 +3488,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let missing = format!("definitely-missing-tino-interpreter-{}-{nanos}", std::process::id());
+        let missing = format!(
+            "definitely-missing-tino-interpreter-{}-{nanos}",
+            std::process::id()
+        );
         let root = std::env::temp_dir().join(format!(
             "tino-explicit-exec-missing-env-{}-{nanos}",
             std::process::id(),
@@ -3933,9 +3930,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3967,9 +3964,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4001,9 +3998,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4038,9 +4035,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4075,9 +4072,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4152,14 +4149,13 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod non-native ELF fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect non-native ELF fallback");
+        let interpreters = detect_exec_interpreters(&path).expect("detect non-native ELF fallback");
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4193,9 +4189,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4227,9 +4223,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4261,9 +4257,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4299,9 +4295,9 @@ mod tests {
 
         assert_eq!(
             interpreters,
-            vec![ExecInterpreter::Candidate(
-                PathBuf::from(EXECVP_FALLBACK_SHELL)
-            )]
+            vec![ExecInterpreter::Candidate(PathBuf::from(
+                EXECVP_FALLBACK_SHELL
+            ))]
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4335,7 +4331,10 @@ mod tests {
         let interpreters =
             detect_exec_interpreters(&path).expect("detect kernel-buffer-limited shebang");
 
-        assert_eq!(interpreters, vec![ExecInterpreter::Candidate("/bin/sh".into())]);
+        assert_eq!(
+            interpreters,
+            vec![ExecInterpreter::Candidate("/bin/sh".into())]
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4406,10 +4405,8 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tino-crlf-shebang-{}-{nanos}",
-            std::process::id(),
-        ));
+        let root =
+            std::env::temp_dir().join(format!("tino-crlf-shebang-{}-{nanos}", std::process::id(),));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create CRLF shebang test dir");
         let path = root.join("script");
@@ -4450,8 +4447,7 @@ mod tests {
         let file = File::open(&path).expect("open offset overflow fixture");
         let mut buf = [0u8; 2];
 
-        let err =
-            read_exact_file_at(&file, &mut buf, u64::MAX).expect_err("offset must not wrap");
+        let err = read_exact_file_at(&file, &mut buf, u64::MAX).expect_err("offset must not wrap");
 
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(&root);
@@ -4479,10 +4475,7 @@ mod tests {
             parse_shebang_exec_paths(b"#!/bin/sh\r\n"),
             vec!["/bin/sh\r"]
         );
-        assert_eq!(
-            parse_shebang_exec_paths(b"#! \t\r\n"),
-            vec!["./\r"]
-        );
+        assert_eq!(parse_shebang_exec_paths(b"#! \t\r\n"), vec!["./\r"]);
     }
 
     #[test]
@@ -4669,13 +4662,17 @@ mod tests {
             vec!["/usr/bin/env"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br"#!/usr/bin/env -S --chdir '' /bin/sh
-"),
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S --chdir '' /bin/sh
+"
+            ),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br"#!/usr/bin/env -S -C '' /bin/sh
-"),
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S -C '' /bin/sh
+"
+            ),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
@@ -4766,13 +4763,17 @@ mod tests {
             vec!["/usr/bin/env", "/bin/sh"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br"#!/usr/bin/env -S python3\_-u
-"),
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S python3\_-u
+"
+            ),
             vec!["/usr/bin/env", "python3"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br#"#!/usr/bin/env -S "/bin/with\_space" -e
-"#),
+            parse_shebang_exec_paths(
+                br#"#!/usr/bin/env -S "/bin/with\_space" -e
+"#
+            ),
             vec!["/usr/bin/env", "/bin/with space"]
         );
     }
@@ -4866,23 +4867,31 @@ mod tests {
     #[test]
     fn parse_shebang_exec_paths_ignores_invalid_env_split_string() {
         assert_eq!(
-            parse_shebang_exec_paths(br"#!/usr/bin/env -S /bin/sh\ x
-"),
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S /bin/sh\ x
+"
+            ),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br#"#!/usr/bin/env -S "/bin/sh -e
-"#),
+            parse_shebang_exec_paths(
+                br#"#!/usr/bin/env -S "/bin/sh -e
+"#
+            ),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br"#!/usr/bin/env -S # /bin/sh
-"),
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S # /bin/sh
+"
+            ),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
-            parse_shebang_exec_paths(br"#!/usr/bin/env -S $TINO_TEST_ENV_SHEBANG_COMMAND /bin/sh
-"),
+            parse_shebang_exec_paths(
+                br"#!/usr/bin/env -S $TINO_TEST_ENV_SHEBANG_COMMAND /bin/sh
+"
+            ),
             vec!["/usr/bin/env"]
         );
         assert_eq!(
@@ -5009,10 +5018,7 @@ mod tests {
         bytes[4] = 2;
         bytes[5] = 1;
         bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
-        let machine = executable_elf_machines()
-            .first()
-            .copied()
-            .unwrap_or(62);
+        let machine = executable_elf_machines().first().copied().unwrap_or(62);
         bytes[18..20].copy_from_slice(&machine.to_le_bytes());
         bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
         bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
@@ -5040,7 +5046,13 @@ mod tests {
         set_minimal_elf64_load_segment(bytes, 0x0040_0000, 1, 1, 1);
     }
 
-    fn set_minimal_elf64_load_segment(bytes: &mut [u8], vaddr: u64, filesz: u64, memsz: u64, flags: u32) {
+    fn set_minimal_elf64_load_segment(
+        bytes: &mut [u8],
+        vaddr: u64,
+        filesz: u64,
+        memsz: u64,
+        flags: u32,
+    ) {
         let load_ph = 64;
         bytes[24..32].copy_from_slice(&vaddr.to_le_bytes());
         bytes[load_ph..load_ph + 4].copy_from_slice(&1u32.to_le_bytes());

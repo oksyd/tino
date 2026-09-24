@@ -5,8 +5,8 @@ use std::{env, ffi::CString};
 use super::landlock;
 use super::signals;
 use super::sys::{
-    Errno, ForkResult, Pid, SigSet, current_process_id, exec_program, fork_process,
-    parent_process_id, process_group_exists, process_group_of, set_process_group,
+    Errno, ForkResult, Pid, SIGPIPE, SigSet, SignalAction, current_process_id, exec_program,
+    fork_process, parent_process_id, process_group_exists, process_group_of, set_process_group,
 };
 
 #[derive(Default)]
@@ -133,7 +133,8 @@ pub(super) fn prepare_resolved_command(args: &[String]) -> Result<(CString, Vec<
     let argv = args
         .iter()
         .map(|s| {
-            CString::new(s.as_str()).map_err(|_| Error::msg("command argument contains embedded NUL byte"))
+            CString::new(s.as_str())
+                .map_err(|_| Error::msg("command argument contains embedded NUL byte"))
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((program, argv))
@@ -151,8 +152,7 @@ fn expand_command_args(cmd: &[String]) -> Result<Vec<String>> {
 }
 
 fn expand_command_arg(arg: &str) -> Result<String> {
-    expand_command_arg_with_depth(arg, 0)
-        .context("expand environment references in child argument")
+    expand_command_arg_with_depth(arg, 0).context("expand environment references in child argument")
 }
 
 fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
@@ -204,10 +204,7 @@ fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
 fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
     if let Some((name, default)) = split_braced_default(body) {
         if !is_valid_env_name(name) {
-            bail!(
-                "invalid environment variable name '{}'",
-                escape_str(name)
-            );
+            bail!("invalid environment variable name '{}'", escape_str(name));
         }
         resolve_env_value(name, Some(default), depth)
     } else if is_valid_env_name(body) {
@@ -486,6 +483,12 @@ pub(super) fn spawn_child(
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork_process()? } {
         ForkResult::Child => {
+            // Rust ignores SIGPIPE in the supervisor. Do not pass that runtime
+            // policy to the managed program; reset it while signals are blocked.
+            if SignalAction::set_default(SIGPIPE).is_err() {
+                child_write(b"tino: failed to reset SIGPIPE in child\n");
+                unsafe { _exit(1) }
+            }
             if let Some(sig) = child_pdeath
                 && let Err(errno) = set_child_pdeath_signal(sig)
             {
@@ -760,12 +763,7 @@ mod tests {
 
         let mut current = guard.subreaper;
         // SAFETY: pointer references a valid mutable integer for prctl output.
-        let ret = unsafe {
-            libc::prctl(
-                libc::PR_GET_CHILD_SUBREAPER,
-                &raw mut current,
-            )
-        };
+        let ret = unsafe { libc::prctl(libc::PR_GET_CHILD_SUBREAPER, &raw mut current) };
         assert_eq!(
             ret,
             0,
@@ -842,7 +840,12 @@ mod tests {
         // SAFETY: this test controls both fork branches and only performs
         // async-signal-safe libc calls before exiting in forked children.
         let leader = unsafe { libc::fork() };
-        assert_ne!(leader, -1, "fork leader failed: {}", io::Error::last_os_error());
+        assert_ne!(
+            leader,
+            -1,
+            "fork leader failed: {}",
+            io::Error::last_os_error()
+        );
         if leader == 0 {
             // SAFETY: child owns these inherited fds after fork.
             unsafe {
@@ -944,7 +947,9 @@ mod tests {
         let suffix = std::process::id();
         let missing_port = format!("__TINO_TEST_MISSING_PORT_{suffix}__");
         let missing_value = format!("__TINO_TEST_MISSING_VALUE_{suffix}__");
-        let arg = format!("port=${{{missing_port}:-8900}},literal=$${{HOME}},missing=${{{missing_value}}}");
+        let arg = format!(
+            "port=${{{missing_port}:-8900}},literal=$${{HOME}},missing=${{{missing_value}}}"
+        );
 
         let expanded = expand_command_arg(&arg).expect("expand env with defaults and escapes");
 
@@ -953,7 +958,10 @@ mod tests {
 
     #[test]
     fn expand_command_arg_supports_escaped_braces_inside_defaults() {
-        let missing = format!("__TINO_TEST_MISSING_LITERAL_DEFAULT_{}__", std::process::id());
+        let missing = format!(
+            "__TINO_TEST_MISSING_LITERAL_DEFAULT_{}__",
+            std::process::id()
+        );
         let arg = format!("${{{missing}:-x$${{HOME}}y}}");
 
         let expanded = expand_command_arg(&arg).expect("expand escaped default literal");
@@ -963,7 +971,10 @@ mod tests {
 
     #[test]
     fn expand_command_arg_ignores_default_operator_inside_escaped_literal() {
-        let missing = format!("__TINO_TEST_MISSING_LITERAL_OPERATOR_{}__", std::process::id());
+        let missing = format!(
+            "__TINO_TEST_MISSING_LITERAL_OPERATOR_{}__",
+            std::process::id()
+        );
         let arg = format!("${{{missing}:-x$${{HOME:-fallback}}y}}");
 
         let expanded = expand_command_arg(&arg).expect("expand escaped operator literal");

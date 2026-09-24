@@ -1,5 +1,5 @@
 use std::convert::Infallible;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
@@ -143,6 +143,7 @@ pub(super) const SIGFPE: Signal = Signal::SIGFPE;
 pub(super) const SIGILL: Signal = Signal::SIGILL;
 pub(super) const SIGINT: Signal = Signal::SIGINT;
 pub(super) const SIGKILL: Signal = Signal::SIGKILL;
+pub(super) const SIGPIPE: Signal = Signal::SIGPIPE;
 pub(super) const SIGQUIT: Signal = Signal::SIGQUIT;
 pub(super) const SIGSEGV: Signal = Signal::SIGSEGV;
 pub(super) const SIGSYS: Signal = Signal::SIGSYS;
@@ -150,6 +151,31 @@ pub(super) const SIGTERM: Signal = Signal::SIGTERM;
 pub(super) const SIGTRAP: Signal = Signal::SIGTRAP;
 pub(super) const SIGTTIN: Signal = Signal::SIGTTIN;
 pub(super) const SIGTTOU: Signal = Signal::SIGTTOU;
+
+pub(super) struct SignalAction(libc::sigaction);
+
+impl SignalAction {
+    pub(super) fn set_default(signal: Signal) -> Result<Self> {
+        // SAFETY: sigaction is initialized before use; an empty mask and zero flags
+        // also clear SA_NOCLDWAIT/SA_NOCLDSTOP when resetting SIGCHLD.
+        let mut action: libc::sigaction = unsafe { zeroed() };
+        action.sa_sigaction = libc::SIG_DFL;
+        unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+        let mut previous = unsafe { zeroed() };
+        // SAFETY: both pointers refer to valid sigaction storage.
+        errno_unit(unsafe {
+            libc::sigaction(signal as i32, &raw const action, &raw mut previous)
+        })?;
+        Ok(Self(previous))
+    }
+
+    pub(super) fn restore(&self, signal: Signal) -> Result<()> {
+        // SAFETY: the action was captured by sigaction for this signal.
+        errno_unit(unsafe {
+            libc::sigaction(signal as i32, &raw const self.0, std::ptr::null_mut())
+        })
+    }
+}
 
 pub(super) struct SigSet(libc::sigset_t);
 
@@ -184,10 +210,9 @@ impl SigSet {
 
     pub(super) fn thread_set_mask(&self) -> Result<()> {
         // SAFETY: set pointer is valid; null oldset means no previous mask capture.
-        let rc =
-            unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.0, std::ptr::null_mut())
-            };
+        let rc = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.0, std::ptr::null_mut())
+        };
         if rc == 0 {
             Ok(())
         } else {
@@ -373,6 +398,14 @@ pub(super) fn exec_program(
     Err(Errno::last())
 }
 
+pub(super) fn check_executable_access(path: &CStr) -> Result<()> {
+    // SAFETY: path is NUL-terminated. Check the effective credentials used by
+    // execve, rather than accepting execute bits belonging to another user.
+    errno_unit(unsafe {
+        libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS)
+    })
+}
+
 pub(super) fn set_process_group(pid: Pid, pgid: Pid) -> Result<()> {
     // SAFETY: arguments are plain process identifiers forwarded directly to libc.
     errno_unit(unsafe { libc::setpgid(pid.as_raw(), pgid.as_raw()) })
@@ -448,11 +481,7 @@ pub(super) fn process_group_exists(pgid: Pid) -> Result<bool> {
 }
 
 fn errno_unit(rc: libc::c_int) -> Result<()> {
-    if rc == -1 {
-        Err(Errno::last())
-    } else {
-        Ok(())
-    }
+    if rc == -1 { Err(Errno::last()) } else { Ok(()) }
 }
 
 fn errno_pid(rc: libc::pid_t) -> Result<Pid> {

@@ -114,11 +114,9 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
         Err(errno) => return Err(LandlockError::QueryAbi(errno)),
     };
 
-    let handled_access_fs = if config.write_requested {
-        handled_write_access_fs(abi_version)
-    } else {
-        0
-    } | handled_execute_access(!config.exec_allow_paths.is_empty())
+    let handled_writes = handled_write_access_fs(abi_version, config.write_requested)?;
+    let handled_access_fs = handled_writes
+        | handled_execute_access(!config.exec_allow_paths.is_empty())
         | handled_ioctl_access(abi_version, !config.device_ioctl_allow_paths.is_empty())?;
     let handled_access_net = handled_network_access(
         abi_version,
@@ -133,7 +131,7 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
     if handled_access_fs == 0 && handled_access_net == 0 && scoped_access == 0 {
         return Err(LandlockError::NotSupported);
     }
-    let allowed_writes = allowed_write_access_fs(abi_version);
+    let allowed_writes = allowed_write_access_fs(handled_writes);
 
     let ruleset_fd = match create_ruleset(
         abi_version,
@@ -205,8 +203,21 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
     Ok(abi_version)
 }
 
-const fn handled_write_access_fs(abi_version: u32) -> u64 {
-    let mut handled = LANDLOCK_ACCESS_FS_WRITE_FILE
+const fn handled_write_access_fs(
+    abi_version: u32,
+    requested: bool,
+) -> Result<u64, LandlockError<'static>> {
+    if !requested {
+        return Ok(0);
+    }
+    if abi_version < 3 {
+        return Err(LandlockError::AbiTooOld {
+            feature: "filesystem write restrictions",
+            required_abi: 3,
+            current_abi: abi_version,
+        });
+    }
+    Ok(LANDLOCK_ACCESS_FS_WRITE_FILE
         | LANDLOCK_ACCESS_FS_REMOVE_DIR
         | LANDLOCK_ACCESS_FS_REMOVE_FILE
         | LANDLOCK_ACCESS_FS_MAKE_CHAR
@@ -215,19 +226,13 @@ const fn handled_write_access_fs(abi_version: u32) -> u64 {
         | LANDLOCK_ACCESS_FS_MAKE_SOCK
         | LANDLOCK_ACCESS_FS_MAKE_FIFO
         | LANDLOCK_ACCESS_FS_MAKE_BLOCK
-        | LANDLOCK_ACCESS_FS_MAKE_SYM;
-    if abi_version >= 2 {
-        handled |= LANDLOCK_ACCESS_FS_REFER;
-    }
-    if abi_version >= 3 {
-        handled |= LANDLOCK_ACCESS_FS_TRUNCATE;
-    }
-    handled
+        | LANDLOCK_ACCESS_FS_MAKE_SYM
+        | LANDLOCK_ACCESS_FS_REFER
+        | LANDLOCK_ACCESS_FS_TRUNCATE)
 }
 
-const fn allowed_write_access_fs(abi_version: u32) -> u64 {
-    handled_write_access_fs(abi_version)
-        & !(LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_BLOCK)
+const fn allowed_write_access_fs(handled_writes: u64) -> u64 {
+    handled_writes & !(LANDLOCK_ACCESS_FS_MAKE_CHAR | LANDLOCK_ACCESS_FS_MAKE_BLOCK)
 }
 
 const fn handled_execute_access(requested: bool) -> u64 {
@@ -396,7 +401,12 @@ fn add_writable_dir_rule(
 }
 
 fn add_exec_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_EXECUTE, PathRuleKind::Any)
+    add_path_beneath_rule(
+        ruleset_fd,
+        path,
+        LANDLOCK_ACCESS_FS_EXECUTE,
+        PathRuleKind::Any,
+    )
 }
 
 fn add_device_ioctl_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
@@ -420,8 +430,8 @@ fn add_path_beneath_rule(
     allowed_access: u64,
     kind: PathRuleKind,
 ) -> Result<(), LandlockError<'_>> {
-    let path_fd = open_rule_path(path, kind)
-        .map_err(|errno| LandlockError::OpenPath { path, errno })?;
+    let path_fd =
+        open_rule_path(path, kind).map_err(|errno| LandlockError::OpenPath { path, errno })?;
     let path_fd = OwnedFd(path_fd);
     let attr = LandlockPathBeneathAttr {
         allowed_access,
@@ -522,23 +532,26 @@ mod tests {
 
     #[test]
     fn allowed_write_mask_excludes_device_nodes() {
-        let allowed = allowed_write_access_fs(1);
+        let allowed = allowed_write_access_fs(handled_write_access_fs(3, true).unwrap());
         assert_eq!(allowed & LANDLOCK_ACCESS_FS_MAKE_CHAR, 0);
         assert_eq!(allowed & LANDLOCK_ACCESS_FS_MAKE_BLOCK, 0);
         assert_ne!(allowed & LANDLOCK_ACCESS_FS_WRITE_FILE, 0);
     }
 
     #[test]
-    fn handled_mask_includes_refer_and_truncate_by_version() {
-        let v1 = handled_write_access_fs(1);
-        assert_eq!(v1 & LANDLOCK_ACCESS_FS_REFER, 0);
-        assert_eq!(v1 & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
-
-        let v2 = handled_write_access_fs(2);
-        assert_ne!(v2 & LANDLOCK_ACCESS_FS_REFER, 0);
-        assert_eq!(v2 & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
-
-        let v3 = handled_write_access_fs(3);
+    fn write_restrictions_require_truncation_support() {
+        for abi in [1, 2] {
+            assert!(matches!(
+                handled_write_access_fs(abi, true),
+                Err(LandlockError::AbiTooOld {
+                    feature: "filesystem write restrictions",
+                    required_abi: 3,
+                    current_abi,
+                }) if current_abi == abi
+            ));
+            assert_eq!(handled_write_access_fs(abi, false).unwrap(), 0);
+        }
+        let v3 = handled_write_access_fs(3, true).unwrap();
         assert_ne!(v3 & LANDLOCK_ACCESS_FS_REFER, 0);
         assert_ne!(v3 & LANDLOCK_ACCESS_FS_TRUNCATE, 0);
     }

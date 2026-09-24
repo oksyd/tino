@@ -1889,6 +1889,115 @@ fn landlock_exec_restrict_auto_allows_env_shebang_command() {
 }
 
 #[test]
+fn landlock_exec_restrict_preserves_path_fallbacks() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-exec-path-fallback");
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::create_dir_all(&first).expect("create first PATH directory");
+    std::fs::create_dir_all(&second).expect("create second PATH directory");
+    let broken = first.join("probe");
+    let working = second.join("probe");
+    std::fs::write(
+        &broken,
+        format!("#!{}\n", root.join("missing-interpreter").display()),
+    )
+    .expect("write broken PATH candidate");
+    std::fs::write(&working, "#!/bin/sh\nexit 37\n").expect("write working PATH candidate");
+    for file in [&broken, &working] {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod candidate");
+    }
+    let path = std::env::join_paths([&first, &second]).expect("build PATH");
+    for args in [
+        vec!["--", "probe"],
+        vec!["--exec-allow", "/bin/true", "--", "probe"],
+        vec!["--exec-allow", "probe", "--", "/usr/bin/env", "probe"],
+    ] {
+        let output = tino_command()
+            .env("PATH", &path)
+            .args(&args)
+            .output()
+            .expect("run PATH fallback");
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Only the owner permission class applies to an unprivileged file owner.
+    // Other-user execute bits must not make this unreadable file stop lookup.
+    if unsafe { libc::geteuid() } != 0 {
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o041))
+            .expect("make first candidate inaccessible to its owner");
+        let output = tino_command()
+            .env("PATH", &path)
+            .args(["--exec-allow", "/bin/true", "--", "probe"])
+            .output()
+            .expect("run past inaccessible PATH candidate");
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755))
+            .expect("restore missing-interpreter fixture");
+    }
+
+    let script = root.join("env-script");
+    std::fs::write(
+        &script,
+        format!("#!/usr/bin/env -S PATH={} probe\n", path.to_string_lossy()),
+    )
+    .expect("write env PATH script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod env script");
+    let output = tino_command()
+        .arg("--exec-allow")
+        .arg(&script)
+        .arg("--")
+        .arg(&script)
+        .output()
+        .expect("run env PATH fallback");
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let unrelated = second.join("unrelated");
+    std::fs::write(&unrelated, "#!/bin/sh\nexit 77\n").expect("write unrelated program");
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod unrelated program");
+    let output = tino_command()
+        .env("PATH", &path)
+        .args([
+            "--exec-allow",
+            "probe",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec \"$1\"",
+            "sh",
+        ])
+        .arg(&unrelated)
+        .output()
+        .expect("run unlisted program");
+    assert_eq!(
+        output.status.code(),
+        Some(126),
+        "PATH fallback must not allow whole directories"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn landlock_exec_restrict_auto_allows_relative_shebang_interpreter_from_cwd() {
     if !landlock_available() {
         return;
