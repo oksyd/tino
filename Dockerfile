@@ -1,4 +1,4 @@
-FROM rust:1.95.0-slim-trixie AS builder
+FROM rust:1.98.1-slim-trixie AS builder
 
 ARG TARGETARCH
 
