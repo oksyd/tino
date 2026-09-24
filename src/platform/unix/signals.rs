@@ -2,7 +2,7 @@ use super::sys::{
     Errno, Pid, SIGABRT, SIGBUS, SIGCHLD, SIGFPE, SIGILL, SIGSEGV, SIGSYS, SIGTRAP, SigSet, Signal,
     SignalAction, SignalFd, new_signal_fd, send_process_group_signal, send_process_signal,
 };
-use crate::{Context, Result, logging};
+use crate::{Context, Result, bail, logging};
 
 const SIGNALS_EXCLUDED_FROM_SIGNALFD: &[Signal] =
     &[SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS];
@@ -26,6 +26,19 @@ impl Drop for ChildReapingRestore {
 }
 
 pub(super) fn setup_signal_delivery() -> Result<(SigSet, SignalFd)> {
+    // Signal dispositions and child reaping belong to the whole process, while
+    // pthread_sigmask only affects this thread. Reject an unsafe host before
+    // changing either state or forking a child.
+    let tasks = std::fs::read_dir("/proc/self/task")
+        .context("inspect process threads (tino requires procfs mounted at /proc)")?;
+    for (index, task) in tasks.enumerate() {
+        task.context("inspect process thread")?;
+        if index != 0 {
+            bail!(
+                "tino::run requires a single-threaded process; launch the tino binary from a multithreaded host"
+            );
+        }
+    }
     let previous_mask = SigSet::thread_get_mask().context("sigprocmask")?;
     let mut block = SigSet::all();
     for &signal in SIGNALS_EXCLUDED_FROM_SIGNALFD {

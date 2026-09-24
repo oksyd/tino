@@ -155,6 +155,270 @@ fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
 }
 
+fn write_exec_fixture(path: &std::path::Path, text: &str) {
+    std::fs::write(path, text).expect("write executable fixture");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod executable fixture");
+}
+
+fn without_capabilities(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // Even a root CI runner must encounter EACCES on execute-only files. These
+    // calls only reduce the forked launcher's privileges and allocate nothing.
+    unsafe {
+        command.pre_exec(|| {
+            let header = [0x2008_0522u32, 0]; // Linux capability ABI version 3, self.
+            let data = [0u32; 6]; // Two effective/permitted/inheritable triples.
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
+                || libc::syscall(libc::SYS_capset, header.as_ptr(), data.as_ptr()) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn landlock_exec_ignores_unreadable_later_path_candidate() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-unreadable-path");
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::create_dir_all(&first).expect("create first PATH dir");
+    std::fs::create_dir_all(&second).expect("create second PATH dir");
+    write_exec_fixture(&first.join("probe"), "#!/bin/sh\nexit 37\n");
+    let unreadable = second.join("probe");
+    std::fs::copy("/bin/true", &unreadable).expect("copy execute-only binary");
+    std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o111))
+        .expect("remove read permission");
+    let path = std::env::join_paths([&first, &second]).expect("PATH");
+    for args in [
+        vec!["--", "probe"],
+        vec!["--exec-allow", "/bin/true", "--", "probe"],
+        vec!["--exec-allow", "probe", "--", "/usr/bin/env", "probe"],
+    ] {
+        let mut command = tino_command();
+        command.env("PATH", &path).args(&args);
+        without_capabilities(&mut command);
+        let output = command
+            .output()
+            .expect("run past unreadable PATH candidate");
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Explicitly requesting inspection of this file remains an error, proving
+    // the permission fixture is effective even when the runner starts as root.
+    let mut explicit = tino_command();
+    explicit
+        .arg("--exec-allow")
+        .arg(&unreadable)
+        .args(["--", "/bin/true"]);
+    without_capabilities(&mut explicit);
+    let output = explicit
+        .output()
+        .expect("probe unreadable explicit allow path");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("for interpreter discovery"));
+    std::fs::remove_dir_all(root).expect("remove PATH fixtures");
+}
+
+#[test]
+fn landlock_exec_preserves_nested_env_context() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-nested-env");
+    let work = root.join("work");
+    let nested = work.join("nested");
+    std::fs::create_dir_all(&nested).expect("create nested work dir");
+    let start = root.join("start");
+    let runner = work.join("runner");
+    for path in [work.join("helper"), nested.join("helper")] {
+        write_exec_fixture(&path, "#!/bin/sh\nexit 37\n");
+    }
+    let cases = [
+        (
+            format!("#!/usr/bin/env -S PATH={} runner\n", work.display()),
+            "#!/usr/bin/env helper\n",
+        ),
+        (
+            format!(
+                "#!/usr/bin/env -S PATH={} SELECTED=helper runner\n",
+                work.display()
+            ),
+            "#!/usr/bin/env -S ${SELECTED}\n",
+        ),
+        (
+            "#!/usr/bin/env -S -C work ./runner\n".to_owned(),
+            "#!./helper\n",
+        ),
+        (
+            "#!/usr/bin/env -S -C work ./runner\n".to_owned(),
+            "#!/usr/bin/env -S -C nested ./helper\n",
+        ),
+        (
+            "#!/usr/bin/env -S -C work PATH=. runner\n".to_owned(),
+            "#!/usr/bin/env helper\n",
+        ),
+    ];
+    for (outer, inner) in cases {
+        write_exec_fixture(&start, &outer);
+        write_exec_fixture(&runner, inner);
+        for explicit in [
+            None,
+            Some("/bin/true"),
+            Some(start.to_str().expect("fixture path")),
+        ] {
+            let mut command = tino_command();
+            command
+                .current_dir(&root)
+                .env("PATH", "/usr/bin:/bin")
+                .env_remove("SELECTED");
+            if let Some(path) = explicit {
+                command.args(["--exec-allow", path]);
+            }
+            let output = command
+                .arg("--")
+                .arg(&start)
+                .output()
+                .expect("run nested interpreters");
+            assert_eq!(
+                output.status.code(),
+                Some(37),
+                "outer={outer:?}, inner={inner:?}, allow={explicit:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).expect("remove nested env fixtures");
+}
+
+#[test]
+fn landlock_exec_discovers_shared_interpreter_in_each_environment() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-shared-interpreter");
+    let shared = root.join("shared");
+    let first = root.join("first");
+    let second = root.join("second");
+    std::fs::create_dir_all(&first).expect("first env dir");
+    std::fs::create_dir_all(&second).expect("second env dir");
+    write_exec_fixture(&shared, "#!/usr/bin/env helper\n");
+    for (dir, code) in [(&first, 11), (&second, 37)] {
+        write_exec_fixture(
+            &dir.join("probe"),
+            &format!("#!/usr/bin/env -S PATH={} runner\n", dir.display()),
+        );
+        std::os::unix::fs::symlink(&shared, dir.join("runner")).expect("shared runner symlink");
+        write_exec_fixture(&dir.join("helper"), &format!("#!/bin/sh\nexit {code}\n"));
+    }
+    let output = tino_command()
+        .env(
+            "PATH",
+            std::env::join_paths([&first, &second]).expect("PATH"),
+        )
+        .args([
+            "--exec-allow",
+            "probe",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec \"$1\"",
+            "sh",
+        ])
+        .arg(second.join("probe"))
+        .output()
+        .expect("run second shared interpreter context");
+    assert_eq!(
+        output.status.code(),
+        Some(37),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::remove_dir_all(root).expect("remove shared interpreter fixtures");
+}
+
+#[test]
+fn signals_during_group_cleanup_preserve_main_exit_and_are_forwarded() {
+    if !python3_available() {
+        return;
+    }
+    let script = r#"import os, signal, time
+reader, writer = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(reader)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGUSR1, lambda *_: os._exit(0))
+    os.write(writer, b'1')
+    os.close(writer)
+    while True: time.sleep(1)
+else:
+    os.close(writer)
+    os.read(reader, 1)
+    os.close(reader)
+    print(pid, flush=True)
+    os._exit(37)
+"#;
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1] {
+        let mut child = tino_command()
+            .args([
+                "-s",
+                "-g",
+                "-v",
+                "--grace-ms",
+                "5000",
+                "--",
+                "python3",
+                "-c",
+                script,
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cleanup probe");
+        let mut stdout = BufReader::new(child.stdout.take().expect("probe stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read grandchild PID");
+        let grandchild: libc::pid_t = line.trim().parse().expect("grandchild PID");
+        let mut stderr = BufReader::new(child.stderr.take().expect("probe stderr"));
+        loop {
+            line.clear();
+            assert_ne!(stderr.read_line(&mut line).expect("read cleanup log"), 0);
+            if line.contains("sending SIGTERM to PGID") {
+                break;
+            }
+        }
+        // The log marks entry into cleanup, after the main exit is recorded.
+        assert_eq!(unsafe { libc::kill(child.id().cast_signed(), sig) }, 0);
+        let status = wait_child_with_timeout(&mut child, Duration::from_secs(2));
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = unsafe { libc::kill(grandchild, libc::SIGKILL) };
+            let _ = child.wait();
+        }
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(37),
+            "cleanup signal {sig}"
+        );
+        assert!(
+            !process_exists(grandchild),
+            "cleanup must reap the descendant"
+        );
+    }
+}
+
 fn assert_execvp_shell_fallback_reached(label: &str, status: ExitStatus, stderr: &str) {
     assert!(
         !status.success(),

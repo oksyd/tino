@@ -7,7 +7,7 @@ use crate::{
 #[cfg(test)]
 use std::cell::RefCell;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::{CString, OsString},
     fs::File,
     io,
@@ -15,7 +15,6 @@ use std::{
     os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -370,28 +369,87 @@ fn insert_landlock_writable_dir(
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExecContext {
+    environment: BTreeMap<OsString, OsString>,
+    cwd: Option<PathBuf>,
+}
+
+impl ExecContext {
+    fn inherited() -> Self {
+        #[allow(unused_mut)]
+        let mut environment: BTreeMap<OsString, OsString> = std::env::vars_os().collect();
+        #[cfg(test)]
+        match test_exec_search_path_override() {
+            ExecSearchPathOverride::Inherit => {}
+            ExecSearchPathOverride::Value(path) => {
+                environment.insert("PATH".into(), path);
+            }
+            ExecSearchPathOverride::Default => {
+                environment.remove(std::ffi::OsStr::new("PATH"));
+            }
+        }
+        Self {
+            environment,
+            cwd: None,
+        }
+    }
+
+    fn search_path(&self) -> OsString {
+        self.environment
+            .get(std::ffi::OsStr::new("PATH"))
+            .cloned()
+            .unwrap_or_else(default_exec_search_path)
+    }
+
+    fn path(&self, path: &Path) -> PathBuf {
+        if path.is_relative()
+            && let Some(cwd) = &self.cwd
+        {
+            return cwd.join(path);
+        }
+        path.to_path_buf()
+    }
+}
+
+type ExecVisits = BTreeSet<(PathBuf, ExecContext)>;
+
 fn insert_landlock_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
     let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(unique, raw, &mut visited, ExecAllowMode::Strict)
+    insert_landlock_exec_path_inner(
+        unique,
+        raw,
+        &mut visited,
+        ExecAllowMode::Strict,
+        &ExecContext::inherited(),
+    )
 }
 
 fn insert_landlock_main_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
     let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(unique, raw, &mut visited, ExecAllowMode::Auto)
+    insert_landlock_exec_path_inner(
+        unique,
+        raw,
+        &mut visited,
+        ExecAllowMode::Auto,
+        &ExecContext::inherited(),
+    )
 }
 
 fn insert_landlock_exec_path_inner(
     unique: &mut BTreeSet<Vec<u8>>,
     raw: &str,
-    visited: &mut BTreeSet<PathBuf>,
+    visited: &mut ExecVisits,
     mode: ExecAllowMode,
+    context: &ExecContext,
 ) -> Result<()> {
     if !raw.contains('/') {
-        let candidates = executable_paths_in_search_path(raw, &exec_search_path(), None);
+        let candidates =
+            executable_paths_in_search_path(raw, &context.search_path(), context.cwd.as_deref());
         if candidates.is_empty() && mode == ExecAllowMode::Strict {
             bail!("resolve exec allow path '{}' from PATH", escape_str(raw));
         }
-        return insert_exec_search_candidates(unique, candidates, visited);
+        return insert_exec_search_candidates(unique, candidates, visited, context);
     }
     let resolved = match mode {
         ExecAllowMode::Strict => Some(resolve_exec_allow_path(raw)?),
@@ -400,23 +458,35 @@ fn insert_landlock_exec_path_inner(
     let Some(resolved) = resolved else {
         return Ok(());
     };
-    insert_resolved_exec_path(unique, resolved, visited, mode)
+    insert_resolved_exec_path(unique, resolved, visited, mode, context)
 }
 
 fn insert_exec_search_candidates(
     unique: &mut BTreeSet<Vec<u8>>,
     candidates: Vec<PathBuf>,
-    visited: &mut BTreeSet<PathBuf>,
+    visited: &mut ExecVisits,
+    context: &ExecContext,
 ) -> Result<()> {
-    // execvp can continue after EACCES or a missing script/ELF interpreter.
-    // Authorize each matching file and its dependencies, without granting the
-    // containing directories or rejecting an earlier, unusable candidate.
+    // execvp can fall back to another candidate. An unreadable or otherwise
+    // uninspectable candidate must not prevent a different match from running.
+    // Keep only discovered file grants; never grant a containing directory.
     for path in candidates {
-        let Some(resolved) = resolve_exec_allow_path_from_path(path, ExecAllowMode::Auto)? else {
-            continue;
-        };
-        if is_executable_file(&resolved.metadata) {
-            insert_resolved_exec_path(unique, resolved, visited, ExecAllowMode::Auto)?;
+        let result = (|| {
+            let Some(resolved) =
+                resolve_exec_allow_path_from_path(path.clone(), ExecAllowMode::Auto)?
+            else {
+                return Ok(());
+            };
+            if is_executable_file(&resolved.metadata) {
+                insert_resolved_exec_path(unique, resolved, visited, ExecAllowMode::Auto, context)?;
+            }
+            Ok::<(), Error>(())
+        })();
+        if let Err(err) = result {
+            logging::debug(format_args!(
+                "skip interpreter discovery for PATH candidate '{}': {err}",
+                escape_path(&path)
+            ));
         }
     }
     Ok(())
@@ -425,47 +495,63 @@ fn insert_exec_search_candidates(
 fn insert_resolved_exec_path(
     unique: &mut BTreeSet<Vec<u8>>,
     resolved: ResolvedExecAllowPath,
-    visited: &mut BTreeSet<PathBuf>,
+    visited: &mut ExecVisits,
     mode: ExecAllowMode,
+    context: &ExecContext,
 ) -> Result<()> {
-    if !visited.insert(resolved.canonical.clone()) {
+    if !visited.insert((resolved.canonical.clone(), context.clone())) {
         return Ok(());
     }
-
+    // env can re-exec a script with a different environment or directory. Bound
+    // that graph as well as detecting cycles with identical execution contexts.
+    if visited.len() > 256 {
+        bail!("exec interpreter discovery exceeds 256 file/context pairs");
+    }
     unique.insert(resolved.canonical.as_os_str().as_bytes().to_vec());
-
     if is_executable_file(&resolved.metadata) {
-        for interpreter in detect_exec_interpreters(&resolved.canonical)? {
-            match interpreter {
-                ExecInterpreter::Candidate(path) => {
-                    insert_landlock_exec_path_candidate(unique, path, visited, mode)?;
-                }
-                ExecInterpreter::SearchCandidates(paths) => {
-                    insert_exec_search_candidates(unique, paths, visited)?;
-                }
-                ExecInterpreter::Missing { .. } | ExecInterpreter::Unresolved { .. }
-                    if mode == ExecAllowMode::Auto => {}
-                ExecInterpreter::Missing { command } => {
-                    bail!(
-                        "resolve exec allow path '{}' from shebang PATH",
-                        escape_str(&command)
-                    );
-                }
-                ExecInterpreter::Unresolved { reason } => {
-                    bail!("{reason}");
-                }
-            }
+        for interpreter in detect_exec_interpreters_in_context(&resolved.canonical, context)? {
+            insert_exec_interpreter(unique, interpreter, visited, mode, context)?;
         }
     }
-
     Ok(())
+}
+
+fn insert_exec_interpreter(
+    unique: &mut BTreeSet<Vec<u8>>,
+    interpreter: ExecInterpreter,
+    visited: &mut ExecVisits,
+    mode: ExecAllowMode,
+    context: &ExecContext,
+) -> Result<()> {
+    match interpreter {
+        ExecInterpreter::Candidate(path) => {
+            insert_landlock_exec_path_candidate(unique, path, visited, mode, context)
+        }
+        ExecInterpreter::SearchCandidates(paths) => {
+            insert_exec_search_candidates(unique, paths, visited, context)
+        }
+        ExecInterpreter::EnvCommand(command) => {
+            insert_exec_interpreter(unique, command.resolve(), visited, mode, &command.context)
+        }
+        ExecInterpreter::Missing { .. } | ExecInterpreter::Unresolved { .. }
+            if mode == ExecAllowMode::Auto =>
+        {
+            Ok(())
+        }
+        ExecInterpreter::Missing { command } => bail!(
+            "resolve exec allow path '{}' from shebang PATH",
+            escape_str(&command)
+        ),
+        ExecInterpreter::Unresolved { reason } => bail!("{reason}"),
+    }
 }
 
 fn insert_landlock_exec_path_candidate(
     unique: &mut BTreeSet<Vec<u8>>,
     path: PathBuf,
-    visited: &mut BTreeSet<PathBuf>,
+    visited: &mut ExecVisits,
     mode: ExecAllowMode,
+    context: &ExecContext,
 ) -> Result<()> {
     if !path.as_os_str().as_bytes().contains(&b'/') {
         let Some(command) = path.to_str() else {
@@ -474,10 +560,9 @@ fn insert_landlock_exec_path_candidate(
             }
             bail!("resolve exec allow path from non-Unicode PATH command");
         };
-        return insert_landlock_exec_path_inner(unique, command, visited, mode);
+        return insert_landlock_exec_path_inner(unique, command, visited, mode, context);
     }
-
-    let Some(resolved) = resolve_exec_allow_path_from_path(path, mode)? else {
+    let Some(resolved) = resolve_exec_allow_path_from_path(context.path(&path), mode)? else {
         return Ok(());
     };
     if !is_executable_file(&resolved.metadata) {
@@ -489,7 +574,7 @@ fn insert_landlock_exec_path_candidate(
             escape_path(&resolved.canonical)
         );
     }
-    insert_resolved_exec_path(unique, resolved, visited, mode)
+    insert_resolved_exec_path(unique, resolved, visited, mode, context)
 }
 
 fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
@@ -715,7 +800,15 @@ fn default_exec_search_path() -> OsString {
     OsString::from_vec(buf)
 }
 
+#[cfg(test)]
 fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
+    detect_exec_interpreters_in_context(path, &ExecContext::inherited())
+}
+
+fn detect_exec_interpreters_in_context(
+    path: &Path,
+    context: &ExecContext,
+) -> Result<Vec<ExecInterpreter>> {
     let file = File::open(path).with_context(|| {
         format!(
             "open exec allow file '{}' for interpreter discovery",
@@ -724,7 +817,7 @@ fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
     })?;
     let shebang_prefix = read_file_prefix_from(&file, EXEC_PROBE_PREFIX_LEN)
         .with_context(|| format!("read exec allow file '{}'", escape_path(path)))?;
-    let shebang_interpreters = parse_shebang_exec_interpreters(&shebang_prefix);
+    let shebang_interpreters = parse_shebang_exec_interpreters_in_context(&shebang_prefix, context);
     if !shebang_interpreters.is_empty() {
         return Ok(shebang_interpreters);
     }
@@ -790,6 +883,7 @@ fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
 enum ExecInterpreter {
     Candidate(PathBuf),
     SearchCandidates(Vec<PathBuf>),
+    EnvCommand(EnvShebangCommand),
     Missing { command: String },
     Unresolved { reason: &'static str },
 }
@@ -802,6 +896,7 @@ impl ExecInterpreter {
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
+            Self::EnvCommand(command) => command.resolve().into_display_paths(),
             Self::Missing { command } => vec![command],
             Self::Unresolved { reason } => vec![reason.to_owned()],
         }
@@ -809,6 +904,13 @@ impl ExecInterpreter {
 }
 
 fn parse_shebang_exec_interpreters(bytes: &[u8]) -> Vec<ExecInterpreter> {
+    parse_shebang_exec_interpreters_in_context(bytes, &ExecContext::inherited())
+}
+
+fn parse_shebang_exec_interpreters_in_context(
+    bytes: &[u8],
+    context: &ExecContext,
+) -> Vec<ExecInterpreter> {
     let Some(shebang) = parse_shebang(bytes) else {
         return Vec::new();
     };
@@ -828,8 +930,8 @@ fn parse_shebang_exec_interpreters(bytes: &[u8]) -> Vec<ExecInterpreter> {
         match parts.argument {
             ShebangArgument::None => {}
             ShebangArgument::Utf8(argument) => {
-                if let Some(command) = env_shebang_command(argument) {
-                    let _ = paths.push_mut(command.resolve());
+                if let Some(command) = env_shebang_command(argument, context) {
+                    let _ = paths.push_mut(ExecInterpreter::EnvCommand(command));
                 }
             }
             ShebangArgument::InvalidUtf8 => {
@@ -948,20 +1050,21 @@ fn trim_shebang_space_end(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct EnvShebangCommand {
     command: String,
-    search_path: Option<OsString>,
-    chdir: Option<PathBuf>,
+    context: ExecContext,
+    search_modified: bool,
 }
 
 struct EnvShebangFields {
     fields: Vec<String>,
-    search_path: Option<OsString>,
+    ignore_environment: bool,
 }
 
 struct EnvSplitString<'a> {
     value: &'a str,
-    search_path: Option<OsString>,
+    ignore_environment: bool,
 }
 
 enum EnvSplitExpansion {
@@ -1009,24 +1112,27 @@ const ENV_LONG_OPTIONS: &[(EnvLongOption, &str)] = &[
 ];
 
 impl EnvShebangCommand {
+    fn new(command: &str, context: ExecContext, inherited: &ExecContext) -> Self {
+        let search_modified = context.cwd != inherited.cwd
+            || context.environment.get(std::ffi::OsStr::new("PATH"))
+                != inherited.environment.get(std::ffi::OsStr::new("PATH"));
+        Self {
+            command: command.to_owned(),
+            context,
+            search_modified,
+        }
+    }
+
     fn resolve(&self) -> ExecInterpreter {
         if self.command.contains('/') {
-            let path = PathBuf::from(self.command.as_str());
-            let candidate = if path.is_relative() {
-                if let Some(dir) = self.chdir.as_deref() {
-                    dir.join(&path)
-                } else {
-                    path
-                }
-            } else {
-                path
-            };
-            return ExecInterpreter::Candidate(candidate);
+            return ExecInterpreter::Candidate(self.context.path(Path::new(&self.command)));
         }
-        if self.search_path.is_some() || self.chdir.is_some() {
-            let search_path = self.search_path.clone().unwrap_or_else(exec_search_path);
-            let candidates =
-                executable_paths_in_search_path(&self.command, &search_path, self.chdir.as_deref());
+        if self.search_modified {
+            let candidates = executable_paths_in_search_path(
+                &self.command,
+                &self.context.search_path(),
+                self.context.cwd.as_deref(),
+            );
             if !candidates.is_empty() {
                 return ExecInterpreter::SearchCandidates(candidates);
             }
@@ -1034,25 +1140,29 @@ impl EnvShebangCommand {
                 command: self.command.clone(),
             };
         }
-        ExecInterpreter::Candidate(PathBuf::from(self.command.as_str()))
+        ExecInterpreter::Candidate(PathBuf::from(&self.command))
     }
 }
 
-fn env_shebang_command(argument: &str) -> Option<EnvShebangCommand> {
-    let parsed = env_shebang_argument_fields(argument)?;
-    env_shebang_command_fields(&parsed.fields, parsed.search_path, None)
+fn env_shebang_command(argument: &str, context: &ExecContext) -> Option<EnvShebangCommand> {
+    let parsed = env_shebang_argument_fields(argument, context)?;
+    let mut options = context.clone();
+    if parsed.ignore_environment {
+        options.environment.clear();
+    }
+    env_shebang_command_fields(&parsed.fields, options, context)
 }
 
-fn env_shebang_argument_fields(argument: &str) -> Option<EnvShebangFields> {
+fn env_shebang_argument_fields(argument: &str, context: &ExecContext) -> Option<EnvShebangFields> {
     if let Some(split) = env_split_string(argument) {
         return Some(EnvShebangFields {
-            fields: split_env_split_string(split.value)?,
-            search_path: split.search_path,
+            fields: split_env_split_string(split.value, context)?,
+            ignore_environment: split.ignore_environment,
         });
     }
     Some(EnvShebangFields {
         fields: vec![argument.to_owned()],
-        search_path: None,
+        ignore_environment: false,
     })
 }
 
@@ -1060,7 +1170,7 @@ fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
     if let Some((EnvLongOption::SplitString, Some(split))) = classify_env_long_option(arg) {
         return Some(EnvSplitString {
             value: split,
-            search_path: None,
+            ignore_environment: false,
         });
     }
     if !arg.starts_with('-') || arg.starts_with("--") {
@@ -1068,7 +1178,7 @@ fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
     }
 
     let mut idx = 1usize;
-    let mut search_path = None;
+    let mut ignore_environment = false;
     while idx < arg.len() {
         let opt = arg[idx..].chars().next()?;
         idx += opt.len_utf8();
@@ -1076,11 +1186,11 @@ fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
             'S' => {
                 return Some(EnvSplitString {
                     value: &arg[idx..],
-                    search_path,
+                    ignore_environment,
                 });
             }
             'i' => {
-                search_path = Some(default_exec_search_path());
+                ignore_environment = true;
             }
             'v' => {}
             _ => return None,
@@ -1089,7 +1199,7 @@ fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
     None
 }
 
-fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
+fn split_env_split_string(raw: &str, context: &ExecContext) -> Option<Vec<String>> {
     // GNU env expands ${VAR} while splitting -S. Environment-mutating options
     // parsed later, such as -i/--ignore-environment and -u/--unset, do not
     // affect this expansion pass.
@@ -1163,7 +1273,7 @@ fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
             continue;
         }
         if quote != Some('\'') && ch == '$' {
-            match expand_env_split_variable(raw, &mut idx)? {
+            match expand_env_split_variable(raw, &mut idx, context)? {
                 EnvSplitExpansion::Value(value) => {
                     current.push_str(&value);
                     in_field = true;
@@ -1209,7 +1319,11 @@ fn split_env_split_string(raw: &str) -> Option<Vec<String>> {
     Some(fields)
 }
 
-fn expand_env_split_variable(raw: &str, idx: &mut usize) -> Option<EnvSplitExpansion> {
+fn expand_env_split_variable(
+    raw: &str,
+    idx: &mut usize,
+    context: &ExecContext,
+) -> Option<EnvSplitExpansion> {
     if !raw[*idx..].starts_with('{') {
         return None;
     }
@@ -1220,8 +1334,8 @@ fn expand_env_split_variable(raw: &str, idx: &mut usize) -> Option<EnvSplitExpan
         return None;
     }
     *idx = name_end + 1;
-    Some(match std::env::var_os(name) {
-        Some(value) => EnvSplitExpansion::Value(value.into_string().ok()?),
+    Some(match context.environment.get(std::ffi::OsStr::new(name)) {
+        Some(value) => EnvSplitExpansion::Value(value.clone().into_string().ok()?),
         None => EnvSplitExpansion::Unset,
     })
 }
@@ -1237,8 +1351,8 @@ fn is_env_split_variable_name(name: &str) -> bool {
 
 fn env_shebang_command_fields(
     fields: &[String],
-    mut search_path: Option<OsString>,
-    mut chdir: Option<PathBuf>,
+    mut options: ExecContext,
+    inherited: &ExecContext,
 ) -> Option<EnvShebangCommand> {
     let mut idx = 0usize;
     let mut options_allowed = true;
@@ -1247,36 +1361,28 @@ fn env_shebang_command_fields(
         let arg = fields[idx].as_str();
         idx += 1;
         if options_allowed && arg == "--" {
-            return env_shebang_command_after_double_dash(&fields[idx..], search_path, chdir);
+            return env_shebang_command_after_double_dash(&fields[idx..], options, inherited);
         }
         if options_allowed && arg.starts_with("--") {
-            match env_long_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
+            match env_long_option_action(arg, fields, &mut idx, &mut options, inherited) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
             }
         }
         if options_allowed && arg.starts_with('-') {
-            match env_short_option_action(arg, fields, &mut idx, &mut search_path, &mut chdir) {
+            match env_short_option_action(arg, fields, &mut idx, &mut options, inherited) {
                 EnvOptionAction::Continue => continue,
                 EnvOptionAction::Return(command) => return command,
                 EnvOptionAction::Invalid => return None,
             }
         }
-        if let Some(path) = path_assignment(arg) {
+        if let Some((name, value)) = arg.split_once('=') {
             options_allowed = false;
-            search_path = Some(OsString::from(path));
+            options.environment.insert(name.into(), value.into());
             continue;
         }
-        if arg.contains('=') {
-            options_allowed = false;
-            continue;
-        }
-        return Some(EnvShebangCommand {
-            command: arg.to_owned(),
-            search_path,
-            chdir,
-        });
+        return Some(EnvShebangCommand::new(arg, options, inherited));
     }
     None
 }
@@ -1285,8 +1391,8 @@ fn env_long_option_action(
     arg: &str,
     fields: &[String],
     idx: &mut usize,
-    search_path: &mut Option<OsString>,
-    chdir: &mut Option<PathBuf>,
+    options: &mut ExecContext,
+    inherited: &ExecContext,
 ) -> EnvOptionAction {
     let Some((option, value)) = classify_env_long_option(arg) else {
         return EnvOptionAction::Invalid;
@@ -1306,15 +1412,15 @@ fn env_long_option_action(
             EnvOptionAction::Return(env_shebang_command_with_split(
                 split,
                 &fields[*idx..],
-                search_path.clone(),
-                chdir.clone(),
+                options.clone(),
+                inherited,
             ))
         }
         EnvLongOption::IgnoreEnvironment => {
             if value.is_some() {
                 return EnvOptionAction::Invalid;
             }
-            *search_path = Some(default_exec_search_path());
+            options.environment.clear();
             EnvOptionAction::Continue
         }
         EnvLongOption::Unset => {
@@ -1330,7 +1436,7 @@ fn env_long_option_action(
             if !valid_env_unset_name(name) {
                 return EnvOptionAction::Invalid;
             }
-            apply_env_unset(name, search_path);
+            options.environment.remove(std::ffi::OsStr::new(name));
             EnvOptionAction::Continue
         }
         EnvLongOption::Chdir => {
@@ -1343,10 +1449,10 @@ fn env_long_option_action(
                 *idx += 1;
                 dir.as_str()
             };
-            if !valid_env_chdir(dir) {
+            let Some(dir) = env_chdir(dir, inherited) else {
                 return EnvOptionAction::Invalid;
-            }
-            *chdir = Some(PathBuf::from(dir));
+            };
+            options.cwd = Some(dir);
             EnvOptionAction::Continue
         }
         EnvLongOption::Argv0 => {
@@ -1380,11 +1486,11 @@ fn env_short_option_action(
     arg: &str,
     fields: &[String],
     idx: &mut usize,
-    search_path: &mut Option<OsString>,
-    chdir: &mut Option<PathBuf>,
+    options: &mut ExecContext,
+    inherited: &ExecContext,
 ) -> EnvOptionAction {
     if arg == "-" {
-        *search_path = Some(default_exec_search_path());
+        options.environment.clear();
         return EnvOptionAction::Continue;
     }
     let mut chars = arg.char_indices();
@@ -1393,7 +1499,7 @@ fn env_short_option_action(
         let value_start = offset + opt.len_utf8();
         match opt {
             'i' => {
-                *search_path = Some(default_exec_search_path());
+                options.environment.clear();
             }
             'v' => {}
             '0' => return EnvOptionAction::Return(None),
@@ -1410,7 +1516,7 @@ fn env_short_option_action(
                 if !valid_env_unset_name(name) {
                     return EnvOptionAction::Invalid;
                 }
-                apply_env_unset(name, search_path);
+                options.environment.remove(std::ffi::OsStr::new(name));
                 return EnvOptionAction::Continue;
             }
             'a' => {
@@ -1422,15 +1528,15 @@ fn env_short_option_action(
             'C' => {
                 if value_start < arg.len() {
                     let dir = &arg[value_start..];
-                    if !valid_env_chdir(dir) {
+                    let Some(dir) = env_chdir(dir, inherited) else {
                         return EnvOptionAction::Invalid;
-                    }
-                    *chdir = Some(PathBuf::from(dir));
+                    };
+                    options.cwd = Some(dir);
                 } else if let Some(dir) = fields.get(*idx) {
-                    if !valid_env_chdir(dir) {
+                    let Some(dir) = env_chdir(dir, inherited) else {
                         return EnvOptionAction::Invalid;
-                    }
-                    *chdir = Some(PathBuf::from(dir.as_str()));
+                    };
+                    options.cwd = Some(dir);
                     *idx += 1;
                 } else {
                     return EnvOptionAction::Invalid;
@@ -1449,8 +1555,8 @@ fn env_short_option_action(
                 return EnvOptionAction::Return(env_shebang_command_with_split(
                     split,
                     &fields[*idx..],
-                    search_path.clone(),
-                    chdir.clone(),
+                    options.clone(),
+                    inherited,
                 ));
             }
             _ => return EnvOptionAction::Invalid,
@@ -1461,22 +1567,15 @@ fn env_short_option_action(
 
 fn env_shebang_command_after_double_dash(
     fields: &[String],
-    mut search_path: Option<OsString>,
-    chdir: Option<PathBuf>,
+    mut options: ExecContext,
+    inherited: &ExecContext,
 ) -> Option<EnvShebangCommand> {
     for arg in fields.iter().map(String::as_str) {
-        if let Some(path) = path_assignment(arg) {
-            search_path = Some(OsString::from(path));
+        if let Some((name, value)) = arg.split_once('=') {
+            options.environment.insert(name.into(), value.into());
             continue;
         }
-        if arg.contains('=') {
-            continue;
-        }
-        return Some(EnvShebangCommand {
-            command: arg.to_owned(),
-            search_path,
-            chdir,
-        });
+        return Some(EnvShebangCommand::new(arg, options, inherited));
     }
     None
 }
@@ -1484,12 +1583,12 @@ fn env_shebang_command_after_double_dash(
 fn env_shebang_command_with_split(
     split: &str,
     rest: &[String],
-    search_path: Option<OsString>,
-    chdir: Option<PathBuf>,
+    options: ExecContext,
+    inherited: &ExecContext,
 ) -> Option<EnvShebangCommand> {
-    let mut fields = split_env_split_string(split)?;
+    let mut fields = split_env_split_string(split, inherited)?;
     fields.extend_from_slice(rest);
-    env_shebang_command_fields(&fields, search_path, chdir)
+    env_shebang_command_fields(&fields, options, inherited)
 }
 
 fn classify_env_long_option(arg: &str) -> Option<(EnvLongOption, Option<&str>)> {
@@ -1511,22 +1610,13 @@ fn classify_env_long_option(arg: &str) -> Option<(EnvLongOption, Option<&str>)> 
     Some((option, value))
 }
 
-fn path_assignment(arg: &str) -> Option<&str> {
-    arg.strip_prefix("PATH=")
-}
-
 fn valid_env_unset_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('=')
 }
 
-fn apply_env_unset(name: &str, search_path: &mut Option<OsString>) {
-    if name == "PATH" {
-        *search_path = Some(default_exec_search_path());
-    }
-}
-
-fn valid_env_chdir(dir: &str) -> bool {
-    std::fs::metadata(dir).is_ok_and(|metadata| metadata.is_dir())
+fn env_chdir(dir: &str, inherited: &ExecContext) -> Option<PathBuf> {
+    let dir = inherited.path(Path::new(dir)).canonicalize().ok()?;
+    dir.is_dir().then_some(dir)
 }
 
 fn validate_env_signal_option(value: Option<&str>, allow_immutable: bool) -> EnvOptionAction {
@@ -2239,13 +2329,10 @@ fn supervise_child(
     if use_pgroup {
         logging::info(format_args!("sending SIGTERM to PGID"));
         send_signal(true, child_pid, SIGTERM as libc::c_int);
-        if !wait_for_process_group(child_pid, cli.grace_ms, cli.warn_on_reap)? {
-            logging::info(format_args!(
-                "still alive after {} ms; sending SIGKILL",
-                cli.grace_ms
-            ));
+        if !wait_for_cleanup(child_pid, true, cli, signal_fd, true)? {
+            logging::info(format_args!("process group still alive; sending SIGKILL"));
             send_signal(true, child_pid, SIGKILL as libc::c_int);
-            let group_gone = wait_for_process_group(child_pid, cli.grace_ms, cli.warn_on_reap)?;
+            let group_gone = wait_for_cleanup(child_pid, true, cli, signal_fd, false)?;
             if !group_gone {
                 logging::warn(format_args!(
                     "process group still alive after SIGKILL wait of {} ms",
@@ -2254,7 +2341,7 @@ fn supervise_child(
             }
         }
     } else {
-        let _ = wait_for_children(cli.grace_ms, cli.warn_on_reap)?;
+        let _ = wait_for_cleanup(child_pid, false, cli, signal_fd, true)?;
     }
 
     logging::info(format_args!("exiting with {}", final_exit));
@@ -2354,42 +2441,59 @@ fn compute_exit_code(code: i32, expect_zero: &ExitCodeRemap) -> i32 {
     }
 }
 
-fn wait_for_children(timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
+fn wait_for_cleanup(
+    child_pid: Pid,
+    use_pgroup: bool,
+    cli: &Cli,
+    signal_fd: &mut SignalFd,
+    interruptible: bool,
+) -> Result<bool> {
     let start = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
+    let timeout = Duration::from_millis(cli.grace_ms);
     loop {
-        if reap_available_children(warn_on_reap)? {
+        let mut terminate = false;
+        // Keep consuming signals after the main child exits. Otherwise pending
+        // termination signals kill the supervisor when its mask is restored.
+        while let Some(info) = signal_fd.read_signal()? {
+            let sig = info.ssi_signo.cast_signed();
+            if sig == SIGCHLD as libc::c_int
+                || sig == SIGTTIN as libc::c_int
+                || sig == SIGTTOU as libc::c_int
+            {
+                continue;
+            }
+            if use_pgroup {
+                send_signal(true, child_pid, sig);
+            }
+            terminate |= is_termination_signal(sig);
+        }
+        let children_gone = reap_available_children(cli.warn_on_reap)?;
+        let done = if use_pgroup {
+            !process_group_exists(child_pid)
+                .with_context(|| format!("query process group {child_pid}"))?
+        } else {
+            children_gone
+        };
+        if done {
             return Ok(true);
         }
-        if timeout_ms == 0 {
+        if (interruptible && terminate) || start.elapsed() >= timeout {
             return Ok(false);
         }
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            return Ok(false);
+        // A group can contain processes we cannot waitpid, so periodically
+        // check its existence even when no SIGCHLD arrives.
+        let remaining = timeout.saturating_sub(start.elapsed());
+        let poll_timeout = PollTimeout::try_from(remaining.min(Duration::from_millis(10)))
+            .unwrap_or(PollTimeout::MAX);
+        let mut fds = [PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN)];
+        match poll_fds(&mut fds, poll_timeout) {
+            Ok(()) => {}
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(err).context("poll during child cleanup"),
         }
-        let remaining = timeout.saturating_sub(elapsed);
-        thread::sleep(remaining.min(Duration::from_millis(10)));
-    }
-}
-
-fn wait_for_process_group(pgid: Pid, timeout_ms: u64, warn_on_reap: bool) -> Result<bool> {
-    let start = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    loop {
-        let _ = reap_available_children(warn_on_reap)?;
-        if !process_group_exists(pgid).with_context(|| format!("query process group {pgid}"))? {
-            return Ok(true);
+        if signal_fd_poll_failed(fds[0].revents().unwrap_or_else(PollFlags::empty)) {
+            bail!("signal fd poll failed during child cleanup");
         }
-        if timeout_ms == 0 {
-            return Ok(false);
-        }
-        let elapsed = start.elapsed();
-        if elapsed >= timeout {
-            return Ok(false);
-        }
-        let remaining = timeout.saturating_sub(elapsed);
-        thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
@@ -2542,8 +2646,8 @@ mod tests {
     }
 
     #[test]
-    fn wait_for_children_without_children_succeeds() {
-        assert!(wait_for_children(0, false).unwrap());
+    fn reaping_without_children_succeeds() {
+        assert!(reap_available_children(false).unwrap());
     }
 
     #[test]

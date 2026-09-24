@@ -28,6 +28,10 @@ osarg = { version = "0.1.3", default-features = false }
 name = "logic_paths"
 harness = false
 
+[[test]]
+name = "signal_state"
+harness = false
+
 [profile.release]
 codegen-units = 1
 lto = "fat"

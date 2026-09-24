@@ -222,6 +222,16 @@ These environment variables act as defaults. Explicit CLI flags still win.
 The matching `TINI_*` names are also accepted for compatibility. When both are set,
 `TINO_*` wins.
 
+## Library use
+
+On Linux, `tino::run` supervises children only in a single-threaded process.
+It takes ownership of process signal handling and child reaping during the call.
+It checks `/proc/self/task` before changing signal state or spawning the command,
+so procfs must be mounted at `/proc`, including when using the binary.
+Multithreaded applications should launch the `tino` binary as a subprocess;
+direct supervision through `run` returns an error in that case.
+Configuration-only operations are exempt from these requirements.
+
 ## Testing
 
 ```bash

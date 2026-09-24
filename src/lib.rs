@@ -56,6 +56,13 @@ pub use error::{Context, Error, Result};
 ///
 /// In typical usage, the `tino` binary calls this function and then exits with
 /// the returned code.
+///
+/// On Linux, supervision requires a single-threaded process and procfs mounted
+/// at `/proc` so this precondition can be checked. It takes ownership of signal
+/// handling and child reaping for the duration of the call. Multithreaded hosts
+/// must launch the `tino` binary as a subprocess; otherwise this function returns
+/// an error before changing signal state or spawning the managed command.
+/// Configuration-only operations do not have this restriction.
 pub fn run(cli: Cli) -> Result<i32> {
     platform::run(cli)
 }
