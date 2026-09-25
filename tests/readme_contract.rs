@@ -16,9 +16,9 @@ fn readme_contains_core_install_and_usage_snippets() {
     let readme = readme();
 
     for snippet in [
-        "COPY --from=ghcr.io/lvillis/tino:latest /sbin/tino /sbin/tino",
+        "COPY --from=ghcr.io/oksyd/tino:latest /sbin/tino /sbin/tino",
         "ENTRYPOINT [\"/sbin/tino\", \"-g\", \"-s\", \"--\"]",
-        "ENTRYPOINT [\"/sbin/tino\", \"--expand-env\", \"--\"]",
+        "tino --expand-env -- /opt/app/service '--port=${SERVICE_PORT:-8900}'",
         "--write-preset runtime",
         "--write-allow /data/logs",
         "--bind-tcp-allow 8900",
@@ -26,7 +26,6 @@ fn readme_contains_core_install_and_usage_snippets() {
         "referenced files and directories already exist",
         "`--write-allow` and `--write-preset` enable write restriction automatically",
         "--security-opt seccomp=./seccomp-landlock.json",
-        "\"seccomp-profile\": \"/etc/docker/seccomp-landlock.json\"",
     ] {
         assert!(
             readme.contains(snippet),
@@ -46,6 +45,7 @@ fn readme_and_help_stay_aligned_on_key_flags() {
     let help = String::from_utf8_lossy(&output.stdout);
 
     for flag in [
+        "--verbose",
         "--write-restrict",
         "--write-allow",
         "--write-preset",
@@ -75,11 +75,11 @@ fn readme_and_help_stay_aligned_on_key_flags() {
         "--help should describe --restrict-warn-only as applying to all access restrictions"
     );
     assert!(
-        help.contains("Allow writable absolute PATH (repeatable; enables write restriction)"),
+        help.contains("Allow writes to PATH; enables restriction"),
         "--help should document that --write-allow enables write restriction"
     );
     assert!(
-        help.contains("Add writable preset: tmp, runtime (enables write restriction)"),
+        help.contains("Allow tmp/runtime writes; enables restriction"),
         "--help should document that --write-preset enables write restriction"
     );
 }

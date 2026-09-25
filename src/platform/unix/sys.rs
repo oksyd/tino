@@ -185,9 +185,15 @@ impl SignalAction {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct SigSet(libc::sigset_t);
 
 impl SigSet {
+    pub(super) fn add(&mut self, signal: Signal) {
+        // SAFETY: self holds an initialized set and signal is a valid enum value.
+        unsafe { libc::sigaddset(&raw mut self.0, signal as i32) };
+    }
+
     pub(super) fn contains_raw(&self, signal: libc::c_int) -> bool {
         // SAFETY: self holds an initialized set; invalid signal numbers return -1.
         unsafe { libc::sigismember(&raw const self.0, signal) == 1 }

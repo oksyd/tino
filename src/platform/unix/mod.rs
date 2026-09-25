@@ -317,7 +317,9 @@ fn build_landlock_config_for_args(
 fn unique_ports(option: &str, raw_ports: &[u16]) -> Result<Vec<u16>> {
     for &port in raw_ports {
         if port == 0 {
-            bail!("invalid value for {option}: 0 (expected 1-65535)");
+            return Err(Error::usage(format!(
+                "invalid value for {option}: 0 (expected 1-65535)"
+            )));
         }
     }
 
@@ -331,10 +333,12 @@ fn unique_ports(option: &str, raw_ports: &[u16]) -> Result<Vec<u16>> {
 
 fn landlock_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
     if raw.is_empty() {
-        bail!("{option} PATH cannot be empty");
+        return Err(Error::usage(format!("{option} PATH cannot be empty")));
     }
     if raw != raw.trim() {
-        bail!("{option} PATH cannot have surrounding whitespace");
+        return Err(Error::usage(format!(
+            "{option} PATH cannot have surrounding whitespace"
+        )));
     }
     Ok(raw)
 }
@@ -342,7 +346,7 @@ fn landlock_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
 fn landlock_absolute_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
     let path = landlock_path_option(option, raw)?;
     if !Path::new(path).is_absolute() {
-        bail!("{option} PATH must be absolute");
+        return Err(Error::usage(format!("{option} PATH must be absolute")));
     }
     Ok(path)
 }
@@ -350,7 +354,9 @@ fn landlock_absolute_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a s
 fn landlock_exec_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
     let path = landlock_path_option(option, raw)?;
     if path.contains('/') && !Path::new(path).is_absolute() {
-        bail!("{option} PATH must be absolute when it contains '/'");
+        return Err(Error::usage(format!(
+            "{option} PATH must be absolute when it contains '/'"
+        )));
     }
     Ok(path)
 }
@@ -974,11 +980,11 @@ fn parse_shebang_exec_interpreters_in_context(
     if is_env_interpreter(parts.interpreter) {
         match parts.argument {
             ShebangArgument::None => {}
-            ShebangArgument::Utf8(argument) => {
-                if let Some(command) = env_shebang_command(argument, context) {
-                    let _ = paths.push_mut(ExecInterpreter::EnvCommand(command));
-                }
-            }
+            ShebangArgument::Utf8(argument) => match env_shebang_command(argument, context) {
+                Ok(Some(command)) => paths.push(ExecInterpreter::EnvCommand(command)),
+                Ok(None) => {}
+                Err(reason) => paths.push(ExecInterpreter::Unresolved { reason }),
+            },
             ShebangArgument::InvalidUtf8 => {
                 let _ = paths.push_mut(ExecInterpreter::Unresolved {
                     reason: "env shebang argument is not valid UTF-8",
@@ -1123,6 +1129,7 @@ enum EnvSplitExpansion {
 enum EnvOptionAction {
     Continue,
     Return(Option<EnvShebangCommand>),
+    SplitString(String),
     Invalid,
 }
 
@@ -1192,13 +1199,18 @@ impl EnvShebangCommand {
     }
 }
 
-fn env_shebang_command(argument: &str, context: &ExecContext) -> Option<EnvShebangCommand> {
-    let parsed = env_shebang_argument_fields(argument, context)?;
+fn env_shebang_command(
+    argument: &str,
+    context: &ExecContext,
+) -> std::result::Result<Option<EnvShebangCommand>, &'static str> {
+    let Some(parsed) = env_shebang_argument_fields(argument, context) else {
+        return Ok(None);
+    };
     let mut options = context.clone();
     if parsed.ignore_environment {
         options.environment.clear();
     }
-    env_shebang_command_fields(&parsed.fields, options, context)
+    env_shebang_command_fields(parsed.fields, options, context)
 }
 
 fn env_shebang_argument_fields(argument: &str, context: &ExecContext) -> Option<EnvShebangFields> {
@@ -1398,31 +1410,49 @@ fn is_env_split_variable_name(name: &str) -> bool {
 }
 
 fn env_shebang_command_fields(
-    fields: &[String],
+    mut fields: Vec<String>,
     mut options: ExecContext,
     inherited: &ExecContext,
-) -> Option<EnvShebangCommand> {
+) -> std::result::Result<Option<EnvShebangCommand>, &'static str> {
     let mut idx = 0usize;
     let mut options_allowed = true;
+    let mut split_steps = 0;
 
     while idx < fields.len() {
         let arg = fields[idx].as_str();
         idx += 1;
         if options_allowed && arg == "--" {
-            return env_shebang_command_after_double_dash(&fields[idx..], options, inherited);
-        }
-        if options_allowed && arg.starts_with("--") {
-            match env_long_option_action(arg, fields, &mut idx, &mut options, inherited) {
-                EnvOptionAction::Continue => continue,
-                EnvOptionAction::Return(command) => return command,
-                EnvOptionAction::Invalid => return None,
-            }
+            return Ok(env_shebang_command_after_double_dash(
+                &fields[idx..],
+                options,
+                inherited,
+            ));
         }
         if options_allowed && arg.starts_with('-') {
-            match env_short_option_action(arg, fields, &mut idx, &mut options, inherited) {
+            let action = if arg.starts_with("--") {
+                env_long_option_action(arg, &fields, &mut idx, &mut options, inherited)
+            } else {
+                env_short_option_action(arg, &fields, &mut idx, &mut options, inherited)
+            };
+            match action {
                 EnvOptionAction::Continue => continue,
-                EnvOptionAction::Return(command) => return command,
-                EnvOptionAction::Invalid => return None,
+                EnvOptionAction::Return(command) => return Ok(command),
+                EnvOptionAction::Invalid => return Ok(None),
+                EnvOptionAction::SplitString(split) => {
+                    // Variables can expand back to the same -S argument. Keep
+                    // reparsing iterative and bounded, including long options.
+                    split_steps += 1;
+                    if split_steps > 32 {
+                        return Err("env split-string expansion exceeds 32 steps");
+                    }
+                    let Some(mut expanded) = split_env_split_string(&split, inherited) else {
+                        return Ok(None);
+                    };
+                    expanded.extend(fields.drain(idx..));
+                    fields = expanded;
+                    idx = 0;
+                    continue;
+                }
             }
         }
         if let Some((name, value)) = arg.split_once('=') {
@@ -1430,9 +1460,9 @@ fn env_shebang_command_fields(
             options.environment.insert(name.into(), value.into());
             continue;
         }
-        return Some(EnvShebangCommand::new(arg, options, inherited));
+        return Ok(Some(EnvShebangCommand::new(arg, options, inherited)));
     }
-    None
+    Ok(None)
 }
 
 fn env_long_option_action(
@@ -1457,12 +1487,7 @@ fn env_long_option_action(
                 *idx += 1;
                 split.as_str()
             };
-            EnvOptionAction::Return(env_shebang_command_with_split(
-                split,
-                &fields[*idx..],
-                options.clone(),
-                inherited,
-            ))
+            EnvOptionAction::SplitString(split.to_owned())
         }
         EnvLongOption::IgnoreEnvironment => {
             if value.is_some() {
@@ -1600,12 +1625,7 @@ fn env_short_option_action(
                 } else {
                     return EnvOptionAction::Continue;
                 };
-                return EnvOptionAction::Return(env_shebang_command_with_split(
-                    split,
-                    &fields[*idx..],
-                    options.clone(),
-                    inherited,
-                ));
+                return EnvOptionAction::SplitString(split.to_owned());
             }
             _ => return EnvOptionAction::Invalid,
         }
@@ -1626,17 +1646,6 @@ fn env_shebang_command_after_double_dash(
         return Some(EnvShebangCommand::new(arg, options, inherited));
     }
     None
-}
-
-fn env_shebang_command_with_split(
-    split: &str,
-    rest: &[String],
-    options: ExecContext,
-    inherited: &ExecContext,
-) -> Option<EnvShebangCommand> {
-    let mut fields = split_env_split_string(split, inherited)?;
-    fields.extend_from_slice(rest);
-    env_shebang_command_fields(&fields, options, inherited)
 }
 
 fn classify_env_long_option(arg: &str) -> Option<(EnvLongOption, Option<&str>)> {
@@ -1975,6 +1984,11 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
             return Ok(ElfInterpreter::Invalid);
         };
         if p_type != PT_LOAD && p_type != PT_INTERP {
+            continue;
+        }
+        // Linux uses the first PT_INTERP. Later entries are ignored, including
+        // invalid ranges, and must not replace or broaden the loader grant.
+        if p_type == PT_INTERP && detected_interpreter.is_some() {
             continue;
         }
 
@@ -2678,11 +2692,6 @@ mod tests {
 
         let id = NEXT_ENV_ID.fetch_add(1, Ordering::Relaxed);
         format!("TINO_TEST_{prefix}_{}_{id}", std::process::id())
-    }
-
-    #[test]
-    fn license_text_includes_mit_header() {
-        assert!(crate::LICENSE_TEXT.contains("MIT License"));
     }
 
     #[test]
@@ -5077,6 +5086,37 @@ mod tests {
             ),
             vec!["/usr/bin/env"]
         );
+    }
+
+    #[test]
+    fn env_split_string_cycles_are_bounded() {
+        let mut context = ExecContext::inherited();
+        for value in ["-S ${TINO_SPLIT_LOOP}", "--split-string=${TINO_SPLIT_LOOP}"] {
+            context
+                .environment
+                .insert("TINO_SPLIT_LOOP".into(), value.into());
+            assert_eq!(
+                env_shebang_command("-S ${TINO_SPLIT_LOOP}", &context),
+                Err("env split-string expansion exceeds 32 steps")
+            );
+        }
+    }
+
+    #[test]
+    fn nested_env_split_strings_keep_options_and_inherited_expansion_context() {
+        let mut context = ExecContext::inherited();
+        context
+            .environment
+            .insert("TINO_SPLIT_FIRST".into(), "-S ${TINO_SPLIT_SECOND}".into());
+        context
+            .environment
+            .insert("TINO_SPLIT_SECOND".into(), "/bin/sh".into());
+        let command = env_shebang_command("-S -i -C /tmp ${TINO_SPLIT_FIRST} -e", &context)
+            .expect("bounded split expansion")
+            .expect("resolved command");
+        assert_eq!(command.command, "/bin/sh");
+        assert_eq!(command.context.cwd.as_deref(), Some(Path::new("/tmp")));
+        assert!(command.context.environment.is_empty());
     }
 
     #[test]

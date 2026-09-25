@@ -209,9 +209,12 @@ fn landlock_exec_allows_execute_only_main_by_absolute_path_and_path_search() {
     std::fs::remove_dir_all(root).expect("remove execute-only fixtures");
 }
 
-// Locate PT_INTERP in a native executable without depending on patchelf or a
-// compiler. /bin/true may be static on minimal systems, in which case skip it.
-fn native_elf_interpreter_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+// Locate ELF segments without depending on patchelf or a compiler. /bin/true
+// may be static on minimal systems, in which case interpreter tests skip it.
+fn native_elf_segment(
+    bytes: &[u8],
+    kind: usize,
+) -> Option<(std::ops::Range<usize>, std::ops::Range<usize>)> {
     if !bytes.starts_with(b"\x7fELF") {
         return None;
     }
@@ -236,12 +239,80 @@ fn native_elf_interpreter_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> 
     };
     for index in 0..count {
         let header = table + index * stride;
-        if number(header, 4) == 3 {
+        if number(header, 4) == kind {
             let offset = number(header + offset_field, word);
-            return Some(offset..offset + number(header + size_field, word));
+            return Some((
+                header..header + stride,
+                offset..offset + number(header + size_field, word),
+            ));
         }
     }
     None
+}
+
+fn native_elf_interpreter_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    native_elf_segment(bytes, 3).map(|(_, range)| range)
+}
+
+#[test]
+fn landlock_exec_uses_first_elf_interpreter() {
+    if !landlock_available() {
+        return;
+    }
+    let original = std::fs::read("/bin/true").expect("read native executable");
+    let Some((interpreter_header, _)) = native_elf_segment(&original, 3) else {
+        return;
+    };
+    let Some((note_header, _)) = native_elf_segment(&original, 4) else {
+        return;
+    };
+    assert!(note_header.start > interpreter_header.start);
+    let root = unique_temp_dir("tino-multiple-elf-interpreters");
+    let allowed = root.join("empty");
+    std::fs::create_dir_all(&allowed).unwrap();
+    let program = root.join("probe");
+    let (offset_field, size_field, word) = if original[4] == 2 {
+        (8, 32, 8)
+    } else {
+        (4, 16, 4)
+    };
+    for invalid_range in [false, true] {
+        let mut bytes = original.clone();
+        bytes[note_header.clone()].copy_from_slice(&original[interpreter_header.clone()]);
+        let extra = b"/definitely/missing/tino-ignored-interpreter\0";
+        let offset = bytes.len() + if invalid_range { 4096 } else { 0 };
+        for (field, value) in [(offset_field, offset), (size_field, extra.len())] {
+            let value = value as u64;
+            let (encoded, start) = if original[5] == 1 {
+                (value.to_le_bytes(), 0)
+            } else {
+                (value.to_be_bytes(), 8 - word)
+            };
+            let field = note_header.start + field;
+            bytes[field..field + word].copy_from_slice(&encoded[start..start + word]);
+        }
+        bytes.extend_from_slice(extra);
+        std::fs::write(&program, bytes).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(Command::new(&program).status().unwrap().success());
+        // Cover automatic main-command discovery and strict explicit entries.
+        for allow in [&allowed, &program] {
+            let output = tino_command()
+                .arg("--exec-allow")
+                .arg(allow)
+                .arg("--")
+                .arg(&program)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "invalid_range={invalid_range}, allow={allow:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -347,6 +418,40 @@ fn landlock_exec_ignores_unreadable_later_path_candidate() {
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("for interpreter discovery"));
     std::fs::remove_dir_all(root).expect("remove PATH fixtures");
+}
+
+#[test]
+fn recursive_env_split_string_reports_an_error_without_aborting() {
+    let root = unique_temp_dir("tino-recursive-env-split");
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("script");
+    write_exec_fixture(&script, "#!/usr/bin/env -S ${TINO_SPLIT_LOOP}\n");
+    for value in ["-S ${TINO_SPLIT_LOOP}", "--split-string=${TINO_SPLIT_LOOP}"] {
+        let mut child = tino_command()
+            .env("TINO_SPLIT_LOOP", value)
+            .args(["--explain", "--exec-allow"])
+            .arg(&script)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_child_with_timeout(&mut child, Duration::from_secs(2));
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("env split-string expansion exceeds 32 steps")
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -795,22 +900,6 @@ time.sleep(5)
 }
 
 #[test]
-fn license_flag_prints_license() {
-    let output = tino_command()
-        .arg("--license")
-        .output()
-        .expect("failed to run tino --license");
-
-    assert!(output.status.success(), "license flag exited with failure");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("MIT License"),
-        "license text missing MIT header\n{}",
-        stdout
-    );
-}
-
-#[test]
 fn help_flag_prints_usage_and_exits_successfully() {
     let output = tino_command()
         .arg("--help")
@@ -869,13 +958,85 @@ fn unknown_argument_exits_with_parse_error() {
 }
 
 #[test]
+fn long_supervision_options_match_short_forms() {
+    let run = |args: &[&str]| {
+        let output = tino_command().args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    };
+    assert_eq!(
+        run(&["-pTERM", "-vv", "--explain", "--", "/bin/true"]),
+        run(&[
+            "--parent-death-signal=TERM",
+            "--verbose",
+            "--verbose",
+            "--explain",
+            "--",
+            "/bin/true"
+        ])
+    );
+    let output = tino_command()
+        .args(["--", "/bin/echo", "--parent-death-signal=TERM", "--verbose"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"--parent-death-signal=TERM --verbose\n");
+}
+
+#[test]
+fn usage_errors_return_two_without_running_a_command() {
+    for args in [
+        vec!["--print-config", "--", "/bin/sh", "-c", "printf unexpected"],
+        vec!["--write-config", "--", "/bin/sh", "-c", "printf unexpected"],
+        vec!["--explain", "--print-config", "--", "/bin/true"],
+        vec!["--write-allow", "relative", "--", "/bin/true"],
+        vec!["--expand-env", "--", "/bin/echo", "${UNFINISHED"],
+        vec!["--", ""],
+    ] {
+        let output = tino_command().args(&args).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+}
+
+#[test]
+fn operational_failures_and_child_exit_codes_are_preserved() {
+    let missing = unique_temp_dir("tino-missing-allow-dir");
+    let output = tino_command()
+        .arg("--write-allow")
+        .arg(&missing)
+        .args(["--", "/bin/sh", "-c", "printf unexpected"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    for code in [1, 2, 23] {
+        let output = tino_command()
+            .args(["--", "/bin/sh", "-c", &format!("exit {code}")])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        assert!(output.stderr.is_empty());
+    }
+}
+
+#[test]
 fn conflicting_control_modes_exit_with_error() {
     let output = Command::new(tino_bin())
         .args(["--check-config", "--write-config"])
         .output()
         .expect("failed to run tino conflicting control-mode test");
 
-    assert!(!output.status.success(), "conflicting modes must fail");
+    assert_eq!(output.status.code(), Some(2), "conflicting modes must fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--check-config cannot be used with --write-config"),
@@ -890,8 +1051,9 @@ fn no_config_check_config_exits_with_error() {
         .output()
         .expect("failed to run tino no-config check-config test");
 
-    assert!(
-        !output.status.success(),
+    assert_eq!(
+        output.status.code(),
+        Some(2),
         "contradictory config modes must fail"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -903,20 +1065,56 @@ fn no_config_check_config_exits_with_error() {
 
 #[test]
 fn check_config_rejects_inline_runtime_options() {
-    let output = Command::new(tino_bin())
-        .args(["--check-config", "--write-allow", "/tmp"])
-        .output()
-        .expect("failed to run tino check-config inline option test");
+    for (args, option) in [
+        (
+            vec!["--check-config", "--write-allow", "/tmp"],
+            "--write-allow",
+        ),
+        (vec!["--check-config", "--grace-ms", "500"], "--grace-ms"),
+        (vec!["-t500", "--check-config"], "--grace-ms"),
+        (vec!["--check-config", "--verbose"], "--verbose"),
+        (
+            vec!["--check-config", "--parent-death-signal=TERM"],
+            "--parent-death-signal",
+        ),
+    ] {
+        let output = Command::new(tino_bin())
+            .args(args)
+            .output()
+            .expect("failed to run tino check-config inline option test");
 
-    assert!(
-        !output.status.success(),
-        "check-config with inline runtime option must fail"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--check-config does not accept --write-allow"),
-        "unexpected stderr:\n{stderr}"
-    );
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "check-config with inline runtime option must fail"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("--check-config does not accept {option}")),
+            "unexpected stderr:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn attached_flag_values_are_rejected_before_running_the_command() {
+    for flag in [
+        "--no-config=false",
+        "--restrict-warn-only=false",
+        "--help=false",
+    ] {
+        let output = tino_command()
+            .args([flag, "--", "/bin/sh", "-c", "printf child-was-started"])
+            .output()
+            .expect("run malformed flag probe");
+        assert_eq!(output.status.code(), Some(2), "{flag}");
+        assert!(output.stdout.is_empty(), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("does not take a value"),
+            "{flag}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -963,8 +1161,8 @@ fn missing_command_exits_with_error() {
 
     assert_eq!(
         output.status.code(),
-        Some(1),
-        "expected exit code 1 when CMD is missing"
+        Some(2),
+        "expected exit code 2 when CMD is missing"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -1951,15 +2149,16 @@ if libc.prctl(2, ctypes.byref(value), 0, 0, 0) != 0:
 sys.exit(0 if value.value == signal.SIGUSR1 else 101)
 "#;
 
-    let status = tino_command()
-        .args(["-p", "USR1", "--", "python3", "-c", script])
-        .status()
-        .expect("failed to run tino pdeath test");
-
-    assert!(
-        status.success(),
-        "expected execed child to inherit configured PDEATHSIG, got {status:?}"
-    );
+    for option in ["-p", "--parent-death-signal"] {
+        let status = tino_command()
+            .args([option, "USR1", "--", "python3", "-c", script])
+            .status()
+            .expect("failed to run tino pdeath test");
+        assert!(
+            status.success(),
+            "expected execed child to inherit configured PDEATHSIG, got {status:?}"
+        );
+    }
 }
 
 #[test]

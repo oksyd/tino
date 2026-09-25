@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     env:
       RUSTUP_TOOLCHAIN: 1.98.1
@@ -57,7 +57,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          key: rust-ubuntu-26.04-${{ runner.arch }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Install nextest
         run: cargo install cargo-nextest --version 0.9.133 --locked
@@ -86,7 +86,7 @@ jobs:
         run: cargo package --locked
 
   container-e2e:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     needs: build
 

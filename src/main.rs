@@ -10,8 +10,12 @@ fn main() {
         Ok(code) => code,
         Err(err) => {
             std::hint::cold_path();
+            let exit_code = err.exit_code();
             let _ = writeln!(std::io::stderr().lock(), "ERROR tino: {err:#}");
-            1
+            if exit_code == 2 {
+                let _ = writeln!(std::io::stderr().lock(), "Try 'tino --help' for usage.");
+            }
+            exit_code
         }
     };
 

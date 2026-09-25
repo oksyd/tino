@@ -1,5 +1,5 @@
 use crate::{
-    Context, Error, LICENSE_TEXT, Result, bail,
+    Context, Error, Result, bail,
     cli::{Cli, DEFAULT_CONFIG_PATH},
     diagnostic::{self, escape_os},
     logging, signals,
@@ -25,7 +25,6 @@ pub(crate) type ExitCodeRemap = [bool; 256];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ControlMode {
-    License,
     CheckConfig,
     WriteConfig,
     PrintConfig,
@@ -35,7 +34,6 @@ enum ControlMode {
 impl ControlMode {
     const fn option(self) -> &'static str {
         match self {
-            Self::License => "--license",
             Self::CheckConfig => "--check-config",
             Self::WriteConfig => "--write-config",
             Self::PrintConfig => "--print-config",
@@ -54,14 +52,6 @@ impl ControlMode {
 pub fn run(mut cli: Cli) -> Result<i32> {
     let control_mode = selected_control_mode(&cli)?;
     match control_mode {
-        Some(ControlMode::License) => {
-            let mut stdout = io::stdout().lock();
-            stdout
-                .write_all(LICENSE_TEXT.as_bytes())
-                .context("write stdout")?;
-            stdout.flush().context("flush stdout")?;
-            return Ok(0);
-        }
         Some(ControlMode::CheckConfig) => {
             reject_control_command(&cli, ControlMode::CheckConfig)?;
             let config =
@@ -90,7 +80,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
             validate_config(&cli)?;
             let config_text = cli
                 .config_text()
-                .map_err(|err| Error::msg(err.to_string()))?;
+                .map_err(|err| Error::usage(err.to_string()))?;
             let mut stdout = io::stdout().lock();
             stdout
                 .write_all(config_text.as_bytes())
@@ -123,7 +113,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
     }
 
     if control_mode != Some(ControlMode::Explain) && cli.cmd.is_empty() {
-        bail!("missing CMD (use --help)");
+        return Err(Error::usage("missing CMD (use --help)"));
     }
 
     let expect_zero = build_exit_remap(&cli.remap_exit);
@@ -138,11 +128,12 @@ fn validate_control_mode(cli: &Cli) -> Result<()> {
 
 fn selected_control_mode(cli: &Cli) -> Result<Option<ControlMode>> {
     if cli.no_config && cli.check_config {
-        bail!("--no-config cannot be used with --check-config");
+        return Err(Error::usage(
+            "--no-config cannot be used with --check-config",
+        ));
     }
 
     let modes = [
-        (cli.license, ControlMode::License),
         (cli.check_config, ControlMode::CheckConfig),
         (cli.write_config, ControlMode::WriteConfig),
         (cli.print_config, ControlMode::PrintConfig),
@@ -155,19 +146,28 @@ fn selected_control_mode(cli: &Cli) -> Result<Option<ControlMode>> {
         return Ok(None);
     };
     if let Some(second) = selected.next() {
-        bail!("{} cannot be used with {}", first.option(), second.option());
+        return Err(Error::usage(format!(
+            "{} cannot be used with {}",
+            first.option(),
+            second.option()
+        )));
     }
     if first == ControlMode::CheckConfig
         && let Some(option) = check_config_inline_option(cli)
     {
-        bail!("--check-config does not accept {option}");
+        return Err(Error::usage(format!(
+            "--check-config does not accept {option}"
+        )));
     }
     Ok(Some(first))
 }
 
 fn reject_control_command(cli: &Cli, mode: ControlMode) -> Result<()> {
     if mode.rejects_command() && !cli.cmd.is_empty() {
-        bail!("{} does not accept CMD", mode.option());
+        return Err(Error::usage(format!(
+            "{} does not accept CMD",
+            mode.option()
+        )));
     }
     Ok(())
 }
@@ -177,10 +177,10 @@ const fn check_config_inline_option(cli: &Cli) -> Option<&'static str> {
         return Some("--subreaper");
     }
     if cli.pdeath.is_some() {
-        return Some("-p");
+        return Some("--parent-death-signal");
     }
     if cli.verbosity > 0 {
-        return Some("-v");
+        return Some("--verbose");
     }
     if cli.warn_on_reap {
         return Some("--warn-on-reap");
@@ -681,7 +681,7 @@ fn explain_pdeath(cli: &Cli) -> Result<String> {
 
 fn pdeath_signal_name(signal: &str) -> Result<&'static str> {
     signals::canonical_signal_name(signal).ok_or_else(|| {
-        Error::msg(format!(
+        Error::usage(format!(
             "invalid pdeath signal '{}'; supported values align with `tino --help`",
             diagnostic::escape_str(signal)
         ))
@@ -695,7 +695,7 @@ fn write_default_config(cli: &Cli) -> Result<()> {
 fn write_config(path: &Path, cli: &Cli) -> Result<()> {
     let config_text = cli
         .config_text()
-        .map_err(|err| Error::msg(err.to_string()))?;
+        .map_err(|err| Error::usage(err.to_string()))?;
     let parent = path
         .parent()
         .context("config path has no parent directory")?;

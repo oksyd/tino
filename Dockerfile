@@ -46,5 +46,6 @@ RUN --mount=type=cache,id=tino-cargo-registry,target=/usr/local/cargo/registry \
 FROM scratch AS runtime
 
 COPY --from=builder /opt/app/tino /sbin/tino
+COPY --from=builder /opt/app/LICENSE /LICENSE
 
 ENTRYPOINT ["/sbin/tino"]

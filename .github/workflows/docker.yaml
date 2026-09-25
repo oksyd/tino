@@ -14,12 +14,12 @@ concurrency:
 
 env:
   CONTEXT: .
-  GHCR_IMAGE: ghcr.io/lvillis/tino
+  GHCR_IMAGE: ghcr.io/oksyd/tino
 
 jobs:
   prepare:
     if: ${{ github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
       tags: ${{ steps.tags.outputs.tags }}
@@ -77,10 +77,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-26.04
             arch: amd64
           - platform: linux/arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-26.04-arm
             arch: arm64
     steps:
       - name: Checkout
@@ -129,7 +129,7 @@ jobs:
       - prepare
       - build
     name: manifest
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     permissions:
       contents: read

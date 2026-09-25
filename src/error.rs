@@ -7,6 +7,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Error {
     message: String,
     source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    usage: bool,
 }
 
 impl Error {
@@ -15,7 +16,33 @@ impl Error {
         Self {
             message: message.into(),
             source: None,
+            usage: false,
         }
+    }
+
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source: None,
+            usage: true,
+        }
+    }
+
+    /// Returns the binary's exit code for this error: 2 for invalid usage,
+    /// or 1 for other failures. Context wrappers preserve this distinction.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        if self.usage {
+            return 2;
+        }
+        let mut source = self.source();
+        while let Some(err) = source {
+            if err.downcast_ref::<Self>().is_some_and(|err| err.usage) {
+                return 2;
+            }
+            source = err.source();
+        }
+        1
     }
 
     #[must_use]
@@ -26,6 +53,7 @@ impl Error {
         Self {
             message: message.into(),
             source: Some(Box::new(source)),
+            usage: false,
         }
     }
 }
@@ -126,4 +154,23 @@ macro_rules! bail {
     ($($arg:tt)*) => {
         return Err($crate::error!($($arg)*))
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_code_survives_nested_context() {
+        for (error, expected) in [
+            (Error::usage("bad option combination"), 2),
+            (Error::msg("supervision failed"), 1),
+        ] {
+            let result: Result<()> = Err(error);
+            let error = result.context("inner").context("outer").unwrap_err();
+            assert_eq!(error.exit_code(), expected);
+        }
+        let result: std::io::Result<()> = Err(std::io::Error::from_raw_os_error(13));
+        assert_eq!(result.context("open file").unwrap_err().exit_code(), 1);
+    }
 }

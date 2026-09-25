@@ -3,6 +3,7 @@ use crate::{
     signals::{SIGNAL_NAMES, canonical_signal_name},
 };
 use osarg::{Arg, Parser, count_flag, set_flag, standard};
+use std::cell::Cell;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -12,36 +13,38 @@ use std::path::Path;
 /// Default line-based configuration file read by the `tino` binary.
 pub const DEFAULT_CONFIG_PATH: &str = "/etc/tino/tino.conf";
 
+const USAGE: &str = "usage: tino [OPTIONS] [--] CMD [ARGS...]";
 const HELP_TEXT: &str = concat!(
-    "usage: tino [OPTIONS] [--] CMD [ARGS...]\n\n",
-    "options:\n",
-    "  -s, --subreaper                 Enable PR_SET_CHILD_SUBREAPER\n",
-    "  -p SIG                          Set PR_SET_PDEATHSIG (e.g. TERM, SIGTERM)\n",
-    "  -v                              Increase log verbosity (repeatable; max 3)\n",
-    "  -w, --warn-on-reap              Warn when reaping secondary child processes\n",
-    "  -g, --pgroup-kill               Forward signals to the child's process group\n",
-    "  -e, --remap-exit CODE           Remap child exit code to success (repeatable)\n",
-    "  -t, --grace-ms MS               Grace period before SIGKILL (default: 500)\n",
-    "      --write-restrict            Restrict child filesystem writes\n",
-    "      --write-allow PATH          Allow writable absolute PATH (repeatable; enables write restriction)\n",
-    "      --write-preset PRESET       Add writable preset: tmp, runtime (enables write restriction)\n",
-    "      --restrict-warn-only        Warn and continue when access restriction fails\n",
-    "      --write-no-dev              Do not automatically allow /dev writes\n",
-    "      --bind-tcp-allow PORT       Allow binding only on local TCP ports (1-65535)\n",
-    "      --connect-tcp-allow PORT    Allow outbound TCP only to remote ports (1-65535)\n",
-    "      --scope-signals             Restrict signal delivery to the same Landlock domain\n",
-    "      --scope-abstract-unix       Restrict abstract UNIX socket connects to the same Landlock domain\n",
-    "      --exec-allow PATH|CMD       Allow executing absolute PATH or PATH-resolved CMD\n",
-    "      --device-ioctl-allow PATH   Allow device ioctl operations beneath absolute PATH\n",
-    "      --expand-env                Expand ${VAR} and ${VAR:-default} in child args\n",
-    "      --explain                   Explain the effective configuration and exit\n",
-    "      --print-config              Print line-based config from active options\n",
-    "      --write-config              Write active options to /etc/tino/tino.conf\n",
-    "      --check-config              Validate /etc/tino/tino.conf and exit\n",
-    "      --no-config                 Do not read /etc/tino/tino.conf\n",
-    "  -l, --license                   Print license text and exit\n",
-    "  -h, --help                      Show help\n",
-    "  -V, --version                   Show version\n",
+    "Options:\n",
+    "  -s, --subreaper                Reap orphaned descendants\n",
+    "  -p, --parent-death-signal SIG  Signal child if tino dies\n",
+    "  -g, --pgroup-kill              Forward signals to the child's process group\n",
+    "  -w, --warn-on-reap             Warn on secondary reaps; enables subreaper\n",
+    "  -t, --grace-ms MS              Delay before SIGKILL (default: 500 ms)\n",
+    "  -e, --remap-exit CODE          Treat child exit CODE as success\n",
+    "  -v, --verbose                  Increase logging (-v: INFO, -vv: DEBUG)\n",
+    "      --expand-env               Expand environment variables in CMD/ARGS\n",
+    "  -h, --help                     Show help\n",
+    "  -V, --version                  Show version\n\n",
+    "Landlock (Linux):\n",
+    "      --write-restrict           Restrict child filesystem writes\n",
+    "      --write-allow PATH         Allow writes to PATH; enables restriction\n",
+    "      --write-preset PRESET      Allow tmp/runtime writes; enables restriction\n",
+    "      --write-no-dev             Do not automatically allow /dev writes\n",
+    "      --bind-tcp-allow PORT      Allow TCP binding only on selected ports\n",
+    "      --connect-tcp-allow PORT   Allow TCP connections only to selected ports\n",
+    "      --scope-signals            Limit signals to the same Landlock domain\n",
+    "      --scope-abstract-unix      Limit abstract sockets to the same domain\n",
+    "      --exec-allow PATH|CMD      Allow executing PATH or PATH-resolved CMD\n",
+    "      --device-ioctl-allow PATH  Allow device ioctl beneath absolute PATH\n",
+    "      --restrict-warn-only       Warn and continue when access restriction fails\n\n",
+    "Config (/etc/tino/tino.conf):\n",
+    "      --explain                  Show effective settings without running CMD\n",
+    "      --print-config             Validate and print config from CLI options\n",
+    "      --write-config             Validate and replace the config file\n",
+    "      --check-config             Validate the config file\n",
+    "      --no-config                Skip the config file\n\n",
+    "Documentation: https://github.com/oksyd/tino#readme\n",
 );
 
 const VERSION_TEXT: &str = concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), "\n");
@@ -118,7 +121,7 @@ impl CliParseError {
     fn help() -> Self {
         Self {
             kind: CliParseErrorKind::Help,
-            message: HELP_TEXT.to_string(),
+            message: format!("{USAGE}\n\n{HELP_TEXT}"),
         }
     }
 
@@ -155,7 +158,7 @@ impl CliParseError {
                 let mut stderr = io::stderr().lock();
                 let _ = writeln!(stderr, "error: {}", self.message);
                 let _ = writeln!(stderr);
-                let _ = stderr.write_all(HELP_TEXT.as_bytes());
+                let _ = writeln!(stderr, "{USAGE}\nTry 'tino --help' for more information.");
                 let _ = stderr.flush();
                 std::process::exit(2);
             }
@@ -182,7 +185,7 @@ pub struct Cli {
     pub subreaper: bool,
     /// Set a parent-death signal via `PR_SET_PDEATHSIG` (e.g. `TERM`, `SIGTERM`).
     pub pdeath: Option<String>,
-    /// Increase log verbosity (-v, -vv, -vvv).
+    /// Increase log verbosity (-v/--verbose; repeatable).
     pub verbosity: u8,
     /// Emit a warning when reaping secondary child processes.
     pub warn_on_reap: bool,
@@ -227,8 +230,6 @@ pub struct Cli {
     pub check_config: bool,
     /// Skip the fixed configuration file at [`DEFAULT_CONFIG_PATH`].
     pub no_config: bool,
-    /// Print license text and exit.
-    pub license: bool,
     /// Child command and trailing arguments.
     pub cmd: Vec<String>,
 }
@@ -277,7 +278,7 @@ impl Cli {
     /// Tries to parse process-like arguments and merge the fixed config file.
     ///
     /// The config file is read first and the provided CLI arguments are applied
-    /// afterward. Passing `--no-config`, `--license`, `--print-config`,
+    /// afterward. Passing `--no-config`, `--print-config`,
     /// `--write-config`, or `--check-config` skips config-file loading.
     /// Standard `--help` and `--version` requests exit during CLI-only parsing.
     pub fn try_parse_with_default_config_from<I, T>(args: I) -> Result<Self, CliParseError>
@@ -288,7 +289,6 @@ impl Cli {
         let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
         let cli_only = Self::try_parse_from(argv.clone())?;
         if cli_only.no_config
-            || cli_only.license
             || cli_only.print_config
             || cli_only.write_config
             || cli_only.check_config
@@ -308,32 +308,64 @@ impl Cli {
         if argv.next().is_none() {
             return Err(CliParseError::message("missing argv[0]".to_owned()));
         }
-        let mut parser = Parser::new(argv);
+        // osarg separates --name=value into a name and an optional value, then
+        // discards an unread value on next(). Track the raw token so flags can
+        // reject attached values without consuming the following command.
+        let attached_long_value = Cell::new(false);
+        let mut parser = Parser::new(argv.inspect(|raw| {
+            let bytes = raw.as_encoded_bytes();
+            attached_long_value.set(bytes.starts_with(b"--") && bytes.contains(&b'='));
+        }));
+        let mut grace_ms_supplied = false;
 
         while let Some(arg) = parser.next().map_err(from_osarg_error)? {
             if let Some(flag) = standard::classify(arg) {
+                reject_attached_flag_value(arg, attached_long_value.get())?;
                 return Err(match flag {
                     standard::Flag::Help => CliParseError::help(),
                     standard::Flag::Version => CliParseError::version(),
                 });
             }
 
+            let flag_slot = match arg {
+                Arg::Short('s') | Arg::Long("subreaper") => Some(&mut cli.subreaper),
+                Arg::Short('w') | Arg::Long("warn-on-reap") => Some(&mut cli.warn_on_reap),
+                Arg::Short('g') | Arg::Long("pgroup-kill") => Some(&mut cli.pgroup_kill),
+                Arg::Long("write-restrict") => Some(&mut cli.write_restrict),
+                Arg::Long("restrict-warn-only") => Some(&mut cli.restrict_warn_only),
+                Arg::Long("write-no-dev") => Some(&mut cli.write_no_dev),
+                Arg::Long("scope-signals") => Some(&mut cli.scope_signals),
+                Arg::Long("scope-abstract-unix") => Some(&mut cli.scope_abstract_unix),
+                Arg::Long("expand-env") => Some(&mut cli.expand_env),
+                Arg::Long("explain") => Some(&mut cli.explain),
+                Arg::Long("print-config") => Some(&mut cli.print_config),
+                Arg::Long("write-config") => Some(&mut cli.write_config),
+                Arg::Long("check-config") => Some(&mut cli.check_config),
+                Arg::Long("no-config") => Some(&mut cli.no_config),
+                _ => None,
+            };
+            if let Some(slot) = flag_slot {
+                reject_attached_flag_value(arg, attached_long_value.get())?;
+                set_flag(slot);
+                continue;
+            }
+
             match arg {
-                Arg::Short('s') | Arg::Long("subreaper") => set_flag(&mut cli.subreaper),
-                Arg::Short('p') => {
+                Arg::Short('p') | Arg::Long("parent-death-signal") => {
                     let raw = parser.value().map_err(from_osarg_error)?;
                     cli.pdeath = Some(parse_signal(raw.to_str().map_err(from_osarg_error)?)?);
                 }
-                Arg::Short('v') => count_flag(&mut cli.verbosity),
-                Arg::Short('w') | Arg::Long("warn-on-reap") => set_flag(&mut cli.warn_on_reap),
-                Arg::Short('g') | Arg::Long("pgroup-kill") => set_flag(&mut cli.pgroup_kill),
+                Arg::Short('v') | Arg::Long("verbose") => {
+                    reject_attached_flag_value(arg, attached_long_value.get())?;
+                    count_flag(&mut cli.verbosity);
+                }
                 Arg::Short('e') | Arg::Long("remap-exit") => {
                     *cli.remap_exit.push_mut(0) = parser.parse::<u8>().map_err(from_osarg_error)?;
                 }
                 Arg::Short('t') | Arg::Long("grace-ms") => {
                     cli.grace_ms = parser.parse::<u64>().map_err(from_osarg_error)?;
+                    grace_ms_supplied = true;
                 }
-                Arg::Long("write-restrict") => set_flag(&mut cli.write_restrict),
                 Arg::Long("write-allow") => {
                     *cli.write_allow.push_mut(String::new()) =
                         parse_string_value(&mut parser, "--write-allow")?;
@@ -342,8 +374,6 @@ impl Cli {
                     let preset = parse_string_value(&mut parser, "--write-preset")?;
                     *cli.write_preset.push_mut(WritePreset::Tmp) = WritePreset::parse(&preset)?;
                 }
-                Arg::Long("restrict-warn-only") => set_flag(&mut cli.restrict_warn_only),
-                Arg::Long("write-no-dev") => set_flag(&mut cli.write_no_dev),
                 Arg::Long("bind-tcp-allow") => {
                     *cli.bind_tcp_allow.push_mut(0) =
                         parse_port_value(&mut parser, "--bind-tcp-allow")?;
@@ -352,8 +382,6 @@ impl Cli {
                     *cli.connect_tcp_allow.push_mut(0) =
                         parse_port_value(&mut parser, "--connect-tcp-allow")?;
                 }
-                Arg::Long("scope-signals") => set_flag(&mut cli.scope_signals),
-                Arg::Long("scope-abstract-unix") => set_flag(&mut cli.scope_abstract_unix),
                 Arg::Long("exec-allow") => {
                     *cli.exec_allow.push_mut(String::new()) =
                         parse_string_value(&mut parser, "--exec-allow")?;
@@ -362,13 +390,6 @@ impl Cli {
                     *cli.device_ioctl_allow.push_mut(String::new()) =
                         parse_string_value(&mut parser, "--device-ioctl-allow")?;
                 }
-                Arg::Long("expand-env") => set_flag(&mut cli.expand_env),
-                Arg::Long("explain") => set_flag(&mut cli.explain),
-                Arg::Long("print-config") => set_flag(&mut cli.print_config),
-                Arg::Long("write-config") => set_flag(&mut cli.write_config),
-                Arg::Long("check-config") => set_flag(&mut cli.check_config),
-                Arg::Long("no-config") => set_flag(&mut cli.no_config),
-                Arg::Short('l') | Arg::Long("license") => set_flag(&mut cli.license),
                 Arg::Value(value) => {
                     let _ = value;
                     let (command, remaining) = parser
@@ -381,12 +402,17 @@ impl Cli {
                             .map(os_string_into_string)
                             .collect::<Result<Vec<_>, _>>()?,
                     );
-                    return Ok(cli);
+                    break;
                 }
                 other => return Err(from_osarg_error(other.unexpected())),
             }
         }
 
+        if cli.check_config && grace_ms_supplied {
+            return Err(CliParseError::message(
+                "--check-config does not accept --grace-ms".into(),
+            ));
+        }
         Ok(cli)
     }
 
@@ -452,6 +478,15 @@ impl Cli {
     }
 }
 
+fn reject_attached_flag_value(arg: Arg<'_>, attached: bool) -> Result<(), CliParseError> {
+    if attached && let Arg::Long(name) = arg {
+        return Err(CliParseError::message(format!(
+            "--{name} does not take a value"
+        )));
+    }
+    Ok(())
+}
+
 impl Default for Cli {
     fn default() -> Self {
         Self {
@@ -479,7 +514,6 @@ impl Default for Cli {
             write_config: false,
             check_config: false,
             no_config: false,
-            license: false,
             cmd: Vec::new(),
         }
     }
@@ -591,7 +625,7 @@ fn apply_config_line(
     let (key, value) = split_config_line(line);
     match key {
         "subreaper" => set_config_flag(&mut cli.subreaper, path, line_no, key, value),
-        "pdeath" => {
+        "pdeath" | "parent-death-signal" => {
             cli.pdeath = Some(
                 parse_signal(config_value(path, line_no, key, value)?)
                     .map_err(|err| config_error(path, line_no, err.to_string()))?,
@@ -652,7 +686,7 @@ fn apply_config_line(
         }
         "expand-env" => set_config_flag(&mut cli.expand_env, path, line_no, key, value),
         "explain" | "print-config" | "write-config" | "check-config" | "help" | "version"
-        | "license" | "no-config" => Err(config_error(
+        | "no-config" => Err(config_error(
             path,
             line_no,
             format!("'{}' is only allowed on the command line", escape_str(key)),
@@ -898,6 +932,93 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_attached_values_for_long_flags() {
+        for flag in [
+            "subreaper",
+            "warn-on-reap",
+            "pgroup-kill",
+            "write-restrict",
+            "restrict-warn-only",
+            "write-no-dev",
+            "scope-signals",
+            "scope-abstract-unix",
+            "expand-env",
+            "explain",
+            "print-config",
+            "write-config",
+            "check-config",
+            "no-config",
+            "help",
+            "version",
+            "verbose",
+        ] {
+            for value in ["", "false", "\u{1b}[31m"] {
+                let arg = format!("--{flag}={value}");
+                let err = Cli::try_parse_from(["tino", &arg]).unwrap_err();
+                assert_eq!(err.kind(), CliParseErrorKind::Message, "{arg:?}");
+                assert_eq!(err.to_string(), format!("--{flag} does not take a value"));
+            }
+        }
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn parse_rejects_non_utf8_attached_flag_values() {
+        let err = Cli::try_parse_from([
+            OsString::from("tino"),
+            OsString::from_vec(b"--restrict-warn-only=\xff".to_vec()),
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), CliParseErrorKind::Message);
+        assert_eq!(
+            err.to_string(),
+            "--restrict-warn-only does not take a value"
+        );
+    }
+
+    #[test]
+    fn parse_preserves_flag_like_values_and_command_arguments() {
+        for args in [
+            vec![
+                "tino",
+                "--exec-allow",
+                "--write-config=false",
+                "--",
+                "echo",
+                "--no-config=false",
+            ],
+            vec![
+                "tino",
+                "--exec-allow=--write-config=false",
+                "echo",
+                "--no-config=false",
+            ],
+        ] {
+            let cli = parse_ok(args);
+            assert_eq!(cli.exec_allow, ["--write-config=false"]);
+            assert_eq!(cli.cmd, ["echo", "--no-config=false"]);
+            assert!(!cli.write_config);
+            assert!(!cli.no_config);
+        }
+    }
+
+    #[test]
+    fn parse_check_config_rejects_explicit_default_grace() {
+        for args in [
+            vec!["tino", "--check-config", "--grace-ms", "500"],
+            vec!["tino", "--grace-ms=500", "--check-config"],
+            vec!["tino", "--check-config", "-t500"],
+            vec!["tino", "-t", "1", "-t", "500", "--check-config"],
+        ] {
+            let err = Cli::try_parse_from(args).unwrap_err();
+            assert_eq!(err.kind(), CliParseErrorKind::Message);
+            assert_eq!(err.to_string(), "--check-config does not accept --grace-ms");
+        }
+        let cli = parse_ok(["tino", "echo", "--check-config", "--grace-ms=500"]);
+        assert_eq!(cli.cmd, ["echo", "--check-config", "--grace-ms=500"]);
+    }
+
+    #[test]
     fn parse_rejects_empty_argv() {
         let err = Cli::try_parse_from(Vec::<OsString>::new()).unwrap_err();
 
@@ -929,8 +1050,6 @@ mod tests {
             (&["tino", "--write-config"], |cli| cli.write_config),
             (&["tino", "--check-config"], |cli| cli.check_config),
             (&["tino", "--no-config"], |cli| cli.no_config),
-            (&["tino", "-l"], |cli| cli.license),
-            (&["tino", "--license"], |cli| cli.license),
         ];
 
         for (args, predicate) in cases {
@@ -946,6 +1065,12 @@ mod tests {
                 cli.pdeath.as_deref() == Some("SIGTERM")
             }),
             (&["tino", "-pTERM"], |cli| {
+                cli.pdeath.as_deref() == Some("SIGTERM")
+            }),
+            (&["tino", "--parent-death-signal", "TERM"], |cli| {
+                cli.pdeath.as_deref() == Some("SIGTERM")
+            }),
+            (&["tino", "--parent-death-signal=TERM"], |cli| {
                 cli.pdeath.as_deref() == Some("SIGTERM")
             }),
             (&["tino", "-e", "3"], |cli| cli.remap_exit == vec![3]),
@@ -1038,7 +1163,13 @@ mod tests {
 
     #[test]
     fn parse_accumulates_repeated_verbosity_flags() {
-        let cases: &[(&[&str], u8)] = &[(&["tino", "-vvv"], 3), (&["tino", "-v", "-v"], 2)];
+        let cases: &[(&[&str], u8)] = &[
+            (&["tino", "-vvv"], 3),
+            (&["tino", "-v", "-v"], 2),
+            (&["tino", "--verbose"], 1),
+            (&["tino", "--verbose", "--verbose"], 2),
+            (&["tino", "--verbose", "-vv"], 3),
+        ];
 
         for (args, expected) in cases {
             let cli = parse_ok(*args);
@@ -1078,7 +1209,6 @@ mod tests {
             "/dev/null",
             "--expand-env",
             "--explain",
-            "--license",
             "--",
             "/bin/echo",
             "hello",
@@ -1108,7 +1238,6 @@ mod tests {
         assert!(!cli.write_config);
         assert!(!cli.check_config);
         assert!(!cli.no_config);
-        assert!(cli.license);
         assert_eq!(cli.cmd, vec!["/bin/echo", "hello"]);
     }
 
@@ -1403,7 +1532,7 @@ mod tests {
     fn cli_args_apply_on_top_of_config_content() {
         let base = parse_config_content(
             Path::new(DEFAULT_CONFIG_PATH),
-            "expand-env\nwrite-allow /data/logs\nbind-tcp-allow 8900\n",
+            "expand-env\nwrite-allow /data/logs\nbind-tcp-allow 8900\nparent-death-signal TERM\nverbosity 1\ngrace-ms 100\n",
         )
         .expect("parse config content");
         let cli = Cli::try_parse_from_base(
@@ -1413,6 +1542,9 @@ mod tests {
                 "/tmp",
                 "--bind-tcp-allow",
                 "9090",
+                "--parent-death-signal=USR1",
+                "--verbose",
+                "--grace-ms=250",
                 "--",
                 "/bin/echo",
                 "${MESSAGE:-ok}",
@@ -1424,6 +1556,9 @@ mod tests {
         assert!(cli.expand_env);
         assert_eq!(cli.write_allow, vec!["/data/logs", "/tmp"]);
         assert_eq!(cli.bind_tcp_allow, vec![8900, 9090]);
+        assert_eq!(cli.pdeath.as_deref(), Some("SIGUSR1"));
+        assert_eq!(cli.verbosity, 2);
+        assert_eq!(cli.grace_ms, 250);
         assert_eq!(cli.cmd, vec!["/bin/echo", "${MESSAGE:-ok}"]);
     }
 
@@ -1457,6 +1592,7 @@ mod tests {
     fn parse_rejects_missing_option_value() {
         let cases = [
             ["tino", "-p"],
+            ["tino", "--parent-death-signal"],
             ["tino", "-e"],
             ["tino", "-t"],
             ["tino", "--grace-ms"],

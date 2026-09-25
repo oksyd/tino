@@ -41,11 +41,6 @@ mod signals;
 /// rather than by manually filling every field.
 pub use cli::{Cli, DEFAULT_CONFIG_PATH, WritePreset};
 
-/// Bundled project license text.
-///
-/// This is the same text printed by the `--license` CLI flag.
-pub const LICENSE_TEXT: &str = include_str!("../LICENSE");
-
 pub use error::{Context, Error, Result};
 
 /// Execute `tino` with a parsed [`Cli`] configuration.

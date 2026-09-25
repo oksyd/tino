@@ -63,6 +63,118 @@ mod linux {
         assert!(output.stdout.is_empty());
     }
 
+    fn inherited_blocked_abort_does_not_terminate_supervisor() {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tino"));
+        command.args(["--no-config", "--", "/bin/sh", "-c", "exit 23"]);
+        // SAFETY: only the forked launcher is changed, using signal-safe calls.
+        unsafe {
+            command.pre_exec(|| {
+                let mut mask = std::mem::zeroed();
+                libc::sigemptyset(&raw mut mask);
+                libc::sigaddset(&raw mut mask, libc::SIGABRT);
+                let rc =
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, std::ptr::null_mut());
+                if rc != 0 {
+                    return Err(std::io::Error::from_raw_os_error(rc));
+                }
+                if libc::kill(libc::getpid(), libc::SIGABRT) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = command
+            .spawn()
+            .expect("launch with blocked pending SIGABRT");
+        assert_eq!(wait_with_timeout(&mut child).code(), Some(23));
+    }
+
+    fn library_preserves_blocked_fault_signals() {
+        let signals = [
+            libc::SIGABRT,
+            libc::SIGFPE,
+            libc::SIGILL,
+            libc::SIGSEGV,
+            libc::SIGBUS,
+            libc::SIGTRAP,
+            libc::SIGSYS,
+        ];
+        let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::sigemptyset(&raw mut mask) };
+        let mut originals = Vec::new();
+        for signal in signals {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = record_signal as *const () as usize;
+            unsafe {
+                libc::sigemptyset(&raw mut action.sa_mask);
+                libc::sigaddset(&raw mut mask, signal);
+            }
+            let mut original = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(signal, &raw const action, &raw mut original) },
+                0
+            );
+            originals.push((signal, original));
+        }
+        let mut previous_mask = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, &raw mut previous_mask)
+            },
+            0
+        );
+        let before = HANDLER_CALLS.load(Ordering::Relaxed);
+        for signal in signals {
+            assert_eq!(unsafe { libc::kill(libc::getpid(), signal) }, 0);
+        }
+        let cli = tino::Cli::try_parse_from(["tino", "--", "/bin/sh", "-c", "exit 23"]).unwrap();
+        assert_eq!(
+            tino::run(cli).expect("run with pending excluded signals"),
+            23
+        );
+        assert_eq!(HANDLER_CALLS.load(Ordering::Relaxed), before);
+        let mut pending = unsafe { std::mem::zeroed() };
+        let mut restored = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::sigpending(&raw mut pending) }, 0);
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut restored)
+            },
+            0
+        );
+        for signal in signals {
+            assert_eq!(unsafe { libc::sigismember(&raw const pending, signal) }, 1);
+            assert_eq!(unsafe { libc::sigismember(&raw const restored, signal) }, 1);
+        }
+        // Deliver the preserved signals only after returning to the caller.
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_UNBLOCK, &raw const mask, std::ptr::null_mut())
+            },
+            0
+        );
+        assert_eq!(
+            HANDLER_CALLS.load(Ordering::Relaxed),
+            before + signals.len()
+        );
+        for (signal, original) in originals {
+            assert_eq!(
+                unsafe { libc::sigaction(signal, &raw const original, std::ptr::null_mut()) },
+                0
+            );
+        }
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const previous_mask,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+    }
+
     fn flood_workload(cleanup: bool) -> ! {
         // This runs as a standalone, single-threaded workload, not a test worker.
         let supervisor = unsafe { libc::getppid() };
@@ -403,7 +515,7 @@ mod linux {
     }
 
     pub(super) fn run() {
-        let tests: [(&str, fn()); 7] = [
+        let tests: [(&str, fn()); 9] = [
             (
                 "inherited_sigchld_ignore_does_not_lose_exit_status",
                 inherited_sigchld_ignore_does_not_lose_exit_status,
@@ -411,6 +523,14 @@ mod linux {
             (
                 "child_sigpipe_uses_default_disposition",
                 child_sigpipe_uses_default_disposition,
+            ),
+            (
+                "inherited_blocked_abort_does_not_terminate_supervisor",
+                inherited_blocked_abort_does_not_terminate_supervisor,
+            ),
+            (
+                "library_preserves_blocked_fault_signals",
+                library_preserves_blocked_fault_signals,
             ),
             (
                 "library_restores_sigchld_disposition",
@@ -458,15 +578,34 @@ mod linux {
         }
         let list = args.iter().any(|arg| arg == "--list");
         let exact = args.iter().any(|arg| arg == "--exact");
-        let filter = args.first().filter(|arg| !arg.starts_with('-'));
-        for (name, test) in tests {
-            if filter.is_some_and(|filter| {
-                if exact {
-                    name != filter
-                } else {
-                    !name.contains(filter.as_str())
+        let mut filters = Vec::new();
+        let mut skips = Vec::new();
+        let mut arguments = args.iter();
+        while let Some(arg) = arguments.next() {
+            match arg.as_str() {
+                "--format" | "--color" | "--test-threads" | "-Z" => {
+                    arguments.next();
                 }
-            }) {
+                "--skip" => {
+                    if let Some(skip) = arguments.next() {
+                        skips.push(skip);
+                    }
+                }
+                _ if !arg.starts_with('-') => filters.push(arg),
+                _ => {}
+            }
+        }
+        let matches = |name: &str, filter: &String| {
+            if exact {
+                name == filter
+            } else {
+                name.contains(filter.as_str())
+            }
+        };
+        for (name, test) in tests {
+            if (!filters.is_empty() && !filters.iter().any(|filter| matches(name, filter)))
+                || skips.iter().any(|skip| matches(name, skip))
+            {
                 continue;
             }
             if list {

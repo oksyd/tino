@@ -37,7 +37,7 @@ pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
         return Ok(None);
     };
     let signal = signals::signal_by_name(sig_name).ok_or_else(|| {
-        Error::msg(format!(
+        Error::usage(format!(
             "invalid signal '{}'; supported values align with `tino --help`",
             escape_str(sig_name)
         ))
@@ -125,16 +125,16 @@ pub(super) fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<V
 
 pub(super) fn prepare_resolved_command(args: &[String]) -> Result<(CString, Vec<CString>)> {
     if args.is_empty() {
-        bail!("missing CMD (use --help)");
+        return Err(Error::usage("missing CMD (use --help)"));
     }
 
     let program = CString::new(args[0].as_str())
-        .map_err(|_| Error::msg("command argument contains embedded NUL byte"))?;
+        .map_err(|_| Error::usage("command argument contains embedded NUL byte"))?;
     let argv = args
         .iter()
         .map(|s| {
             CString::new(s.as_str())
-                .map_err(|_| Error::msg("command argument contains embedded NUL byte"))
+                .map_err(|_| Error::usage("command argument contains embedded NUL byte"))
         })
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok((program, argv))
@@ -142,7 +142,7 @@ pub(super) fn prepare_resolved_command(args: &[String]) -> Result<(CString, Vec<
 
 fn validate_program_name(args: &[String]) -> Result<()> {
     if args.first().is_some_and(String::is_empty) {
-        bail!("command program cannot be empty");
+        return Err(Error::usage("command program cannot be empty"));
     }
     Ok(())
 }
@@ -157,10 +157,10 @@ fn expand_command_arg(arg: &str) -> Result<String> {
 
 fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
     if depth > MAX_ENV_EXPANSION_DEPTH {
-        bail!(
+        return Err(Error::usage(format!(
             "environment expansion nesting exceeds {} levels",
             MAX_ENV_EXPANSION_DEPTH
-        );
+        )));
     }
 
     let mut expanded = String::with_capacity(arg.len());
@@ -204,16 +204,19 @@ fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
 fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
     if let Some((name, default)) = split_braced_default(body) {
         if !is_valid_env_name(name) {
-            bail!("invalid environment variable name '{}'", escape_str(name));
+            return Err(Error::usage(format!(
+                "invalid environment variable name '{}'",
+                escape_str(name)
+            )));
         }
         resolve_env_value(name, Some(default), depth)
     } else if is_valid_env_name(body) {
         resolve_env_value(body, None, depth)
     } else {
-        bail!(
+        Err(Error::usage(format!(
             "unsupported braced environment expansion '${{{}}}'",
             escape_str(body)
-        );
+        )))
     }
 }
 
@@ -276,7 +279,7 @@ fn find_matching_brace(arg: &str, mut idx: usize) -> Result<usize> {
         idx += 1;
     }
 
-    bail!("missing closing '}}'")
+    Err(Error::usage("missing closing '}'"))
 }
 
 fn split_braced_default(body: &str) -> Option<(&str, &str)> {

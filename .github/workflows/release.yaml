@@ -31,27 +31,27 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-24.04
+          - os: ubuntu-26.04
             target: x86_64-unknown-linux-gnu
             platform: linux/amd64
             asset-suffix: linux-x86_64-gnu
             use-cross: false
-          - os: ubuntu-24.04
+          - os: ubuntu-26.04
             target: x86_64-unknown-linux-musl
             platform: linux/amd64
             asset-suffix: linux-x86_64-musl
             use-cross: true
-          - os: ubuntu-24.04
+          - os: ubuntu-26.04
             target: arm-unknown-linux-gnueabihf
             platform: linux/arm/v6
             asset-suffix: linux-arm-gnueabihf
             use-cross: true
-          - os: ubuntu-24.04
+          - os: ubuntu-26.04
             target: aarch64-unknown-linux-musl
             platform: linux/arm64
             asset-suffix: linux-aarch64-musl
             use-cross: true
-          - os: ubuntu-24.04
+          - os: ubuntu-26.04
             target: armv7-unknown-linux-gnueabihf
             platform: linux/arm/v7
             asset-suffix: linux-armv7-gnueabihf
@@ -95,7 +95,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ matrix.target }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          key: rust-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Setup native compilation
         if: ${{ matrix.use-cross == false }}
@@ -180,7 +180,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     permissions:
       actions: read

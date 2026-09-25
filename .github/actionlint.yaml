@@ -1,0 +1,7 @@
+# GitHub-hosted labels missing from actionlint v1.7.12's built-in list.
+# Remove these entries once actionlint recognizes Ubuntu 26.04.
+# https://github.com/actions/runner-images#available-images
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04
+    - ubuntu-26.04-arm

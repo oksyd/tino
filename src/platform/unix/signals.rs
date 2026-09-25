@@ -45,7 +45,16 @@ pub(super) fn setup_signal_delivery() -> Result<(SigSet, SignalFd)> {
     for &signal in SIGNALS_EXCLUDED_FROM_SIGNALFD {
         block.remove(signal);
     }
-    block.thread_set_mask().context("sigprocmask")?;
+    // Excluded signals must not be consumed by signalfd, but they may already
+    // be blocked (and pending) in a library caller or the binary's launcher.
+    // Preserve those bits instead of unexpectedly delivering a fatal signal.
+    let mut supervisor_mask = block.clone();
+    for &signal in SIGNALS_EXCLUDED_FROM_SIGNALFD {
+        if previous_mask.contains_raw(signal as libc::c_int) {
+            supervisor_mask.add(signal);
+        }
+    }
+    supervisor_mask.thread_set_mask().context("sigprocmask")?;
 
     let signal_fd = match new_signal_fd(&block).context("signalfd") {
         Ok(signal_fd) => signal_fd,
