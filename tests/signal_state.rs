@@ -288,7 +288,15 @@ mod linux {
             );
             assert_eq!(action.sa_sigaction, record_signal as *const () as usize);
             assert_ne!(action.sa_flags & libc::SA_RESTART, 0);
-            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            // Concurrent flood probes share RLIMIT_SIGPENDING. Unlike raise's
+            // tgkill, kill can send one signal even when that quota is full.
+            // This probe is single-threaded, so delivery still tests this handler.
+            assert_eq!(
+                unsafe { libc::kill(libc::getpid(), signal) },
+                0,
+                "send signal {signal} to self failed: {}",
+                std::io::Error::last_os_error()
+            );
             assert_eq!(
                 unsafe { libc::sigaction(signal, &raw const original, std::ptr::null_mut()) },
                 0
