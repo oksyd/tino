@@ -1,6 +1,7 @@
 use super::sys::{
-    Errno, Pid, SIGABRT, SIGBUS, SIGCHLD, SIGFPE, SIGILL, SIGSEGV, SIGSYS, SIGTRAP, SigSet, Signal,
-    SignalAction, SignalFd, new_signal_fd, send_process_group_signal, send_process_signal,
+    Errno, Pid, SIGABRT, SIGBUS, SIGCHLD, SIGFPE, SIGILL, SIGPIPE, SIGSEGV, SIGSYS, SIGTRAP,
+    SigSet, Signal, SignalAction, SignalFd, current_process_id, new_signal_fd,
+    send_process_group_signal, send_process_signal,
 };
 use crate::{Context, Result, bail, logging};
 
@@ -59,6 +60,23 @@ pub(super) fn setup_signal_delivery() -> Result<(SigSet, SignalFd)> {
 
 pub(super) fn signal_by_name(name: &str) -> Option<Signal> {
     crate::signals::signal_from_str(name)
+}
+
+pub(super) fn read_forwardable_signal(
+    signal_fd: &mut SignalFd,
+) -> Result<Option<libc::signalfd_siginfo>> {
+    while let Some(info) = signal_fd.read_signal()? {
+        // Linux attributes pipe-write SIGPIPE to the writing process. Failed
+        // supervisor logging must not terminate a healthy managed command.
+        // External SIGPIPE still has its sender's PID and must be forwarded.
+        if info.ssi_signo == SIGPIPE as u32
+            && info.ssi_pid == current_process_id().as_raw().cast_unsigned()
+        {
+            continue;
+        }
+        return Ok(Some(info));
+    }
+    Ok(None)
 }
 
 pub(super) fn send_signal(pgid: bool, child: Pid, sig: libc::c_int) {

@@ -562,12 +562,6 @@ fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
             child_write_errno(errno);
             child_write_seccomp_hint(errno);
         }
-        landlock::LandlockError::OpenPath { path, errno } => {
-            child_write(b"open ");
-            child_write_escaped(path.to_bytes());
-            child_write(b" errno ");
-            child_write_errno(errno);
-        }
         landlock::LandlockError::AddRule { path, errno } => {
             child_write(b"add rule ");
             child_write_escaped(path.to_bytes());
@@ -821,6 +815,7 @@ mod tests {
 
     #[test]
     fn manage_process_group_detects_group_after_leader_exit() {
+        let _lock = super::super::CHILD_TEST_LOCK.lock().unwrap();
         let guard = PrctlStateGuard::capture();
         // SAFETY: the test temporarily enables subreaper mode so the forked
         // grandchild remains waitable by this process after the leader exits.

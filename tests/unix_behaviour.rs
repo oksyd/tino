@@ -348,6 +348,144 @@ fn landlock_exec_discovers_shared_interpreter_in_each_environment() {
 }
 
 #[test]
+fn broken_stderr_logging_does_not_signal_the_managed_command() {
+    if !landlock_available() {
+        return;
+    }
+    for verbose in [false, true] {
+        let (reader, writer) = std::io::pipe().expect("create broken stderr pipe");
+        drop(reader);
+        let mut command = tino_command();
+        if verbose {
+            command.arg("-vv");
+        }
+        let mut child = command
+            .args([
+                "--exec-allow",
+                "/bin/sleep",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 0.2; exit 37",
+            ])
+            .stdout(Stdio::null())
+            .stderr(writer)
+            .spawn()
+            .expect("spawn broken stderr probe");
+        let status = wait_child_with_timeout(&mut child, Duration::from_secs(5));
+        if status.is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(37),
+            "verbose: {verbose}"
+        );
+    }
+}
+
+#[test]
+fn externally_sent_sigpipe_is_forwarded() {
+    let mut child = tino_command()
+        .args([
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'ready\\n'; read token; exit 99",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn external SIGPIPE probe");
+    let mut stdout = BufReader::new(child.stdout.take().expect("probe stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read readiness marker");
+    assert_eq!(line.trim(), "ready");
+    // SAFETY: child.id() is the live supervisor PID returned by spawn.
+    assert_eq!(
+        unsafe { libc::kill(child.id().cast_signed(), libc::SIGPIPE) },
+        0
+    );
+    let status = wait_child_with_timeout(&mut child, Duration::from_secs(2));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert_eq!(status.and_then(|s| s.code()), Some(128 + libc::SIGPIPE));
+}
+
+#[test]
+fn shutdown_grace_is_shared_by_main_and_descendant_cleanup() {
+    if !python3_available() {
+        return;
+    }
+    let script = r#"import os, signal, time
+reader, writer = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(reader)
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    os.write(writer, b'1')
+    os.close(writer)
+    while True: time.sleep(1)
+else:
+    os.close(writer)
+    os.read(reader, 1)
+    os.close(reader)
+    def terminate(*_):
+        time.sleep(1.3)
+        os._exit(37)
+    signal.signal(signal.SIGTERM, terminate)
+    print(pid, flush=True)
+    while True: time.sleep(1)
+"#;
+    let mut child = tino_command()
+        .args([
+            "-s",
+            "-g",
+            "--grace-ms",
+            "2000",
+            "--",
+            "python3",
+            "-c",
+            script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn shared grace probe");
+    let mut stdout = BufReader::new(child.stdout.take().expect("probe stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("read grandchild PID");
+    let grandchild: libc::pid_t = line.trim().parse().expect("grandchild PID");
+    let started = Instant::now();
+    // SAFETY: child.id() is the live supervisor PID returned by spawn.
+    assert_eq!(
+        unsafe { libc::kill(child.id().cast_signed(), libc::SIGTERM) },
+        0
+    );
+    // A restarted grace period would take at least 3.3 seconds. Allow 0.9
+    // seconds for scheduling and reaping beyond the shared 2-second deadline.
+    let status = wait_child_with_timeout(&mut child, Duration::from_millis(2900));
+    if status.is_none() {
+        let _ = unsafe { libc::kill(grandchild, libc::SIGKILL) };
+        if wait_child_with_timeout(&mut child, Duration::from_secs(1)).is_none() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+    assert_eq!(
+        status.and_then(|s| s.code()),
+        Some(37),
+        "elapsed: {:?}",
+        started.elapsed()
+    );
+    assert!(!process_exists(grandchild), "descendant must be reaped");
+}
+
+#[test]
 fn signals_during_group_cleanup_preserve_main_exit_and_are_forwarded() {
     if !python3_available() {
         return;
@@ -1109,7 +1247,7 @@ fn print_config_rejects_missing_write_allow_path() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("canonicalize write allow path"),
+        stderr.contains("open write allow path"),
         "expected write-allow validation error\n{stderr}"
     );
 }

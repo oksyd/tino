@@ -20,6 +20,8 @@ use std::{
 
 mod child;
 mod landlock;
+#[cfg(test)]
+mod policy_tests;
 mod signals;
 pub(crate) mod sys;
 
@@ -27,8 +29,8 @@ use child::{
     configure_parent_prctl, manage_process_group, pdeath_signal, prepare_resolved_command,
     resolve_command_args, spawn_child,
 };
-use landlock::LandlockConfig;
-use signals::{ChildReapingRestore, send_signal, setup_signal_delivery};
+use landlock::{LandlockConfig, PathRuleKind, PinnedPath};
+use signals::{ChildReapingRestore, read_forwardable_signal, send_signal, setup_signal_delivery};
 #[cfg(test)]
 use sys::Signal;
 use sys::{
@@ -38,6 +40,11 @@ use sys::{
 };
 
 type ExitCodeRemap = super::ExitCodeRemap;
+type PinnedPaths = BTreeMap<Vec<u8>, PinnedPath>;
+
+// Tests that fork or call waitpid(-1) share the libtest process under cargo test.
+#[cfg(test)]
+static CHILD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 thread_local! {
@@ -130,6 +137,9 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         &argv_c,
     )
     .context("spawn child")?;
+    // The child has its own copies, all closed by exec. The supervisor need
+    // not retain policy descriptors for the entire workload lifetime.
+    drop(landlock_config);
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
 
     supervise_child(&cli, &expect_zero, child_pid, use_pgroup, &mut signal_fd)
@@ -234,10 +244,10 @@ fn build_landlock_config_for_args(
         return Ok(None);
     }
 
-    let mut unique = BTreeSet::new();
+    let mut unique = PinnedPaths::new();
     let mut preset_names = Vec::new();
-    let mut exec_allow = BTreeSet::new();
-    let mut device_ioctl_allow = BTreeSet::new();
+    let mut exec_allow = PinnedPaths::new();
+    let mut device_ioctl_allow = PinnedPaths::new();
 
     for preset in &cli.write_preset {
         let name = preset.as_str();
@@ -268,20 +278,19 @@ fn build_landlock_config_for_args(
         insert_landlock_device_ioctl_path(&mut device_ioctl_allow, path)?;
     }
 
-    let writable_dirs = unique
-        .into_iter()
-        .map(|path| CString::new(path).context("landlock writable path contains NUL byte"))
-        .collect::<Result<Vec<_>>>()?;
-    let exec_allow_paths = exec_allow
-        .into_iter()
-        .map(|path| CString::new(path).context("landlock exec allow path contains NUL byte"))
-        .collect::<Result<Vec<_>>>()?;
-    let device_ioctl_allow_paths = device_ioctl_allow
-        .into_iter()
-        .map(|path| {
-            CString::new(path).context("landlock device ioctl allow path contains NUL byte")
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let writable_dirs = unique.into_values().collect();
+    let exec_allow_paths = exec_allow.into_values().collect();
+    let device_ioctl_allow_paths = device_ioctl_allow.into_values().collect();
+    let dev_dir = if write_requested && !cli.write_no_dev {
+        pin_allow_path(
+            "/dev",
+            true,
+            "default writable directory",
+            PathRuleKind::Directory,
+        )?
+    } else {
+        None
+    };
 
     let bind_tcp_ports = unique_ports("--bind-tcp-allow", &cli.bind_tcp_allow)?;
     let connect_tcp_ports = unique_ports("--connect-tcp-allow", &cli.connect_tcp_allow)?;
@@ -292,6 +301,7 @@ fn build_landlock_config_for_args(
         no_dev: cli.write_no_dev,
         preset_names,
         writable_dirs,
+        dev_dir,
         bind_tcp_ports,
         connect_tcp_ports,
         scope_signals: cli.scope_signals,
@@ -350,22 +360,20 @@ const fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
 }
 
 fn insert_landlock_writable_dir(
-    unique: &mut BTreeSet<Vec<u8>>,
+    unique: &mut PinnedPaths,
     raw: &str,
     allow_missing: bool,
 ) -> Result<()> {
-    let Some(canonical) = canonicalize_allow_path(raw, allow_missing, "write allow path")? else {
+    let Some(path) = pin_allow_path(
+        raw,
+        allow_missing,
+        "write allow path",
+        PathRuleKind::Directory,
+    )?
+    else {
         return Ok(());
     };
-    let metadata = std::fs::metadata(&canonical)
-        .with_context(|| format!("inspect write allow path '{}'", escape_path(&canonical)))?;
-    if !metadata.is_dir() {
-        bail!(
-            "write allow path '{}' is not a directory",
-            escape_path(&canonical)
-        );
-    }
-    unique.insert(canonical.as_os_str().as_bytes().to_vec());
+    unique.insert(path.as_c_str().to_bytes().to_vec(), path);
     Ok(())
 }
 
@@ -414,7 +422,7 @@ impl ExecContext {
 
 type ExecVisits = BTreeSet<(PathBuf, ExecContext)>;
 
-fn insert_landlock_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
+fn insert_landlock_exec_path(unique: &mut PinnedPaths, raw: &str) -> Result<()> {
     let mut visited = BTreeSet::new();
     insert_landlock_exec_path_inner(
         unique,
@@ -425,7 +433,7 @@ fn insert_landlock_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Resul
     )
 }
 
-fn insert_landlock_main_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
+fn insert_landlock_main_exec_path(unique: &mut PinnedPaths, raw: &str) -> Result<()> {
     let mut visited = BTreeSet::new();
     insert_landlock_exec_path_inner(
         unique,
@@ -437,7 +445,7 @@ fn insert_landlock_main_exec_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> 
 }
 
 fn insert_landlock_exec_path_inner(
-    unique: &mut BTreeSet<Vec<u8>>,
+    unique: &mut PinnedPaths,
     raw: &str,
     visited: &mut ExecVisits,
     mode: ExecAllowMode,
@@ -462,7 +470,7 @@ fn insert_landlock_exec_path_inner(
 }
 
 fn insert_exec_search_candidates(
-    unique: &mut BTreeSet<Vec<u8>>,
+    unique: &mut PinnedPaths,
     candidates: Vec<PathBuf>,
     visited: &mut ExecVisits,
     context: &ExecContext,
@@ -493,7 +501,7 @@ fn insert_exec_search_candidates(
 }
 
 fn insert_resolved_exec_path(
-    unique: &mut BTreeSet<Vec<u8>>,
+    unique: &mut PinnedPaths,
     resolved: ResolvedExecAllowPath,
     visited: &mut ExecVisits,
     mode: ExecAllowMode,
@@ -507,17 +515,25 @@ fn insert_resolved_exec_path(
     if visited.len() > 256 {
         bail!("exec interpreter discovery exceeds 256 file/context pairs");
     }
-    unique.insert(resolved.canonical.as_os_str().as_bytes().to_vec());
-    if is_executable_file(&resolved.metadata) {
-        for interpreter in detect_exec_interpreters_in_context(&resolved.canonical, context)? {
-            insert_exec_interpreter(unique, interpreter, visited, mode, context)?;
-        }
+    let interpreters = if is_executable_file(&resolved.metadata) {
+        detect_exec_interpreters_in_context(&resolved.pinned, context)
+    } else {
+        Ok(Vec::new())
+    };
+    // Preserve the executable grant even if an optional PATH candidate cannot
+    // be read. Its discovery error is handled by the caller as before.
+    unique.insert(
+        resolved.canonical.as_os_str().as_bytes().to_vec(),
+        resolved.pinned,
+    );
+    for interpreter in interpreters? {
+        insert_exec_interpreter(unique, interpreter, visited, mode, context)?;
     }
     Ok(())
 }
 
 fn insert_exec_interpreter(
-    unique: &mut BTreeSet<Vec<u8>>,
+    unique: &mut PinnedPaths,
     interpreter: ExecInterpreter,
     visited: &mut ExecVisits,
     mode: ExecAllowMode,
@@ -547,7 +563,7 @@ fn insert_exec_interpreter(
 }
 
 fn insert_landlock_exec_path_candidate(
-    unique: &mut BTreeSet<Vec<u8>>,
+    unique: &mut PinnedPaths,
     path: PathBuf,
     visited: &mut ExecVisits,
     mode: ExecAllowMode,
@@ -583,40 +599,43 @@ fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
     metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
 }
 
-fn insert_landlock_device_ioctl_path(unique: &mut BTreeSet<Vec<u8>>, raw: &str) -> Result<()> {
+fn insert_landlock_device_ioctl_path(unique: &mut PinnedPaths, raw: &str) -> Result<()> {
     use std::os::unix::fs::FileTypeExt;
 
-    let canonical =
-        canonicalize_allow_path(raw, false, "device ioctl allow path")?.ok_or_else(|| {
-            Error::msg(format!(
-                "device ioctl allow path '{}' could not be resolved",
-                escape_path(Path::new(raw))
-            ))
-        })?;
-    let metadata = std::fs::metadata(&canonical).with_context(|| {
+    let path = PinnedPath::open(Path::new(raw), PathRuleKind::Any).with_context(|| {
+        format!(
+            "open device ioctl allow path '{}'",
+            escape_path(Path::new(raw))
+        )
+    })?;
+    let metadata = path.metadata().with_context(|| {
         format!(
             "inspect device ioctl allow path '{}'",
-            escape_path(&canonical)
+            escape_path(path.path())
         )
     })?;
     let file_type = metadata.file_type();
     if !metadata.is_dir() && !file_type.is_char_device() && !file_type.is_block_device() {
         bail!(
             "device ioctl allow path '{}' is neither a directory nor a device node",
-            escape_path(&canonical)
+            escape_path(path.path())
         );
     }
-    unique.insert(canonical.as_os_str().as_bytes().to_vec());
+    unique.insert(path.as_c_str().to_bytes().to_vec(), path);
     Ok(())
 }
 
-fn canonicalize_allow_path(raw: &str, allow_missing: bool, kind: &str) -> Result<Option<PathBuf>> {
-    let path = PathBuf::from(raw);
-    match std::fs::canonicalize(&path) {
-        Ok(canonical) => Ok(Some(canonical)),
-        Err(err) if allow_missing && err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+fn pin_allow_path(
+    raw: &str,
+    allow_missing: bool,
+    kind: &str,
+    rule_kind: PathRuleKind,
+) -> Result<Option<PinnedPath>> {
+    match PinnedPath::open(Path::new(raw), rule_kind) {
+        Ok(path) => Ok(Some(path)),
+        Err(err) if allow_missing && err.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(err) => {
-            Err(err).with_context(|| format!("canonicalize {kind} '{}'", escape_path(&path)))
+            Err(err).with_context(|| format!("open {kind} '{}'", escape_path(Path::new(raw))))
         }
     }
 }
@@ -624,6 +643,7 @@ fn canonicalize_allow_path(raw: &str, allow_missing: bool, kind: &str) -> Result
 struct ResolvedExecAllowPath {
     canonical: PathBuf,
     metadata: std::fs::Metadata,
+    pinned: PinnedPath,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -649,10 +669,12 @@ fn resolve_main_exec_allow_path(raw: &str) -> Result<Option<ResolvedExecAllowPat
     }
 }
 
-fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<ResolvedExecAllowPath> {
-    let canonical = std::fs::canonicalize(resolved)
-        .with_context(|| format!("canonicalize exec allow path '{}'", escape_path(resolved)))?;
-    let metadata = std::fs::metadata(&canonical)
+fn resolved_exec_allow_path_from_candidate(resolved: &Path) -> Result<ResolvedExecAllowPath> {
+    let pinned = PinnedPath::open(resolved, PathRuleKind::Any)
+        .with_context(|| format!("open exec allow path '{}'", escape_path(resolved)))?;
+    let canonical = pinned.path().to_path_buf();
+    let metadata = pinned
+        .metadata()
         .with_context(|| format!("inspect exec allow path '{}'", escape_path(&canonical)))?;
     if !metadata.is_dir() && !metadata.is_file() {
         bail!(
@@ -663,6 +685,7 @@ fn resolved_exec_allow_path_from_candidate(resolved: &PathBuf) -> Result<Resolve
     Ok(ResolvedExecAllowPath {
         canonical,
         metadata,
+        pinned,
     })
 }
 
@@ -802,14 +825,16 @@ fn default_exec_search_path() -> OsString {
 
 #[cfg(test)]
 fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
-    detect_exec_interpreters_in_context(path, &ExecContext::inherited())
+    let pinned = PinnedPath::open(path, PathRuleKind::Any).context("pin interpreter fixture")?;
+    detect_exec_interpreters_in_context(&pinned, &ExecContext::inherited())
 }
 
 fn detect_exec_interpreters_in_context(
-    path: &Path,
+    pinned: &PinnedPath,
     context: &ExecContext,
 ) -> Result<Vec<ExecInterpreter>> {
-    let file = File::open(path).with_context(|| {
+    let path = pinned.path();
+    let file = pinned.open_read().with_context(|| {
         format!(
             "open exec allow file '{}' for interpreter discovery",
             escape_path(path)
@@ -2249,14 +2274,15 @@ impl ShutdownDeadline {
             .map_or(Self::Never, Self::At)
     }
 
-    fn poll_timeout(self) -> PollTimeout {
+    fn remaining(self, now: Instant) -> Duration {
         match self {
-            Self::At(deadline) => {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX)
-            }
-            Self::Never => PollTimeout::MAX,
+            Self::At(deadline) => deadline.saturating_duration_since(now),
+            Self::Never => Duration::MAX,
         }
+    }
+
+    fn poll_timeout(self) -> PollTimeout {
+        PollTimeout::try_from(self.remaining(Instant::now())).unwrap_or(PollTimeout::MAX)
     }
 }
 
@@ -2291,7 +2317,7 @@ fn supervise_child(
             bail!("signal fd poll failed with events {:?}", events);
         }
         if events.contains(PollFlags::POLLIN) {
-            while let Some(info) = signal_fd.read_signal()? {
+            while let Some(info) = read_forwardable_signal(signal_fd)? {
                 let sig = info.ssi_signo.cast_signed();
                 if sig == SIGCHLD as libc::c_int {
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
@@ -2325,14 +2351,21 @@ fn supervise_child(
 
     let main_exit = main_exit.context("main child exit status was not observed")?;
     let final_exit = compute_exit_code(main_exit, expect_zero);
+    // Descendants share the shutdown deadline started by the first termination
+    // signal. Only a natural main-child exit starts a fresh cleanup grace period.
+    let cleanup_deadline =
+        shutdown_deadline.unwrap_or_else(|| ShutdownDeadline::after(Instant::now(), cli.grace_ms));
 
     if use_pgroup {
         logging::info(format_args!("sending SIGTERM to PGID"));
         send_signal(true, child_pid, SIGTERM as libc::c_int);
-        if !wait_for_cleanup(child_pid, true, cli, signal_fd, true)? {
+        if !wait_for_cleanup(child_pid, true, cli, signal_fd, cleanup_deadline, true)? {
             logging::info(format_args!("process group still alive; sending SIGKILL"));
             send_signal(true, child_pid, SIGKILL as libc::c_int);
-            let group_gone = wait_for_cleanup(child_pid, true, cli, signal_fd, false)?;
+            // Allow reaping after SIGKILL without delaying when SIGKILL is sent.
+            let reap_deadline = ShutdownDeadline::after(Instant::now(), cli.grace_ms);
+            let group_gone =
+                wait_for_cleanup(child_pid, true, cli, signal_fd, reap_deadline, false)?;
             if !group_gone {
                 logging::warn(format_args!(
                     "process group still alive after SIGKILL wait of {} ms",
@@ -2341,7 +2374,7 @@ fn supervise_child(
             }
         }
     } else {
-        let _ = wait_for_cleanup(child_pid, false, cli, signal_fd, true)?;
+        let _ = wait_for_cleanup(child_pid, false, cli, signal_fd, cleanup_deadline, true)?;
     }
 
     logging::info(format_args!("exiting with {}", final_exit));
@@ -2446,15 +2479,14 @@ fn wait_for_cleanup(
     use_pgroup: bool,
     cli: &Cli,
     signal_fd: &mut SignalFd,
+    deadline: ShutdownDeadline,
     interruptible: bool,
 ) -> Result<bool> {
-    let start = Instant::now();
-    let timeout = Duration::from_millis(cli.grace_ms);
     loop {
         let mut terminate = false;
         // Keep consuming signals after the main child exits. Otherwise pending
         // termination signals kill the supervisor when its mask is restored.
-        while let Some(info) = signal_fd.read_signal()? {
+        while let Some(info) = read_forwardable_signal(signal_fd)? {
             let sig = info.ssi_signo.cast_signed();
             if sig == SIGCHLD as libc::c_int
                 || sig == SIGTTIN as libc::c_int
@@ -2477,12 +2509,12 @@ fn wait_for_cleanup(
         if done {
             return Ok(true);
         }
-        if (interruptible && terminate) || start.elapsed() >= timeout {
+        let remaining = deadline.remaining(Instant::now());
+        if (interruptible && terminate) || remaining.is_zero() {
             return Ok(false);
         }
         // A group can contain processes we cannot waitpid, so periodically
         // check its existence even when no SIGCHLD arrives.
-        let remaining = timeout.saturating_sub(start.elapsed());
         let poll_timeout = PollTimeout::try_from(remaining.min(Duration::from_millis(10)))
             .unwrap_or(PollTimeout::MAX);
         let mut fds = [PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN)];
@@ -2603,7 +2635,7 @@ mod tests {
         }
     }
 
-    fn unique_env_name(prefix: &str) -> String {
+    pub(super) fn unique_env_name(prefix: &str) -> String {
         static NEXT_ENV_ID: AtomicU64 = AtomicU64::new(0);
 
         let id = NEXT_ENV_ID.fetch_add(1, Ordering::Relaxed);
@@ -2647,11 +2679,13 @@ mod tests {
 
     #[test]
     fn reaping_without_children_succeeds() {
+        let _lock = CHILD_TEST_LOCK.lock().unwrap();
         assert!(reap_available_children(false).unwrap());
     }
 
     #[test]
     fn sigchld_without_waitable_main_child_errors() {
+        let _lock = CHILD_TEST_LOCK.lock().unwrap();
         let mut main_exit = None;
         let err = handle_sigchld(&Cli::default(), Pid::from_raw(i32::MAX), &mut main_exit)
             .expect_err("missing main child status must be explicit");
@@ -2909,7 +2943,7 @@ mod tests {
 
     #[test]
     fn main_exec_auto_allow_skips_missing_program() {
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
 
         insert_landlock_main_exec_path(&mut unique, "/definitely/missing/tino-test-binary")
             .expect("missing main program should be left to execvp");
@@ -2943,7 +2977,7 @@ mod tests {
         std::fs::set_permissions(&file, perms).expect("chmod non-executable main file");
 
         for path in [&directory, &file] {
-            let mut unique = BTreeSet::new();
+            let mut unique = PinnedPaths::new();
             insert_landlock_main_exec_path(&mut unique, &path.to_string_lossy())
                 .expect("non-executable main path should be left to execvp");
 
@@ -3070,11 +3104,11 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod env shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
             .expect("missing shebang command should be left to child execution");
         let allowed = unique
-            .iter()
+            .keys()
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect::<Vec<_>>();
 
@@ -3113,11 +3147,11 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod invalid env shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
             .expect("invalid env shebang argument should be left to child execution");
         let allowed = unique
-            .iter()
+            .keys()
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect::<Vec<_>>();
 
@@ -3169,11 +3203,11 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod env PATH shebang script");
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
             .expect("missing shebang PATH command should not fall back to parent PATH");
         let allowed = unique
-            .iter()
+            .keys()
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect::<Vec<_>>();
 
@@ -3230,11 +3264,11 @@ mod tests {
             perms.set_mode(0o755);
             std::fs::set_permissions(&script, perms).expect("chmod env unset PATH shebang script");
 
-            let mut unique = BTreeSet::new();
+            let mut unique = PinnedPaths::new();
             insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
                 .expect("unset PATH shebang should not use parent PATH");
             let allowed = unique
-                .iter()
+                .keys()
                 .map(|path| String::from_utf8_lossy(path).into_owned())
                 .collect::<Vec<_>>();
 
@@ -3286,11 +3320,11 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod env -iS shebang script");
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
             .expect("env -iS shebang should not use parent PATH");
         let allowed = unique
-            .iter()
+            .keys()
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect::<Vec<_>>();
 
@@ -3344,11 +3378,11 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod chdir shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
             .expect("relative shebang PATH should resolve after env --chdir");
         let allowed = unique
-            .iter()
+            .keys()
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect::<Vec<_>>();
 
@@ -3390,11 +3424,11 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
             .expect("directory shebang interpreter should be left to child execution");
         let allowed = unique
-            .iter()
+            .keys()
             .map(|path| String::from_utf8_lossy(path).into_owned())
             .collect::<Vec<_>>();
 
@@ -3516,20 +3550,20 @@ mod tests {
 
     #[test]
     fn explicit_exec_allow_still_rejects_missing_program() {
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
 
         let err = insert_landlock_exec_path(&mut unique, "/definitely/missing/tino-test-binary")
             .expect_err("explicit missing exec allow path must fail");
 
         assert!(
-            format!("{err:#}").contains("canonicalize exec allow path"),
+            format!("{err:#}").contains("open exec allow path"),
             "unexpected error: {err:#}"
         );
     }
 
     #[test]
     fn explicit_exec_allow_missing_path_escapes_control_bytes() {
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
 
         let err = insert_landlock_exec_path(&mut unique, "/definitely/missing/tino-\u{1b}[31m")
             .expect_err("explicit missing exec allow path must fail");
@@ -3573,7 +3607,7 @@ mod tests {
 
     #[test]
     fn explicit_exec_allow_missing_path_command_escapes_control_bytes() {
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
 
         let err = insert_landlock_exec_path(&mut unique, "missing-\u{1b}[31m")
             .expect_err("explicit missing exec allow command must fail");
@@ -3611,7 +3645,7 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod explicit env shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should strictly validate shebang dependencies");
 
@@ -3647,7 +3681,7 @@ mod tests {
         std::fs::set_permissions(&script, perms)
             .expect("chmod explicit invalid env shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject unresolved shebang dependency");
 
@@ -3684,7 +3718,7 @@ mod tests {
         std::fs::set_permissions(&script, perms)
             .expect("chmod explicit env shebang escaping script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject missing shebang dependency");
         let message = format!("{err:#}");
@@ -3730,7 +3764,7 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod explicit env PATH shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject missing shebang PATH command");
 
@@ -3775,7 +3809,7 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod env -iS shebang script");
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit env -iS shebang must not use parent PATH");
 
@@ -3813,7 +3847,7 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
 
-        let mut unique = BTreeSet::new();
+        let mut unique = PinnedPaths::new();
         let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
             .expect_err("explicit exec allow should reject directory shebang dependency");
         let message = format!("{err:#}");

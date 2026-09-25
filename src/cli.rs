@@ -211,6 +211,7 @@ pub struct Cli {
     /// Restrict abstract UNIX socket connects to the same Landlock domain (Linux only).
     pub scope_abstract_unix: bool,
     /// Allow executing files beneath this path when exec restriction is enabled (repeatable).
+    /// Discovered interpreters/loaders are allowed too; they may run other readable code.
     pub exec_allow: Vec<String>,
     /// Allow device ioctl operations beneath this path (directory or device node; repeatable).
     pub device_ioctl_allow: Vec<String>,

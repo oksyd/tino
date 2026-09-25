@@ -62,7 +62,9 @@ pub use error::{Context, Error, Result};
 /// handling and child reaping for the duration of the call. Multithreaded hosts
 /// must launch the `tino` binary as a subprocess; otherwise this function returns
 /// an error before changing signal state or spawning the managed command.
-/// Configuration-only operations do not have this restriction.
+/// Configuration-only operations may run in multithreaded processes. Executable
+/// interpreter discovery (including for `--explain`) also requires procfs to
+/// read pinned files through `/proc/self/fd`.
 pub fn run(cli: Cli) -> Result<i32> {
     platform::run(cli)
 }

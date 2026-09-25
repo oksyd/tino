@@ -135,7 +135,7 @@ Landlock-based restrictions require Linux 5.13+ with Landlock enabled.
 - `--bind-tcp-allow`, `--connect-tcp-allow` require Landlock ABI v4+
 - `--device-ioctl-allow` requires Landlock ABI v5+
 - `--scope-signals`, `--scope-abstract-unix` require Landlock ABI v6+
-- `--exec-allow` restricts which executables the child may launch after startup
+- `--exec-allow` restricts kernel execute access to allowed files and directories
 
 `--write-allow` and `--write-preset` enable write restriction automatically.
 Use `--write-restrict` when you want write restriction without adding writable
@@ -150,6 +150,17 @@ Use absolute filesystem paths for write and device `ioctl` allowlists.
 Command names allow matching executable files across `PATH`, including fallback
 candidates when an earlier match cannot run. Use an absolute path to allow a
 specific file.
+
+Filesystem allowlist entries are opened during validation and held until the
+child applies its rules. Renaming an entry or replacing it with a symlink after
+validation does not redirect its grant to another object.
+
+The main command and its discovered interpreters and dynamic loaders are
+automatically allowed. `--exec-allow` does not restrict file reads or executable
+memory mappings: an allowed interpreter or dynamic loader can load and run code
+from other readable files. It therefore does not guarantee that only allowlisted
+code runs. For example, an allowed dynamic loader can be invoked directly with a
+program that cannot be executed directly under the allowlist.
 
 Example:
 
@@ -230,7 +241,9 @@ It checks `/proc/self/task` before changing signal state or spawning the command
 so procfs must be mounted at `/proc`, including when using the binary.
 Multithreaded applications should launch the `tino` binary as a subprocess;
 direct supervision through `run` returns an error in that case.
-Configuration-only operations are exempt from these requirements.
+Configuration-only operations may run in multithreaded processes. Executable
+interpreter discovery, including for `--explain`, reads pinned files through
+`/proc/self/fd` and also requires procfs.
 
 ## Testing
 

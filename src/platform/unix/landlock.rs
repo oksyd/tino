@@ -1,4 +1,9 @@
 use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 use super::sys::Errno;
 
@@ -7,13 +12,62 @@ pub(super) struct LandlockConfig {
     pub warn_only: bool,
     pub no_dev: bool,
     pub preset_names: Vec<&'static str>,
-    pub writable_dirs: Vec<CString>,
+    pub writable_dirs: Vec<PinnedPath>,
+    pub dev_dir: Option<PinnedPath>,
     pub bind_tcp_ports: Vec<u16>,
     pub connect_tcp_ports: Vec<u16>,
     pub scope_signals: bool,
     pub scope_abstract_unix: bool,
-    pub exec_allow_paths: Vec<CString>,
-    pub device_ioctl_allow_paths: Vec<CString>,
+    pub exec_allow_paths: Vec<PinnedPath>,
+    pub device_ioctl_allow_paths: Vec<PinnedPath>,
+}
+
+/// An opened policy object. Its path is only a diagnostic label: validation,
+/// interpreter inspection and rule creation must all use this same object.
+#[derive(Debug)]
+pub(super) struct PinnedPath {
+    path: CString,
+    file: File,
+}
+
+impl PinnedPath {
+    pub(super) fn open(path: &Path, kind: PathRuleKind) -> io::Result<Self> {
+        let raw = CString::new(path.as_os_str().as_bytes())?;
+        let fd = open_rule_path(&raw, kind)
+            .map_err(|errno| io::Error::from_raw_os_error(errno.raw()))?;
+        // SAFETY: open_rule_path returned a new descriptor with O_CLOEXEC.
+        let file = unsafe { File::from_raw_fd(fd) };
+        // Obtain a label after pinning. A fallback label never participates in
+        // rule application, including when procfs is unavailable to --explain.
+        let canonical = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+            .or_else(|_| std::fs::canonicalize(path))?;
+        Ok(Self {
+            path: CString::new(canonical.as_os_str().as_bytes())?,
+            file,
+        })
+    }
+
+    pub(super) fn as_c_str(&self) -> &CStr {
+        &self.path
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        Path::new(std::ffi::OsStr::from_bytes(self.path.as_bytes()))
+    }
+
+    pub(super) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    pub(super) fn open_read(&self) -> io::Result<File> {
+        // Reopen the pinned inode for reading, not its potentially replaced
+        // pathname. O_PATH also lets execute-only files remain policy objects.
+        File::open(self.fd_path())
+    }
+
+    fn fd_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
 }
 
 #[derive(Debug)]
@@ -26,10 +80,6 @@ pub(super) enum LandlockError<'a> {
     },
     QueryAbi(Errno),
     CreateRuleset(Errno),
-    OpenPath {
-        path: &'a CStr,
-        errno: Errno,
-    },
     AddRule {
         path: &'a CStr,
         errno: Errno,
@@ -146,31 +196,20 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
         Err(errno) => return Err(LandlockError::CreateRuleset(errno)),
     };
 
-    if config.write_requested && !config.no_dev {
-        let dev_dir = c"/dev";
-        if let Err(err) =
-            add_writable_dir_rule(ruleset_fd.0, dev_dir, LANDLOCK_ACCESS_FS_WRITE_FILE)
-        {
-            match err {
-                LandlockError::OpenPath {
-                    errno: Errno::ENOENT,
-                    ..
-                } => {}
-                other => return Err(other),
-            }
-        }
+    if let Some(dev_dir) = &config.dev_dir {
+        add_path_beneath_rule(ruleset_fd.0, dev_dir, LANDLOCK_ACCESS_FS_WRITE_FILE)?;
     }
 
     for dir in &config.writable_dirs {
-        add_writable_dir_rule(ruleset_fd.0, dir.as_c_str(), allowed_writes)?;
+        add_path_beneath_rule(ruleset_fd.0, dir, allowed_writes)?;
     }
 
     for path in &config.exec_allow_paths {
-        add_exec_path_rule(ruleset_fd.0, path.as_c_str())?;
+        add_path_beneath_rule(ruleset_fd.0, path, LANDLOCK_ACCESS_FS_EXECUTE)?;
     }
 
     for path in &config.device_ioctl_allow_paths {
-        add_device_ioctl_path_rule(ruleset_fd.0, path.as_c_str())?;
+        add_path_beneath_rule(ruleset_fd.0, path, LANDLOCK_ACCESS_FS_IOCTL_DEV)?;
     }
 
     for port in &config.bind_tcp_ports {
@@ -312,7 +351,7 @@ const fn handled_scope_access(
     Ok(handled)
 }
 
-fn query_abi_version() -> std::result::Result<Option<u32>, Errno> {
+pub(super) fn query_abi_version() -> std::result::Result<Option<u32>, Errno> {
     // SAFETY: calling a raw syscall with documented parameters and a null pointer for the
     // version query is safe.
     let ret = unsafe {
@@ -392,50 +431,20 @@ fn create_ruleset(
     }
 }
 
-fn add_writable_dir_rule(
-    ruleset_fd: i32,
-    path: &CStr,
-    allowed_access: u64,
-) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(ruleset_fd, path, allowed_access, PathRuleKind::Directory)
-}
-
-fn add_exec_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(
-        ruleset_fd,
-        path,
-        LANDLOCK_ACCESS_FS_EXECUTE,
-        PathRuleKind::Any,
-    )
-}
-
-fn add_device_ioctl_path_rule(ruleset_fd: i32, path: &CStr) -> Result<(), LandlockError<'_>> {
-    add_path_beneath_rule(
-        ruleset_fd,
-        path,
-        LANDLOCK_ACCESS_FS_IOCTL_DEV,
-        PathRuleKind::Any,
-    )
-}
-
 #[derive(Clone, Copy)]
-enum PathRuleKind {
+pub(super) enum PathRuleKind {
     Any,
     Directory,
 }
 
 fn add_path_beneath_rule(
     ruleset_fd: i32,
-    path: &CStr,
+    path: &PinnedPath,
     allowed_access: u64,
-    kind: PathRuleKind,
 ) -> Result<(), LandlockError<'_>> {
-    let path_fd =
-        open_rule_path(path, kind).map_err(|errno| LandlockError::OpenPath { path, errno })?;
-    let path_fd = OwnedFd(path_fd);
     let attr = LandlockPathBeneathAttr {
         allowed_access,
-        parent_fd: path_fd.0,
+        parent_fd: path.file.as_raw_fd(),
     };
     // SAFETY: calling the Landlock add_rule syscall with a pointer to a C-compatible struct.
     let ret = unsafe {
@@ -449,7 +458,7 @@ fn add_path_beneath_rule(
     };
     if ret == -1 {
         return Err(LandlockError::AddRule {
-            path,
+            path: path.as_c_str(),
             errno: Errno::last(),
         });
     }
