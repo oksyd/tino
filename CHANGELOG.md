@@ -1,8 +1,26 @@
+## [0.1.34] - 2026-09-25
+
+### 🐛 Bug Fixes
+
+- [**breaking**] Correct child signal handling and Landlock enforcement
+- [**breaking**] Correct exec discovery and shutdown signal handling
+- Pin Landlock grants and correct signal and shutdown handling
+- Enforce shutdown deadlines and correct interpreter discovery
+- [**breaking**] Correct CLI validation, signal handling and interpreter discovery
+- Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Update
 ## [0.1.33] - 2026-05-17
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.33
 ## [0.1.32] - 2026-05-16
 
 ### 🐛 Bug Fixes
