@@ -62,10 +62,65 @@ pub(super) fn signal_by_name(name: &str) -> Option<Signal> {
     crate::signals::signal_from_str(name)
 }
 
+struct SignalDispositionRestore {
+    signal: libc::c_int,
+    action: SignalAction,
+}
+
+impl Drop for SignalDispositionRestore {
+    fn drop(&mut self) {
+        if let Err(err) = self.action.restore_raw(self.signal) {
+            logging::warn(format_args!(
+                "restore signal {} disposition failed: {err}",
+                self.signal
+            ));
+        }
+    }
+}
+
+pub(super) fn restore_signal_delivery(previous_mask: &SigSet) -> Result<()> {
+    // A bounded final batch can leave queued signals behind. Temporarily
+    // ignore signals that supervision blocked but the caller did not: the
+    // kernel discards their backlog without another unbounded drain loop.
+    // Keep them ignored while unblocking, then restore the caller's actions.
+    // Signals the caller already blocked retain both their mask and backlog.
+    let current_mask = SigSet::thread_get_mask();
+    let mut restore = Vec::new();
+    if let Ok(current_mask) = current_mask {
+        for signal in 1..=libc::SIGRTMAX() {
+            // SIGCHLD is never forwarded. Ignoring it here could discard exit
+            // status for children still owned by a library caller.
+            if signal != SIGCHLD as libc::c_int
+                && current_mask.contains_raw(signal)
+                && !previous_mask.contains_raw(signal)
+            {
+                match SignalAction::set_ignored_raw(signal) {
+                    Ok(action) => restore.push(SignalDispositionRestore { signal, action }),
+                    Err(err) => logging::warn(format_args!(
+                        "discard pending signal {signal} failed: {err}"
+                    )),
+                }
+            }
+        }
+    }
+    let result = previous_mask
+        .thread_set_mask()
+        .context("restore signal mask");
+    drop(restore);
+    result
+}
+
 pub(super) fn read_forwardable_signal(
     signal_fd: &mut SignalFd,
+    budget: &mut usize,
 ) -> Result<Option<libc::signalfd_siginfo>> {
-    while let Some(info) = signal_fd.read_signal()? {
+    while *budget > 0 {
+        let Some(info) = signal_fd.read_signal()? else {
+            return Ok(None);
+        };
+        // Ignored signals also consume the budget so filtering cannot prevent
+        // the supervisor from checking its shutdown deadline.
+        *budget -= 1;
         // Linux attributes pipe-write SIGPIPE to the writing process. Failed
         // supervisor logging must not terminate a healthy managed command.
         // External SIGPIPE still has its sender's PID and must be forwarded.

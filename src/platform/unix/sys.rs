@@ -156,30 +156,43 @@ pub(super) struct SignalAction(libc::sigaction);
 
 impl SignalAction {
     pub(super) fn set_default(signal: Signal) -> Result<Self> {
+        Self::replace(signal as i32, libc::SIG_DFL)
+    }
+
+    pub(super) fn set_ignored_raw(signal: libc::c_int) -> Result<Self> {
+        Self::replace(signal, libc::SIG_IGN)
+    }
+
+    fn replace(signal: libc::c_int, handler: libc::sighandler_t) -> Result<Self> {
         // SAFETY: sigaction is initialized before use; an empty mask and zero flags
         // also clear SA_NOCLDWAIT/SA_NOCLDSTOP when resetting SIGCHLD.
         let mut action: libc::sigaction = unsafe { zeroed() };
-        action.sa_sigaction = libc::SIG_DFL;
+        action.sa_sigaction = handler;
         unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
         let mut previous = unsafe { zeroed() };
         // SAFETY: both pointers refer to valid sigaction storage.
-        errno_unit(unsafe {
-            libc::sigaction(signal as i32, &raw const action, &raw mut previous)
-        })?;
+        errno_unit(unsafe { libc::sigaction(signal, &raw const action, &raw mut previous) })?;
         Ok(Self(previous))
     }
 
     pub(super) fn restore(&self, signal: Signal) -> Result<()> {
+        self.restore_raw(signal as i32)
+    }
+
+    pub(super) fn restore_raw(&self, signal: libc::c_int) -> Result<()> {
         // SAFETY: the action was captured by sigaction for this signal.
-        errno_unit(unsafe {
-            libc::sigaction(signal as i32, &raw const self.0, std::ptr::null_mut())
-        })
+        errno_unit(unsafe { libc::sigaction(signal, &raw const self.0, std::ptr::null_mut()) })
     }
 }
 
 pub(super) struct SigSet(libc::sigset_t);
 
 impl SigSet {
+    pub(super) fn contains_raw(&self, signal: libc::c_int) -> bool {
+        // SAFETY: self holds an initialized set; invalid signal numbers return -1.
+        unsafe { libc::sigismember(&raw const self.0, signal) == 1 }
+    }
+
     pub(super) fn all() -> Self {
         // SAFETY: sigset_t is plain old data and is immediately initialized by sigfillset.
         let mut set = unsafe { zeroed() };

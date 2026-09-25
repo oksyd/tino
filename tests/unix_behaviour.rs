@@ -181,6 +181,125 @@ fn without_capabilities(command: &mut Command) {
 }
 
 #[test]
+fn landlock_exec_allows_execute_only_main_by_absolute_path_and_path_search() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-execute-only-main");
+    std::fs::create_dir_all(&root).expect("create execute-only fixture directory");
+    let program = root.join("probe");
+    std::fs::copy("/bin/true", &program).expect("copy execute-only program");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o111))
+        .expect("remove read permissions");
+    for main in [program.as_os_str(), std::ffi::OsStr::new("probe")] {
+        let mut command = tino_command();
+        command
+            .env("PATH", &root)
+            .args(["--exec-allow", "/bin/true", "--"])
+            .arg(main);
+        without_capabilities(&mut command);
+        let output = command.output().expect("run execute-only main");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{main:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove execute-only fixtures");
+}
+
+// Locate PT_INTERP in a native executable without depending on patchelf or a
+// compiler. /bin/true may be static on minimal systems, in which case skip it.
+fn native_elf_interpreter_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> {
+    if !bytes.starts_with(b"\x7fELF") {
+        return None;
+    }
+    let little = bytes[5] == 1;
+    let number = |offset: usize, len: usize| -> usize {
+        let slice = &bytes[offset..offset + len];
+        if little {
+            slice
+                .iter()
+                .rev()
+                .fold(0, |value, byte| (value << 8) | usize::from(*byte))
+        } else {
+            slice
+                .iter()
+                .fold(0, |value, byte| (value << 8) | usize::from(*byte))
+        }
+    };
+    let (table, stride, count, offset_field, size_field, word) = match bytes[4] {
+        1 => (number(28, 4), number(42, 2), number(44, 2), 4, 16, 4),
+        2 => (number(32, 8), number(54, 2), number(56, 2), 8, 32, 8),
+        _ => return None,
+    };
+    for index in 0..count {
+        let header = table + index * stride;
+        if number(header, 4) == 3 {
+            let offset = number(header + offset_field, word);
+            return Some(offset..offset + number(header + size_field, word));
+        }
+    }
+    None
+}
+
+#[test]
+fn landlock_exec_resolves_bare_elf_loader_from_cwd() {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !landlock_available() {
+        return;
+    }
+    let original = std::fs::read("/bin/true").expect("read native executable");
+    let Some(range) = native_elf_interpreter_range(&original) else {
+        return;
+    };
+    let loader = std::ffi::OsStr::from_bytes(
+        original[range.clone()]
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap(),
+    );
+    let root = unique_temp_dir("tino-relative-elf-loader");
+    let allowed = root.join("empty");
+    std::fs::create_dir_all(&allowed).expect("create ELF fixture directory");
+    std::os::unix::fs::symlink(loader, root.join("auditld")).expect("link local loader");
+    let program = root.join("probe");
+    for interpreter in [b"auditld\0".as_slice(), b"./auditld\0"] {
+        assert!(interpreter.len() <= range.len());
+        let mut bytes = original.clone();
+        bytes[range.clone()].fill(0);
+        bytes[range.start..range.start + interpreter.len()].copy_from_slice(interpreter);
+        std::fs::write(&program, bytes).expect("write native ELF with relative loader");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            Command::new(&program)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let output = tino_command()
+            .current_dir(&root)
+            .env("PATH", &allowed)
+            .arg("--exec-allow")
+            .arg(&allowed)
+            .arg("--")
+            .arg(&program)
+            .output()
+            .expect("run ELF with relative loader under Landlock");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{interpreter:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove ELF fixtures");
+}
+
+#[test]
 fn landlock_exec_ignores_unreadable_later_path_candidate() {
     if !landlock_available() {
         return;

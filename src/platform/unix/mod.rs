@@ -30,7 +30,10 @@ use child::{
     resolve_command_args, spawn_child,
 };
 use landlock::{LandlockConfig, PathRuleKind, PinnedPath};
-use signals::{ChildReapingRestore, read_forwardable_signal, send_signal, setup_signal_delivery};
+use signals::{
+    ChildReapingRestore, read_forwardable_signal, restore_signal_delivery, send_signal,
+    setup_signal_delivery,
+};
 #[cfg(test)]
 use sys::Signal;
 use sys::{
@@ -157,7 +160,7 @@ impl<'a> SignalMaskRestore<'a> {
 
 impl Drop for SignalMaskRestore<'_> {
     fn drop(&mut self) {
-        if let Err(err) = self.previous_mask.thread_set_mask() {
+        if let Err(err) = restore_signal_delivery(self.previous_mask) {
             logging::warn(format_args!("restore signal mask failed: {}", err));
         }
     }
@@ -520,16 +523,29 @@ fn insert_resolved_exec_path(
     } else {
         Ok(Vec::new())
     };
-    // Preserve the executable grant even if an optional PATH candidate cannot
-    // be read. Its discovery error is handled by the caller as before.
+    // Pin the executable even when optional interpreter discovery fails. This
+    // applies equally to absolute main commands and PATH candidates; explicitly
+    // listed files still require successful inspection.
     unique.insert(
         resolved.canonical.as_os_str().as_bytes().to_vec(),
         resolved.pinned,
     );
-    for interpreter in interpreters? {
-        insert_exec_interpreter(unique, interpreter, visited, mode, context)?;
+    let discovery = (|| {
+        for interpreter in interpreters? {
+            insert_exec_interpreter(unique, interpreter, visited, mode, context)?;
+        }
+        Ok(())
+    })();
+    if mode == ExecAllowMode::Auto
+        && let Err(err) = &discovery
+    {
+        logging::debug(format_args!(
+            "skip interpreter discovery for executable '{}': {err}",
+            escape_path(&resolved.canonical)
+        ));
+        return Ok(());
     }
-    Ok(())
+    discovery
 }
 
 fn insert_exec_interpreter(
@@ -851,7 +867,11 @@ fn detect_exec_interpreters_in_context(
     }
     if shebang_prefix.starts_with(ELF_MAGIC) {
         return Ok(match read_elf_interpreter_from_file(&file, path)? {
-            ElfInterpreter::Interpreter(path) => vec![ExecInterpreter::Candidate(path)],
+            // PT_INTERP is a filesystem path, even when it is a bare name.
+            // Keep it out of the command-name PATH search, as with shebangs.
+            ElfInterpreter::Interpreter(path) => vec![ExecInterpreter::Candidate(
+                filesystem_interpreter_path(path.into_os_string()),
+            )],
             ElfInterpreter::NoInterpreter => Vec::new(),
             ElfInterpreter::Invalid => {
                 vec![ExecInterpreter::Candidate(PathBuf::from(
@@ -1033,8 +1053,11 @@ fn parse_shebang_line(line: &[u8]) -> Shebang<'_> {
 }
 
 fn shebang_interpreter_path(interpreter: &[u8]) -> PathBuf {
-    let path = OsString::from_vec(interpreter.to_vec());
-    if interpreter.contains(&b'/') {
+    filesystem_interpreter_path(OsString::from_vec(interpreter.to_vec()))
+}
+
+fn filesystem_interpreter_path(path: OsString) -> PathBuf {
+    if path.as_bytes().contains(&b'/') {
         PathBuf::from(path)
     } else {
         PathBuf::from(".").join(path)
@@ -2284,7 +2307,13 @@ impl ShutdownDeadline {
     fn poll_timeout(self) -> PollTimeout {
         PollTimeout::try_from(self.remaining(Instant::now())).unwrap_or(PollTimeout::MAX)
     }
+
+    fn expired(self) -> bool {
+        self.remaining(Instant::now()).is_zero()
+    }
 }
+
+const SIGNAL_BATCH_LIMIT: usize = 64;
 
 fn supervise_child(
     cli: &Cli,
@@ -2317,7 +2346,8 @@ fn supervise_child(
             bail!("signal fd poll failed with events {:?}", events);
         }
         if events.contains(PollFlags::POLLIN) {
-            while let Some(info) = read_forwardable_signal(signal_fd)? {
+            let mut budget = SIGNAL_BATCH_LIMIT;
+            while let Some(info) = read_forwardable_signal(signal_fd, &mut budget)? {
                 let sig = info.ssi_signo.cast_signed();
                 if sig == SIGCHLD as libc::c_int {
                     handle_sigchld(cli, child_pid, &mut main_exit)?;
@@ -2332,6 +2362,11 @@ fn supervise_child(
                             Some(_) => ShutdownDeadline::At(now),
                         });
                     }
+                }
+                if main_exit.is_some()
+                    || (!sigkill_sent && shutdown_deadline.is_some_and(ShutdownDeadline::expired))
+                {
+                    break;
                 }
             }
         }
@@ -2484,9 +2519,9 @@ fn wait_for_cleanup(
 ) -> Result<bool> {
     loop {
         let mut terminate = false;
-        // Keep consuming signals after the main child exits. Otherwise pending
-        // termination signals kill the supervisor when its mask is restored.
-        while let Some(info) = read_forwardable_signal(signal_fd)? {
+        // Bound each batch so a continuous stream cannot postpone cleanup.
+        let mut budget = SIGNAL_BATCH_LIMIT;
+        while let Some(info) = read_forwardable_signal(signal_fd, &mut budget)? {
             let sig = info.ssi_signo.cast_signed();
             if sig == SIGCHLD as libc::c_int
                 || sig == SIGTTIN as libc::c_int
@@ -2498,6 +2533,9 @@ fn wait_for_cleanup(
                 send_signal(true, child_pid, sig);
             }
             terminate |= is_termination_signal(sig);
+            if (interruptible && terminate) || deadline.expired() {
+                break;
+            }
         }
         let children_gone = reap_available_children(cli.warn_on_reap)?;
         let done = if use_pgroup {

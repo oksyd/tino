@@ -8,8 +8,10 @@ fn main() {
 #[cfg(target_os = "linux")]
 mod linux {
 
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::os::unix::process::CommandExt;
-    use std::process::{Child, Command, ExitStatus};
+    use std::process::{Child, Command, ExitStatus, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     fn wait_with_timeout(child: &mut Child) -> ExitStatus {
@@ -59,6 +61,219 @@ mod linux {
             .expect("run SIGPIPE child");
         assert_eq!(output.status.code(), Some(128 + libc::SIGPIPE));
         assert!(output.stdout.is_empty());
+    }
+
+    fn flood_workload(cleanup: bool) -> ! {
+        // This runs as a standalone, single-threaded workload, not a test worker.
+        let supervisor = unsafe { libc::getppid() };
+        let signal = libc::SIGRTMIN();
+        unsafe {
+            libc::signal(signal, libc::SIG_IGN);
+            libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        }
+        println!("{}", std::process::id());
+        std::io::stdout().flush().unwrap();
+        std::io::stdin()
+            .read_exact(&mut [0])
+            .expect("read flood gate");
+        if cleanup {
+            // SAFETY: the standalone workload has only this thread.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid != 0 {
+                std::process::exit(37);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            for _ in 0..256 {
+                // SAFETY: the saved PID is our supervisor; the signal is valid.
+                unsafe { libc::kill(supervisor, signal) };
+            }
+        }
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    }
+
+    static HANDLER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    extern "C" fn record_signal(_: libc::c_int) {
+        HANDLER_CALLS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn library_flood_probe() {
+        // Verify that dropping queued signals does not leave SIG_IGN installed
+        // or run the caller's handlers on signals consumed during supervision.
+        let mut originals = Vec::new();
+        for signal in [libc::SIGUSR1, libc::SIGRTMIN()] {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = record_signal as *const () as usize;
+            action.sa_flags = libc::SA_RESTART;
+            unsafe { libc::sigemptyset(&raw mut action.sa_mask) };
+            let mut previous = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(signal, &raw const action, &raw mut previous) },
+                0
+            );
+            originals.push((signal, previous));
+        }
+        let mut caller_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        unsafe {
+            libc::sigemptyset(&raw mut caller_mask);
+            libc::sigaddset(&raw mut caller_mask, libc::SIGUSR2);
+        }
+        let mut original_mask = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_BLOCK,
+                    &raw const caller_mask,
+                    &raw mut original_mask,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut caller_mask)
+            },
+            0
+        );
+
+        let exe = std::env::current_exe().unwrap();
+        let cli = tino::Cli::try_parse_from([
+            "tino",
+            "-s",
+            "-g",
+            "--grace-ms",
+            "100",
+            "--",
+            exe.to_str().unwrap(),
+            "flood-workload",
+        ])
+        .unwrap();
+        assert_eq!(tino::run(cli).expect("supervise flooding workload"), 137);
+        assert_eq!(HANDLER_CALLS.load(Ordering::Relaxed), 0);
+        let mut restored_mask = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut restored_mask)
+            },
+            0
+        );
+        for signal in 1..=libc::SIGRTMAX() {
+            assert_eq!(
+                unsafe { libc::sigismember(&raw const restored_mask, signal) },
+                unsafe { libc::sigismember(&raw const caller_mask, signal) }
+            );
+        }
+        for (signal, original) in originals {
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::sigaction(signal, std::ptr::null(), &raw mut action) },
+                0
+            );
+            assert_eq!(action.sa_sigaction, record_signal as *const () as usize);
+            assert_ne!(action.sa_flags & libc::SA_RESTART, 0);
+            assert_eq!(unsafe { libc::raise(signal) }, 0);
+            assert_eq!(
+                unsafe { libc::sigaction(signal, &raw const original, std::ptr::null_mut()) },
+                0
+            );
+        }
+        assert_eq!(HANDLER_CALLS.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            unsafe {
+                libc::pthread_sigmask(
+                    libc::SIG_SETMASK,
+                    &raw const original_mask,
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+    }
+
+    fn run_flood_probe(library: bool, cleanup: bool) {
+        let exe = std::env::current_exe().unwrap();
+        let mut command = if library {
+            let mut command = Command::new(&exe);
+            command.arg("library-flood-probe");
+            command
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_tino"));
+            command
+                .args(["--no-config", "-s", "-g", "--grace-ms", "100", "--"])
+                .arg(&exe)
+                .arg(if cleanup {
+                    "cleanup-flood-workload"
+                } else {
+                    "flood-workload"
+                });
+            command
+        };
+        let mut child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).expect("read workload PID");
+        let group: libc::pid_t = line.trim().parse().expect("workload PID");
+        let supervisor = child.id().cast_signed();
+        // Preload a backlog before resuming the supervisor, making the test
+        // independent of which process gets scheduled first after the gate.
+        assert_eq!(unsafe { libc::kill(supervisor, libc::SIGSTOP) }, 0);
+        child.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        if !cleanup {
+            assert_eq!(unsafe { libc::kill(supervisor, libc::SIGTERM) }, 0);
+        }
+        let start = Instant::now();
+        assert_eq!(unsafe { libc::kill(supervisor, libc::SIGCONT) }, 0);
+        let deadline = start + Duration::from_millis(1200);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let elapsed = start.elapsed();
+        // Always clean up both the workload group and supervisor on failure.
+        if status.is_none() {
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let expected = if library {
+            0
+        } else if cleanup {
+            37
+        } else {
+            137
+        };
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(expected),
+            "elapsed: {elapsed:?}"
+        );
+    }
+
+    fn signal_flood_does_not_postpone_shutdown() {
+        run_flood_probe(false, false);
+    }
+
+    fn signal_flood_does_not_postpone_descendant_cleanup() {
+        run_flood_probe(false, true);
+    }
+
+    fn library_restores_signal_state_after_flood() {
+        run_flood_probe(true, false);
     }
 
     fn library_restores_sigchld_disposition() {
@@ -188,7 +403,7 @@ mod linux {
     }
 
     pub(super) fn run() {
-        let tests: [(&str, fn()); 4] = [
+        let tests: [(&str, fn()); 7] = [
             (
                 "inherited_sigchld_ignore_does_not_lose_exit_status",
                 inherited_sigchld_ignore_does_not_lose_exit_status,
@@ -205,9 +420,27 @@ mod linux {
                 "library_rejects_multithreaded_host",
                 library_rejects_multithreaded_host,
             ),
+            (
+                "signal_flood_does_not_postpone_shutdown",
+                signal_flood_does_not_postpone_shutdown,
+            ),
+            (
+                "signal_flood_does_not_postpone_descendant_cleanup",
+                signal_flood_does_not_postpone_descendant_cleanup,
+            ),
+            (
+                "library_restores_signal_state_after_flood",
+                library_restores_signal_state_after_flood,
+            ),
         ];
         let args: Vec<_> = std::env::args().skip(1).collect();
         match args.first().map(String::as_str) {
+            Some("flood-workload") => flood_workload(false),
+            Some("cleanup-flood-workload") => flood_workload(true),
+            Some("library-flood-probe") => {
+                library_flood_probe();
+                return;
+            }
             Some("sigchld-probe") => {
                 library_restores_sigchld_disposition();
                 return;

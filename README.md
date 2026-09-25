@@ -156,7 +156,12 @@ child applies its rules. Renaming an entry or replacing it with a symlink after
 validation does not redirect its grant to another object.
 
 The main command and its discovered interpreters and dynamic loaders are
-automatically allowed. `--exec-allow` does not restrict file reads or executable
+automatically allowed. If the main command is executable but unreadable, tino
+keeps its file grant and lets the kernel attempt execution. Required loaders
+that cannot be discovered must be allowed separately. Explicit file entries in
+`--exec-allow` still require successful interpreter inspection.
+
+`--exec-allow` does not restrict file reads or executable
 memory mappings: an allowed interpreter or dynamic loader can load and run code
 from other readable files. It therefore does not guarantee that only allowlisted
 code runs. For example, an allowed dynamic loader can be invoked directly with a
