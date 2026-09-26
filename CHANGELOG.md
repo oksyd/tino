@@ -1,3 +1,8 @@
+## [0.1.35] - 2026-09-26
+
+### 🐛 Bug Fixes
+
+- Correct process supervision and execution policy handling
 ## [0.1.34] - 2026-09-25
 
 ### 🐛 Bug Fixes
@@ -12,6 +17,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Update
+- Release tino version 0.1.34
 ## [0.1.33] - 2026-05-17
 
 ### 🐛 Bug Fixes
