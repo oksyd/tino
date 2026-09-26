@@ -37,7 +37,7 @@ fn run_policy(config: &LandlockConfig, args: &[&str]) -> i32 {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     let (program, argv) = prepare_resolved_command(&args).expect("prepare policy probe");
     let mask = SigSet::thread_get_mask().expect("read test signal mask");
-    let pid = spawn_child(&mask, None, Some(config), false, &program, &argv)
+    let pid = spawn_child(&mask, None, Some(config), false, false, &program, &argv)
         .expect("spawn policy probe")
         .as_raw();
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -140,6 +140,46 @@ fn exec_rules_keep_validated_file_after_symlink_replacement() {
             target.display()
         );
     }
+}
+
+#[test]
+fn disappearing_exec_candidates_do_not_disable_execution_restrictions() {
+    let _lock = CHILD_TEST_LOCK.lock().unwrap();
+    if !require_abi(3) {
+        return;
+    }
+    let root = Fixture::new();
+    let candidate = root.join("allowed");
+    std::fs::copy("/bin/true", &candidate).unwrap();
+    let mut context = ExecContext::inherited();
+    context
+        .environment
+        .insert("PATH".into(), root.0.as_os_str().to_owned());
+    let candidates = executable_paths_in_search_path("allowed", &context.search_path(), None);
+    assert_eq!(candidates, vec![candidate.clone()]);
+
+    // A PATH match can disappear between discovery and pinning. Optional
+    // candidate probing tolerates that race, leaving no executable grants.
+    std::fs::remove_file(&candidate).unwrap();
+    let mut paths = PinnedPaths::new();
+    insert_exec_search_candidates(&mut paths, candidates, &mut ExecVisits::new(), &context)
+        .unwrap();
+    assert!(paths.is_empty());
+    let mut config = build_landlock_config(&Cli {
+        write_restrict: true,
+        write_no_dev: true,
+        ..Cli::default()
+    })
+    .unwrap()
+    .unwrap();
+    config.exec_requested = true;
+    config.exec_allow_paths = paths.into_values().collect();
+
+    // A command appearing after inspection must still be denied, even when
+    // another requested restriction keeps the overall ruleset nonempty.
+    let program = root.join("main");
+    std::fs::copy("/bin/true", &program).unwrap();
+    assert_eq!(run_policy(&config, &[program.to_str().unwrap()]), 126);
 }
 
 #[test]

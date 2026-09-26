@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 /// Default line-based configuration file read by the `tino` binary.
@@ -139,11 +139,22 @@ impl CliParseError {
     }
 
     fn print_and_exit(&self) -> ! {
+        // This path always exits. Failed output must not replace the intended
+        // status with SIGXFSZ when a redirected file reaches its size limit.
+        #[cfg(target_family = "unix")]
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
         match self.kind {
             CliParseErrorKind::Help | CliParseErrorKind::Version => {
                 let mut stdout = io::stdout().lock();
-                let _ = stdout.write_all(self.message.as_bytes());
-                let _ = stdout.flush();
+                let result = stdout
+                    .write_all(self.message.as_bytes())
+                    .and_then(|()| stdout.flush());
+                if let Err(err) = result {
+                    let _ = writeln!(io::stderr().lock(), "error: write stdout: {err}");
+                    std::process::exit(1);
+                }
                 std::process::exit(0);
             }
             CliParseErrorKind::Config => {
@@ -267,6 +278,15 @@ impl Cli {
     ///
     /// The first item must be `argv[0]` (the program name). This helper only
     /// parses the provided arguments and does not read [`DEFAULT_CONFIG_PATH`].
+    ///
+    /// Help and version requests return distinct error kinds without exiting:
+    ///
+    /// ```
+    /// use tino::{Cli, CliParseError, CliParseErrorKind};
+    ///
+    /// let error: CliParseError = Cli::try_parse_from(["tino", "--help"]).unwrap_err();
+    /// assert_eq!(error.kind(), CliParseErrorKind::Help);
+    /// ```
     pub fn try_parse_from<I, T>(args: I) -> Result<Self, CliParseError>
     where
         I: IntoIterator<Item = T>,
@@ -523,10 +543,51 @@ fn load_default_config() -> Result<Cli, CliParseError> {
     load_config(Path::new(DEFAULT_CONFIG_PATH), false)
 }
 
+fn read_config_file(path: &Path) -> io::Result<String> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_family = "unix")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // A mistaken FIFO must not stall startup before its type can be
+        // checked. Opening a device must not acquire a controlling terminal.
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    let mut file = options.open(path)?;
+    // Check the opened object, preserving normal configuration symlinks
+    // without racing a separate path metadata check against the open.
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "config path is not a regular file",
+        ));
+    }
+    let mut content = String::new();
+    file.read_to_string(&mut content)?;
+    Ok(content)
+}
+
 fn load_config(path: &Path, required: bool) -> Result<Cli, CliParseError> {
-    match fs::read_to_string(path) {
+    match read_config_file(path) {
         Ok(content) => parse_config_content(path, &content),
-        Err(err) if !required && err.kind() == io::ErrorKind::NotFound => Ok(Cli::default()),
+        Err(err) if !required && err.kind() == io::ErrorKind::NotFound => {
+            // A dangling config symlink is a broken configured entry, not an
+            // absent optional file. Do not silently discard its policy.
+            match fs::symlink_metadata(path) {
+                Err(inspect_err) if inspect_err.kind() == io::ErrorKind::NotFound => {
+                    Ok(Cli::default())
+                }
+                Err(inspect_err) => Err(CliParseError::config(format!(
+                    "inspect {}: {inspect_err}",
+                    path.display()
+                ))),
+                Ok(_) => Err(CliParseError::config(format!(
+                    "read {}: {err}",
+                    path.display()
+                ))),
+            }
+        }
         Err(err) if required && err.kind() == io::ErrorKind::NotFound => Err(
             CliParseError::config(format!("{}: file not found", path.display())),
         ),
@@ -1302,6 +1363,39 @@ mod tests {
         assert_eq!(cli.bind_tcp_allow, vec![8900]);
     }
 
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn optional_config_rejects_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "tino-dangling-config-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).expect("create config fixture");
+        let path = dir.join("tino.conf");
+        let target = dir.join("policy.conf");
+        fs::write(&target, "subreaper\n").expect("write config target");
+        symlink(&target, &path).expect("create config link");
+
+        let valid = load_config(&path, false);
+        fs::remove_file(&target).expect("remove config target");
+        let absent = load_config(&target, false);
+        let dangling = load_config(&path, false);
+        fs::remove_dir_all(&dir).expect("remove config fixture");
+
+        assert!(valid.expect("valid config link should load").subreaper);
+        assert!(absent.is_ok(), "absent optional config should use defaults");
+        let error = dangling.expect_err("existing broken config entry must not disable policy");
+        assert_eq!(error.kind(), CliParseErrorKind::Config);
+        assert!(error.to_string().contains("read "));
+    }
+
     #[test]
     fn parse_config_content_rejects_commands_and_control_flow() {
         let command = parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "/bin/echo hello")
@@ -1317,6 +1411,88 @@ mod tests {
                 .to_string()
                 .contains("only allowed on the command line")
         );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn config_rejects_fifo_without_waiting_for_a_writer() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("tino-fifo-config-{}-{nanos}", std::process::id()));
+        fs::create_dir(&dir).expect("create config fixture");
+        let path = dir.join("tino.conf");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: the NUL-terminated path belongs to this test's fresh directory.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let reader_path = path.clone();
+        let reader = std::thread::spawn(move || load_config(&reader_path, true));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut supplied = false;
+        while !reader.is_finished() {
+            assert!(Instant::now() < deadline, "config reader did not finish");
+            if !supplied {
+                match fs::OpenOptions::new()
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&path)
+                {
+                    Ok(mut writer) => {
+                        // Bound the old blocking implementation: let it read a
+                        // valid config and reach the rejecting assertion below.
+                        // The fixed reader can close before this write occurs.
+                        let _ = writer.write_all(b"subreaper\n");
+                        supplied = true;
+                    }
+                    Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
+                    Err(error) => panic!("open FIFO writer: {error}"),
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let result = reader.join().unwrap();
+        fs::remove_dir_all(dir).expect("remove config fixture");
+        let error = result.expect_err("a FIFO must not be accepted as configuration");
+        assert_eq!(error.kind(), CliParseErrorKind::Config);
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn config_rejects_character_devices() {
+        let error = load_config(Path::new("/dev/null"), false)
+            .expect_err("an empty character device is not an absent configuration");
+        assert_eq!(error.kind(), CliParseErrorKind::Config);
+        assert!(error.to_string().contains("not a regular file"));
+    }
+
+    #[test]
+    fn config_reports_invalid_utf8_in_regular_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "tino-nonutf8-config-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::write(&path, b"subreaper\n\xff").expect("write invalid UTF-8 fixture");
+        let result = load_config(&path, false);
+        fs::remove_file(path).expect("remove config fixture");
+        let error = result.expect_err("non-UTF-8 configuration must fail");
+        assert_eq!(error.kind(), CliParseErrorKind::Config);
+        assert!(error.to_string().contains("read "));
+        assert!(error.to_string().contains("UTF-8"));
     }
 
     #[test]

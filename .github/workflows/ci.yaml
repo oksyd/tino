@@ -2,8 +2,11 @@ name: CI
 
 on:
   push:
+    branches:
+      - '**'
     tags:
       - '*.*.*'
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -77,6 +80,8 @@ jobs:
         run: cargo check --all-features --locked
 
       - name: Run tests
+        env:
+          TINO_TEST_REQUIRE_LANDLOCK: '1'
         run: cargo nextest run --all-features --locked
 
       - name: Run doc tests
@@ -131,3 +136,13 @@ jobs:
             cat "$deny_stderr" >&2
             exit 1
           fi
+
+  docker-publish:
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+    needs:
+      - build
+      - container-e2e
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker.yaml

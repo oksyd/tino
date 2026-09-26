@@ -1,16 +1,10 @@
 name: Docker Publish
 
 on:
-  workflow_run:
-    workflows: [ CI ]
-    types: [ completed ]
+  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
-  cancel-in-progress: true
 
 env:
   CONTEXT: .
@@ -18,7 +12,7 @@ env:
 
 jobs:
   prepare:
-    if: ${{ github.event.workflow_run.event == 'push' && github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
     outputs:
@@ -27,21 +21,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: Resolve image tags
         id: tags
         shell: bash
         run: |
-          version="$(
-            git tag --points-at "${{ github.event.workflow_run.head_sha }}" \
-              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sort -V \
-              | tail -n 1
-          )"
-          if [ -z "$version" ]; then
-            echo "no version tag found for CI commit ${{ github.event.workflow_run.head_sha }}" >&2
+          version="$GITHUB_REF_NAME"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "image tag must match MAJOR.MINOR.PATCH: ${version}" >&2
             exit 1
           fi
 
@@ -86,7 +75,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1

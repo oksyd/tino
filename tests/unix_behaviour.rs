@@ -209,6 +209,95 @@ fn landlock_exec_allows_execute_only_main_by_absolute_path_and_path_search() {
     std::fs::remove_dir_all(root).expect("remove execute-only fixtures");
 }
 
+#[test]
+fn landlock_exec_preserves_inaccessible_main_command_status() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-inaccessible-main");
+    let private = root.join("private");
+    std::fs::create_dir_all(&private).expect("create inaccessible main fixture");
+    let program = private.join("main");
+    std::fs::copy("/bin/true", &program).expect("copy inaccessible main");
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600))
+        .expect("remove directory search permission");
+
+    for restricted in [false, true] {
+        let mut command = tino_command();
+        if restricted {
+            command.args(["--exec-allow", "/bin/true"]);
+        }
+        command.arg("--").arg(&program);
+        without_capabilities(&mut command);
+        let output = command.output().expect("run inaccessible main");
+        assert_eq!(
+            output.status.code(),
+            Some(126),
+            "restricted={restricted}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("permission denied"));
+    }
+
+    // An explicitly requested allow path still requires successful validation.
+    let mut command = tino_command();
+    command
+        .arg("--exec-allow")
+        .arg(&program)
+        .args(["--", "/bin/true"]);
+    without_capabilities(&mut command);
+    let output = command
+        .output()
+        .expect("validate inaccessible explicit allow path");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("open exec allow path"));
+
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))
+        .expect("restore fixture directory access");
+    std::fs::remove_dir_all(root).expect("remove inaccessible main fixture");
+}
+
+#[test]
+fn landlock_exec_preserves_unexecutable_main_errors() {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-unexecutable-main");
+    std::fs::create_dir(&root).expect("create unexecutable main fixture");
+    let loop_path = root.join("loop");
+    std::os::unix::fs::symlink("loop", &loop_path).expect("create symlink loop");
+    let long_path = root.join("x".repeat(256));
+    let fifo = root.join("fifo");
+    let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o700) }, 0);
+    for path in [loop_path, long_path, fifo, "/dev/null".into()] {
+        for restricted in [false, true] {
+            let mut command = tino_command();
+            if restricted {
+                command.args(["--exec-allow", "/bin/true"]);
+            }
+            let output = command.arg("--").arg(&path).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(126),
+                "path={path:?}, restricted={restricted}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stderr).contains("tino: execvp failed"));
+        }
+        let output = tino_command()
+            .arg("--exec-allow")
+            .arg(&path)
+            .args(["--", "/bin/true"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1), "explicit path={path:?}");
+    }
+    std::fs::remove_dir_all(root).expect("remove unexecutable main fixture");
+}
+
 // Locate ELF segments without depending on patchelf or a compiler. /bin/true
 // may be static on minimal systems, in which case interpreter tests skip it.
 fn native_elf_segment(
@@ -308,6 +397,93 @@ fn landlock_exec_uses_first_elf_interpreter() {
                 output.status.code(),
                 Some(0),
                 "invalid_range={invalid_range}, allow={allow:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_allows_file_backed_load_segments_past_eof() {
+    use std::os::unix::ffi::OsStrExt;
+
+    if !landlock_available() {
+        return;
+    }
+    let original = std::fs::read("/bin/true").expect("read native executable");
+    let Some(interpreter) = native_elf_interpreter_range(&original) else {
+        return;
+    };
+    let Some((extra_header, _)) = native_elf_segment(&original, 0x6474_e552) else {
+        return; // Use the optional GNU_RELRO entry without changing the table size.
+    };
+    let root = unique_temp_dir("tino-elf-load-past-eof");
+    let allowed = root.join("empty");
+    std::fs::create_dir_all(&allowed).unwrap();
+    let loader = std::ffi::OsStr::from_bytes(
+        original[interpreter.clone()]
+            .split(|byte| *byte == 0)
+            .next()
+            .unwrap(),
+    );
+    // A distinct inode prevents the shell fallback's system loader grant from
+    // hiding failure to discover the main executable's actual interpreter.
+    std::fs::copy(loader, root.join("ld")).expect("copy local loader");
+    let program = root.join("probe");
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let offset = original.len().div_ceil(page) * page + page;
+    let (offset_field, vaddr_field, size_field, memsz_field, align_field, flags_field, word) =
+        if original[4] == 2 {
+            (8, 16, 32, 40, 48, 4, 8)
+        } else {
+            (4, 8, 16, 20, 28, 24, 4)
+        };
+    for filesz in [0, 1, page] {
+        let mut bytes = original.clone();
+        bytes[interpreter.clone()].fill(0);
+        bytes[interpreter.start..interpreter.start + 3].copy_from_slice(b"ld\0");
+        bytes[extra_header.clone()].fill(0);
+        for (field, len, value) in [
+            (0, 4, 1),           // PT_LOAD
+            (flags_field, 4, 4), // PF_R
+            (offset_field, word, offset),
+            (vaddr_field, word, 0x100_0000),
+            (size_field, word, filesz),
+            (memsz_field, word, page),
+            (align_field, word, page),
+        ] {
+            let (encoded, start) = if original[5] == 1 {
+                ((value as u64).to_le_bytes(), 0)
+            } else {
+                ((value as u64).to_be_bytes(), 8 - len)
+            };
+            let field = extra_header.start + field;
+            bytes[field..field + len].copy_from_slice(&encoded[start..start + len]);
+        }
+        std::fs::write(&program, bytes).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            Command::new(&program)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success(),
+            "kernel must accept the fixture, filesz={filesz}"
+        );
+        for allow in [&allowed, &program] {
+            let output = tino_command()
+                .current_dir(&root)
+                .arg("--exec-allow")
+                .arg(allow)
+                .arg("--")
+                .arg(&program)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "filesz={filesz}, allow={allow:?}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -450,6 +626,363 @@ fn recursive_env_split_string_reports_an_error_without_aborting() {
             String::from_utf8_lossy(&output.stderr)
                 .contains("env split-string expansion exceeds 32 steps")
         );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_matches_kernel_shebang_argument_truncation() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-shebang-truncate");
+    std::fs::create_dir_all(&root).expect("create shebang fixtures");
+    let runner = root.join("runner");
+    let extra = root.join("runnerX");
+    write_exec_fixture(&runner, "#!/bin/sh\nexit 37\n");
+    write_exec_fixture(&extra, "#!/bin/sh\nexit 39\n");
+    let script = root.join("main");
+    let command = extra.to_str().unwrap();
+    let prefix = "#!/usr/bin/env -S ";
+    let padding = 256usize
+        .checked_sub(prefix.len() + command.len())
+        .expect("fixture fits shebang buffer");
+    write_exec_fixture(
+        &script,
+        &format!("{prefix}{}{command}\n", " ".repeat(padding)),
+    );
+    let allowed = root.join("empty");
+    std::fs::create_dir(&allowed).unwrap();
+    for allow in [None, Some(&allowed), Some(&script)] {
+        let mut command = tino_command();
+        if let Some(path) = allow {
+            command.arg("--exec-allow").arg(path);
+        }
+        let output = command.arg("--").arg(&script).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "allow={allow:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_preserves_env_dash_after_option_terminator() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-env-dash");
+    std::fs::create_dir_all(&root).expect("create env dash fixtures");
+    let runner = root.join("runner");
+    write_exec_fixture(&runner, "#!/bin/sh\nexit 37\n");
+    let script = root.join("main");
+    write_exec_fixture(
+        &script,
+        &format!("#!/usr/bin/env -S -- - {}\n", runner.display()),
+    );
+    for allow in [None, Some("/bin/true"), Some(script.to_str().unwrap())] {
+        let mut command = tino_command();
+        if let Some(path) = allow {
+            command.args(["--exec-allow", path]);
+        }
+        let output = command
+            .arg("--")
+            .arg(&script)
+            .output()
+            .expect("run env dash script");
+        assert_eq!(
+            output.status.code(),
+            Some(37),
+            "allow={allow:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove env dash fixtures");
+}
+
+#[test]
+fn landlock_exec_preserves_env_single_quote_escapes() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-env-quote");
+    std::fs::create_dir_all(&root).expect("create env quote fixtures");
+    let script = root.join("main");
+    for name in ["runner'quoted", r"runner\slash"] {
+        let runner = root.join(name);
+        write_exec_fixture(&runner, "#!/bin/sh\nexit 37\n");
+        let escaped = runner
+            .to_str()
+            .expect("runner path")
+            .replace('\\', "\\\\")
+            .replace('\'', "\\'");
+        write_exec_fixture(&script, &format!("#!/usr/bin/env -S '{escaped}'\n"));
+        for allow in [None, Some("/bin/true"), Some(script.to_str().unwrap())] {
+            let mut command = tino_command();
+            if let Some(path) = allow {
+                command.args(["--exec-allow", path]);
+            }
+            let output = command
+                .arg("--")
+                .arg(&script)
+                .output()
+                .expect("run escaped env interpreter");
+            assert_eq!(
+                output.status.code(),
+                Some(37),
+                "{name:?}, allow={allow:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).expect("remove env quote fixtures");
+}
+
+#[test]
+fn landlock_exec_discovers_env_aliases_with_nested_context() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-env-alias");
+    let work = root.join("work");
+    std::fs::create_dir_all(&work).expect("create env alias fixtures");
+    let alias = root.join("env-link");
+    std::os::unix::fs::symlink("/usr/bin/env", &alias).expect("create env alias");
+    let main = root.join("main");
+    let runner = work.join("runner");
+    write_exec_fixture(&work.join("leaf"), "#!/bin/sh\nexit 37\n");
+    let allowed = root.join("empty");
+    std::fs::create_dir(&allowed).unwrap();
+    for (outer, inner) in [
+        (
+            format!(
+                "#!{} -S PATH={} SELECTED=leaf runner\n",
+                alias.display(),
+                work.display()
+            ),
+            format!("#!{} -S ${{SELECTED}}\n", alias.display()),
+        ),
+        (
+            "#!./env-link -S -C work PATH=. SELECTED=leaf runner\n".to_owned(),
+            "#!../env-link -S ${SELECTED}\n".to_owned(),
+        ),
+    ] {
+        write_exec_fixture(&main, &outer);
+        write_exec_fixture(&runner, &inner);
+        for allow in [None, Some(&allowed), Some(&main)] {
+            let mut command = tino_command();
+            command
+                .current_dir(&root)
+                .env("PATH", "/usr/bin:/bin")
+                .env_remove("SELECTED");
+            if let Some(path) = allow {
+                command.arg("--exec-allow").arg(path);
+            }
+            let output = command.arg("--").arg(&main).output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(37),
+                "outer={outer:?}, inner={inner:?}, allow={allow:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_does_not_treat_an_unrelated_env_name_as_env() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-unrelated-env");
+    std::fs::create_dir_all(&root).expect("create unrelated env fixtures");
+    let interpreter = root.join("env");
+    write_exec_fixture(&interpreter, "#!/bin/sh\nexec \"$TARGET\"\n");
+    let helper = root.join("helper");
+    std::fs::copy("/bin/false", &helper).expect("copy helper executable");
+    let main = root.join("main");
+    write_exec_fixture(&main, &format!("#!{} -S helper\n", interpreter.display()));
+    let allowed = root.join("empty");
+    std::fs::create_dir(&allowed).unwrap();
+    for allow in [None, Some(&allowed), Some(&main)] {
+        let mut command = tino_command();
+        command.env("PATH", &root).env("TARGET", &helper);
+        if let Some(path) = allow {
+            command.arg("--exec-allow").arg(path);
+        }
+        let output = command.arg("--").arg(&main).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if allow.is_none() { 1 } else { 126 }),
+            "allow={allow:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_uses_only_the_final_env_chdir_option() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-env-final-chdir");
+    let work = root.join("work");
+    let blocked = root.join("blocked");
+    let allowed = root.join("empty");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::create_dir_all(blocked.join("nested")).unwrap();
+    std::fs::create_dir(&allowed).unwrap();
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    write_exec_fixture(&work.join("runner"), "#!/bin/sh\nexit 37\n");
+    std::os::unix::fs::symlink("/usr/bin/env", root.join("env-link")).unwrap();
+    let main = root.join("main");
+    for interpreter in ["/usr/bin/env", "./env-link"] {
+        for (options, expected) in [
+            ("-C missing -C work", 37),
+            ("--chdir=blocked/nested --chdir=work", 37),
+            ("-C '' -C work", 37),
+            ("-C work -C work", 37),
+            ("-C work -C missing", 125),
+            ("-C work --chdir=blocked/nested", 125),
+            ("-C work -C ''", 125),
+        ] {
+            write_exec_fixture(&main, &format!("#!{interpreter} -S {options} ./runner\n"));
+            for allow in [None, Some(&allowed), Some(&main)] {
+                let mut command = tino_command();
+                command.current_dir(&root);
+                if let Some(path) = allow {
+                    command.arg("--exec-allow").arg(path);
+                }
+                command.arg("--").arg(&main);
+                without_capabilities(&mut command);
+                let output = command.output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected),
+                    "interpreter={interpreter}, options={options}, allow={allow:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_ignores_unset_options_when_env_clears_environment() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-env-ignore-unset");
+    std::fs::create_dir(&root).unwrap();
+    let runner = root.join("runner");
+    write_exec_fixture(
+        &runner,
+        "#!/bin/sh\n[ \"$SELECTED\" = kept ] || exit 38\nexit 37\n",
+    );
+    let allowed = root.join("empty");
+    std::fs::create_dir(&allowed).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", root.join("env-link")).unwrap();
+    let main = root.join("main");
+    for interpreter in ["/usr/bin/env", "./env-link"] {
+        for (options, expected) in [
+            ("-u = -i", 37),
+            ("-i -u =", 37),
+            ("--unset= --ignore-environment", 37),
+            ("-u = -", 37),
+            ("-u = -- -", 37),
+            ("-u = -S '-i'", 37),
+            ("-u SELECTED", 37),
+            ("-u =", 125),
+            ("--unset=", 125),
+        ] {
+            write_exec_fixture(
+                &main,
+                &format!(
+                    "#!{interpreter} -S {options} SELECTED=kept {}\n",
+                    runner.display()
+                ),
+            );
+            for allow in [None, Some(&allowed), Some(&main)] {
+                let mut command = tino_command();
+                command.current_dir(&root).env("SELECTED", "inherited");
+                if let Some(path) = allow {
+                    command.arg("--exec-allow").arg(path);
+                }
+                let output = command.arg("--").arg(&main).output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(expected),
+                    "interpreter={interpreter}, options={options}, allow={allow:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_uses_final_env_signal_dispositions() {
+    if !landlock_available() {
+        return;
+    }
+    let root = unique_temp_dir("tino-env-signal-options");
+    std::fs::create_dir(&root).unwrap();
+    let runner = root.join("runner");
+    write_exec_fixture(&runner, "#!/bin/sh\nexit 37\n");
+    let allowed = root.join("empty");
+    std::fs::create_dir(&allowed).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", root.join("env-link")).unwrap();
+    let main = root.join("main");
+    let mut cases = vec![
+        ("--ignore-signal=KILL --default-signal".to_owned(), 37),
+        ("--default-signal=STOP --ignore-signal".to_owned(), 37),
+        ("--default-signal --ignore-signal=KILL".to_owned(), 125),
+        ("--ignore-signal --default-signal=STOP".to_owned(), 125),
+        ("--ignore-signal=KILL --default-signal=TERM".to_owned(), 125),
+        ("--ignore-signal=KILL --default-signal=".to_owned(), 125),
+        ("--block-signal=KILL --default-signal".to_owned(), 37),
+        ("--ignore-signal=0 --default-signal".to_owned(), 125),
+        ("--ignore-signal=NOPE --default-signal".to_owned(), 125),
+        ("--ignore-signal=999 --default-signal".to_owned(), 125),
+    ];
+    for signal in [32, 33] {
+        cases.extend([
+            (format!("--ignore-signal={signal} --default-signal"), 37),
+            (format!("--default-signal={signal} --ignore-signal"), 37),
+            (format!("--default-signal --ignore-signal={signal}"), 125),
+            (format!("--block-signal={signal} --block-signal"), 125),
+            (format!("--block-signal={signal} --default-signal"), 125),
+        ]);
+    }
+    for interpreter in ["/usr/bin/env", "./env-link"] {
+        for (options, expected) in &cases {
+            write_exec_fixture(
+                &main,
+                &format!("#!{interpreter} -S {options} {}\n", runner.display()),
+            );
+            for allow in [None, Some(&allowed), Some(&main)] {
+                let mut command = tino_command();
+                command.current_dir(&root);
+                if let Some(path) = allow {
+                    command.arg("--exec-allow").arg(path);
+                }
+                let output = command.arg("--").arg(&main).output().unwrap();
+                assert_eq!(
+                    output.status.code(),
+                    Some(*expected),
+                    "interpreter={interpreter}, options={options}, allow={allow:?}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -913,6 +1446,78 @@ fn help_flag_prints_usage_and_exits_successfully() {
         "unexpected help output\n{}",
         stdout
     );
+}
+
+#[test]
+fn diagnostic_file_size_limits_preserve_exit_status() {
+    use std::os::unix::process::CommandExt;
+
+    let root = unique_temp_dir("tino-diagnostic-file-limit");
+    std::fs::create_dir(&root).unwrap();
+    let missing = root.join("missing");
+    for (args, expected, stdout) in [
+        (vec!["--invalid"], 2, false),
+        (
+            vec![
+                "--write-allow",
+                missing.to_str().unwrap(),
+                "--",
+                "/bin/true",
+            ],
+            1,
+            false,
+        ),
+        (vec!["--help"], 1, true),
+        (vec!["--print-config", "--subreaper"], 1, true),
+        (vec!["--explain", "--", "/bin/true"], 1, true),
+    ] {
+        let file = std::fs::File::create(root.join("output")).unwrap();
+        let mut command = tino_command();
+        command.args(&args);
+        if stdout {
+            command.stdout(file);
+        } else {
+            command.stderr(file);
+        }
+        // SAFETY: only the forked launcher's resource limit changes; no
+        // allocation or locking occurs before exec.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let result = command.output().expect("run with diagnostic file limit");
+        assert_eq!(result.status.code(), Some(expected), "{args:?}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn help_and_version_report_stdout_write_failures() {
+    for flag in ["-h", "--help", "-V", "--version"] {
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("open full output device");
+        let output = tino_command()
+            .arg(flag)
+            .stdout(full)
+            .output()
+            .expect("run help/version with failing stdout");
+        assert_eq!(output.status.code(), Some(1), "{flag}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("write stdout"),
+            "{flag}: {:?}",
+            output.stderr
+        );
+    }
 }
 
 #[test]

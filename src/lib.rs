@@ -39,7 +39,7 @@ mod signals;
 /// This type mirrors the `tino` binary CLI and is intended to be constructed
 /// through [`Cli::parse`], [`Cli::parse_from`], or [`Cli::try_parse_from`],
 /// rather than by manually filling every field.
-pub use cli::{Cli, DEFAULT_CONFIG_PATH, WritePreset};
+pub use cli::{Cli, CliParseError, CliParseErrorKind, DEFAULT_CONFIG_PATH, WritePreset};
 
 pub use error::{Context, Error, Result};
 
@@ -57,6 +57,9 @@ pub use error::{Context, Error, Result};
 /// handling and child reaping for the duration of the call. Multithreaded hosts
 /// must launch the `tino` binary as a subprocess; otherwise this function returns
 /// an error before changing signal state or spawning the managed command.
+/// Signals already blocked and pending at entry, except SIGCHLD, remain queued
+/// for the caller, along with signals of those numbers received during the call.
+/// Stop and continue signals still follow the kernel's mutual cancellation rules.
 /// Configuration-only operations may run in multithreaded processes. Executable
 /// interpreter discovery (including for `--explain`) also requires procfs to
 /// read pinned files through `/proc/self/fd`.

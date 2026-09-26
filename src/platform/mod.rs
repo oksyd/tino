@@ -57,9 +57,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
             let config =
                 Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
             validate_config(&config)?;
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "tino: config OK: {DEFAULT_CONFIG_PATH}").context("write stdout")?;
-            stdout.flush().context("flush stdout")?;
+            write_stdout(format!("tino: config OK: {DEFAULT_CONFIG_PATH}\n").as_bytes())?;
             return Ok(0);
         }
         Some(ControlMode::WriteConfig) => {
@@ -69,10 +67,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
             let config =
                 Cli::load_required_default_config().map_err(|err| Error::msg(err.to_string()))?;
             validate_config(&config)?;
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "tino: config written: {DEFAULT_CONFIG_PATH}")
-                .context("write stdout")?;
-            stdout.flush().context("flush stdout")?;
+            write_stdout(format!("tino: config written: {DEFAULT_CONFIG_PATH}\n").as_bytes())?;
             return Ok(0);
         }
         Some(ControlMode::PrintConfig) => {
@@ -81,11 +76,7 @@ pub fn run(mut cli: Cli) -> Result<i32> {
             let config_text = cli
                 .config_text()
                 .map_err(|err| Error::usage(err.to_string()))?;
-            let mut stdout = io::stdout().lock();
-            stdout
-                .write_all(config_text.as_bytes())
-                .context("write stdout")?;
-            stdout.flush().context("flush stdout")?;
+            write_stdout(config_text.as_bytes())?;
             return Ok(0);
         }
         Some(ControlMode::Explain) | None => {}
@@ -589,10 +580,34 @@ fn explain(
         }
     }
 
-    let mut stdout = io::stdout().lock();
-    stdout.write_all(out.as_bytes()).context("write stdout")?;
-    stdout.flush().context("flush stdout")?;
+    write_stdout(out.as_bytes())?;
     Ok(0)
+}
+
+fn write_stdout(content: &[u8]) -> Result<()> {
+    write_with_signal_protection(|| {
+        let mut stdout = io::stdout().lock();
+        stdout.write_all(content)?;
+        stdout.flush()
+    })
+    .context("write stdout")
+}
+
+fn write_with_signal_protection(write: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    // Preserve the caller's signal dispositions. If a write-generated signal
+    // cannot be consumed, keep only that signal blocked while returning the
+    // original I/O error rather than unexpectedly delivering it to the caller.
+    #[cfg(target_os = "linux")]
+    let mut signals = unix::sys::DiagnosticWriteGuard::new()
+        .ok_or_else(|| io::Error::other("could not protect output signal state"))?;
+    let result = write();
+    #[cfg(target_os = "linux")]
+    if let Err(error) = &result
+        && let Some(errno) = error.raw_os_error()
+    {
+        signals.consume_failure(errno);
+    }
+    result
 }
 
 fn escaped_list(values: &[String]) -> String {
@@ -796,7 +811,7 @@ fn write_temp_file(
                 return Err(err).with_context(|| format!("create {}", temp_path.display()));
             }
         };
-        if let Err(err) = file.write_all(content) {
+        if let Err(err) = write_with_signal_protection(|| file.write_all(content)) {
             let _ = fs::remove_file(&temp_path);
             return Err(err).with_context(|| format!("write {}", temp_path.display()));
         }
@@ -875,7 +890,7 @@ fn collect_explain_platform(cli: &Cli) -> Result<ExplainPlatform> {
                     }),
                 exec_restrict: landlock
                     .as_ref()
-                    .filter(|config| !config.exec_allow_paths.is_empty())
+                    .filter(|config| config.exec_requested)
                     .map(|config| ExplainExecRestrict {
                         warn_only: config.warn_only,
                         allow_paths: config.exec_allow_paths.clone(),
@@ -1012,6 +1027,27 @@ mod tests {
         assert!(message.contains("invalid pdeath signal"));
         assert!(message.contains(r"\u{1b}"));
         assert!(!message.contains('\u{1b}'));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explain_rejects_manual_command_with_embedded_nul() {
+        let cli = Cli {
+            explain: true,
+            cmd: vec!["/bin/true".into(), "embedded\0argument".into()],
+            ..Cli::default()
+        };
+        let origins = ExplainOrigins {
+            subreaper: false,
+            pgroup_kill: false,
+            verbosity: 0,
+        };
+
+        let err = explain(cli, &origins, &EnvDefaultLog::default(), false)
+            .expect_err("explain must reject arguments that cannot be executed");
+
+        assert_eq!(err.exit_code(), 2);
+        assert!(err.to_string().contains("embedded NUL byte"));
     }
 
     #[test]
@@ -1198,6 +1234,55 @@ mod tests {
             "temporary config file should be renamed away"
         );
         fs::remove_dir_all(&dir).expect("remove temp dir");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn atomic_write_cleans_temp_file_after_file_size_limit() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        const PROBE_PATH: &str = "TINO_TEST_CONFIG_FILE_SIZE_LIMIT_PATH";
+        if let Some(path) = std::env::var_os(PROBE_PATH) {
+            let error = write_file_atomically(Path::new(&path), b"new\n")
+                .expect_err("partial config write must fail");
+            let source = std::error::Error::source(&error)
+                .unwrap()
+                .downcast_ref::<io::Error>()
+                .unwrap();
+            assert_eq!(source.raw_os_error(), Some(libc::EFBIG));
+            return;
+        }
+
+        let dir = unique_test_dir("atomic-write-file-size-limit");
+        let path = dir.join("config");
+        fs::write(&path, b"old\n").unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "platform::tests::atomic_write_cleans_temp_file_after_file_size_limit",
+                "--nocapture",
+            ])
+            .env(PROBE_PATH, &path);
+        // SAFETY: only the isolated test process receives this resource limit.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 1,
+                    rlim_max: 1,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &limit) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(fs::read(&path).unwrap(), b"old\n");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(target_family = "unix")]

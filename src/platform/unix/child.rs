@@ -1,12 +1,13 @@
 use crate::{Context, Error, Result, bail, cli::Cli, diagnostic::escape_str, logging};
 use libc::{_exit, PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
-use std::{env, ffi::CString};
+use std::{cell::Cell, env, ffi::CString};
 
 use super::landlock;
 use super::signals;
 use super::sys::{
     Errno, ForkResult, Pid, SIGPIPE, SigSet, SignalAction, current_process_id, exec_program,
-    fork_process, parent_process_id, process_group_exists, process_group_of, set_process_group,
+    fork_process, parent_process_id, process_group_exists, process_group_of,
+    send_process_group_signal, send_process_signal, set_process_group,
 };
 
 #[derive(Default)]
@@ -15,18 +16,41 @@ pub(super) struct ParentPrctlOutcome {
     subreaper_restore: Option<SubreaperRestore>,
 }
 
+impl ParentPrctlOutcome {
+    pub(super) fn finish(mut self) -> Result<()> {
+        self.subreaper_restore
+            .take()
+            .map_or(Ok(()), SubreaperRestore::finish)
+    }
+}
+
 struct SubreaperRestore {
     previous: libc::c_int,
+    active: bool,
+}
+
+impl SubreaperRestore {
+    fn restore(&self) -> Result<()> {
+        // SAFETY: restore the captured child-subreaper flag for this process.
+        if unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, self.previous) } == -1 {
+            return Err(Errno::last()).context("restore child subreaper state");
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.active = false;
+        self.restore()
+    }
 }
 
 impl Drop for SubreaperRestore {
     fn drop(&mut self) {
-        // SAFETY: restoring the previously captured child-subreaper flag for this process.
-        let ret = unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, self.previous) };
-        if ret == -1 {
+        if self.active
+            && let Err(err) = self.restore()
+        {
             logging::warn(format_args!(
-                "restore child subreaper state failed: {}",
-                Errno::last()
+                "restore child subreaper state failed: {err:#}"
             ));
         }
     }
@@ -48,7 +72,8 @@ pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
 pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<ParentPrctlOutcome> {
     let mut outcome = ParentPrctlOutcome::default();
     if cli.subreaper {
-        let previous_subreaper = current_child_subreaper_state();
+        let previous_subreaper =
+            current_child_subreaper_state().context("capture child subreaper state")?;
         // SAFETY: enabling the child subreaper flag is safe for the current process.
         unsafe {
             if libc::prctl(PR_SET_CHILD_SUBREAPER, 1) == -1 {
@@ -63,17 +88,10 @@ pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<ParentPrctlOutcome> {
                 }
             } else {
                 outcome.subreaper_enabled = true;
-                match previous_subreaper {
-                    Ok(previous) => {
-                        outcome.subreaper_restore = Some(SubreaperRestore { previous });
-                    }
-                    Err(err) => {
-                        logging::warn(format_args!(
-                            "capture child subreaper state failed; restore disabled: {}",
-                            err
-                        ));
-                    }
-                }
+                outcome.subreaper_restore = Some(SubreaperRestore {
+                    previous: previous_subreaper,
+                    active: true,
+                });
             }
         }
     }
@@ -119,7 +137,7 @@ pub(super) fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<V
     } else {
         Ok(cmd.to_vec())
     }?;
-    validate_program_name(&args)?;
+    validate_command_args(&args)?;
     Ok(args)
 }
 
@@ -140,9 +158,12 @@ pub(super) fn prepare_resolved_command(args: &[String]) -> Result<(CString, Vec<
     Ok((program, argv))
 }
 
-fn validate_program_name(args: &[String]) -> Result<()> {
+fn validate_command_args(args: &[String]) -> Result<()> {
     if args.first().is_some_and(String::is_empty) {
         return Err(Error::usage("command program cannot be empty"));
+    }
+    if args.iter().any(|arg| arg.contains('\0')) {
+        return Err(Error::usage("command argument contains embedded NUL byte"));
     }
     Ok(())
 }
@@ -343,35 +364,10 @@ const fn is_env_name_continue(byte: u8) -> bool {
 }
 
 fn child_write(bytes: &[u8]) {
-    let mut remaining = bytes;
-    while !remaining.is_empty() {
-        // SAFETY: `remaining` points to a valid byte slice and STDERR_FILENO is a libc fd
-        // constant. This path runs after fork, so keep diagnostics to write(2).
-        let written = unsafe {
-            libc::write(
-                libc::STDERR_FILENO,
-                remaining.as_ptr().cast::<libc::c_void>(),
-                remaining.len(),
-            )
-        };
-        if written > 0 {
-            let Ok(written) = usize::try_from(written) else {
-                break;
-            };
-            let Some(rest) = remaining.get(written..) else {
-                break;
-            };
-            remaining = rest;
-            continue;
-        }
-        if written == -1 {
-            let errno = Errno::last();
-            if errno == Errno::EINTR {
-                continue;
-            }
-        }
-        break;
-    }
+    let Some(mut stderr) = super::sys::DiagnosticWriter::stderr() else {
+        return;
+    };
+    let _ = stderr.write_all(bytes);
 }
 
 fn child_write_escaped(bytes: &[u8]) {
@@ -471,11 +467,114 @@ fn claim_foreground_tty() {
     }
 }
 
+pub(super) fn owned_foreground_tty() -> Option<Pid> {
+    // A background supervisor must not take the controlling terminal away
+    // from the shell or another foreground job.
+    let own_group = process_group_of(Pid::from_raw(0)).ok()?;
+    // SAFETY: tcgetpgrp only queries stdin; a non-terminal returns -1.
+    let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    (foreground == own_group.as_raw()).then_some(own_group)
+}
+
+pub(super) struct ForegroundTtyRestore {
+    previous_group: Pid,
+    child_group: Pid,
+    job_control_started: Cell<bool>,
+}
+
+impl ForegroundTtyRestore {
+    pub(super) const fn new(previous_group: Pid, child_group: Pid) -> Self {
+        Self {
+            previous_group,
+            child_group,
+            job_control_started: Cell::new(false),
+        }
+    }
+
+    pub(super) fn suspend_job(&self) -> bool {
+        if process_group_of(self.child_group).ok() != Some(self.child_group) {
+            return false;
+        }
+        let supervisor = current_process_id();
+        let parent = parent_process_id();
+        let parent_group = process_group_of(parent).ok();
+        // Only synchronize stops with a parent outside our group in the same
+        // session. An orphan group or a caller sharing its parent's group has
+        // no established job-control parent to resume a forced SIGSTOP.
+        let session = unsafe { libc::getsid(0) };
+        if process_group_of(supervisor).ok() != Some(self.previous_group)
+            || parent_group.is_none_or(|group| group == self.previous_group)
+            || session == -1
+            || unsafe { libc::getsid(parent.as_raw()) } != session
+        {
+            return false;
+        }
+        // A first stop must belong to the foreground job we established. Once
+        // suspended/resumed, also report background reads stopped by SIGTTIN,
+        // while leaving the shell's foreground group untouched.
+        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if foreground == self.child_group.as_raw() {
+            if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_group.as_raw()) } == -1 {
+                logging::warn(format_args!(
+                    "return foreground terminal before stopping: {}",
+                    Errno::last()
+                ));
+                return false;
+            }
+            self.job_control_started.set(true);
+        } else if foreground == -1 || !self.job_control_started.get() {
+            return false;
+        }
+        // A shell pipeline needs all members stopped before its prompt can
+        // return. Signal our original job group only when we still lead it;
+        // the parent checked above is outside that group. SIGSTOP cannot remain
+        // pending behind the supervisor's signal mask.
+        let stopped = if supervisor == self.previous_group {
+            send_process_group_signal(self.previous_group, libc::SIGSTOP)
+        } else {
+            send_process_signal(supervisor, libc::SIGSTOP)
+        };
+        if let Err(err) = stopped {
+            logging::warn(format_args!("stop foreground supervisor: {err}"));
+            return false;
+        }
+        true
+    }
+
+    pub(super) fn resume_job(&self) {
+        // `fg` hands the terminal to the supervisor before sending CONT; `bg`
+        // does not. Only the foreground case should hand it on to the child.
+        if process_group_of(self.child_group).ok() == Some(self.child_group)
+            && unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) } == self.previous_group.as_raw()
+            && unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, self.child_group.as_raw()) } == -1
+        {
+            logging::warn(format_args!(
+                "restore child foreground terminal after continue: {}",
+                Errno::last()
+            ));
+        }
+    }
+}
+
+impl Drop for ForegroundTtyRestore {
+    fn drop(&mut self) {
+        // Restore only a terminal still owned by the group we handed it to.
+        // Another job may have taken foreground ownership during supervision.
+        // SIGTTOU remains blocked until the supervisor's signal guard is dropped.
+        unsafe {
+            if libc::tcgetpgrp(libc::STDIN_FILENO) == self.child_group.as_raw() {
+                let _ = libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_group.as_raw());
+            }
+        }
+    }
+}
+
 pub(super) fn spawn_child(
     child_mask: &SigSet,
     child_pdeath: Option<libc::c_int>,
     landlock_config: Option<&landlock::LandlockConfig>,
     pgroup_kill: bool,
+    claim_tty: bool,
     cmd_c: &CString,
     argv_c: &[CString],
 ) -> Result<Pid> {
@@ -486,6 +585,15 @@ pub(super) fn spawn_child(
     // SAFETY: the forked child only performs async-signal-safe operations before exec or exit.
     match unsafe { fork_process()? } {
         ForkResult::Child => {
+            // Match exec's disposition reset before unblocking signals or
+            // applying restrictions. A forwarded signal in that window must
+            // not execute a library caller's inherited handler in the child.
+            if let Err(errno) = SignalAction::reset_caught_handlers() {
+                child_write(b"tino: failed to reset child signal handlers (errno ");
+                child_write_errno(errno);
+                child_write(b")\n");
+                unsafe { _exit(1) }
+            }
             // Rust ignores SIGPIPE in the supervisor. Do not pass that runtime
             // policy to the managed program; reset it while signals are blocked.
             if SignalAction::set_default(SIGPIPE).is_err() {
@@ -507,7 +615,9 @@ pub(super) fn spawn_child(
             }
             if pgroup_kill {
                 if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_ok() {
-                    claim_foreground_tty();
+                    if claim_tty {
+                        claim_foreground_tty();
+                    }
                 } else {
                     child_write(b"tino: failed to establish child process group\n");
                 }
@@ -1030,6 +1140,26 @@ mod tests {
             format!("{err:#}").contains("command program cannot be empty"),
             "unexpected error: {err:#}"
         );
+    }
+
+    #[test]
+    fn resolve_command_rejects_nul_bytes_in_program_and_arguments() {
+        for expand_env in [false, true] {
+            for args in [
+                vec!["/bin/tr\0ue".into()],
+                vec!["/bin/true".into(), "embedded\0argument".into()],
+            ] {
+                let err = resolve_command_args(&args, expand_env)
+                    .expect_err("NUL bytes must fail during shared command validation");
+                assert_eq!(err.exit_code(), 2);
+                assert!(err.to_string().contains("embedded NUL byte"));
+            }
+            assert!(
+                resolve_command_args(&[], expand_env)
+                    .expect("explain may omit a command")
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

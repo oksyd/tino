@@ -1,4 +1,7 @@
 use std::fmt;
+#[cfg(target_os = "linux")]
+use std::fmt::Write as _;
+#[cfg(not(target_os = "linux"))]
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -70,6 +73,11 @@ fn log(level: Level, args: fmt::Arguments<'_>) {
         return;
     }
 
+    #[cfg(target_os = "linux")]
+    let Some(mut stderr) = crate::platform::unix::sys::DiagnosticWriter::stderr() else {
+        return;
+    };
+    #[cfg(not(target_os = "linux"))]
     let mut stderr = io::stderr().lock();
     let _ = writeln!(stderr, "{} tino: {}", level.as_str(), args);
 }

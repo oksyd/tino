@@ -9,6 +9,7 @@ use super::sys::Errno;
 
 pub(super) struct LandlockConfig {
     pub write_requested: bool,
+    pub exec_requested: bool,
     pub warn_only: bool,
     pub no_dev: bool,
     pub preset_names: Vec<&'static str>,
@@ -165,8 +166,10 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
     };
 
     let handled_writes = handled_write_access_fs(abi_version, config.write_requested)?;
+    // An empty discovered allowlist must deny all execution when requested.
+    // PATH candidates can disappear before their policy descriptors are pinned.
     let handled_access_fs = handled_writes
-        | handled_execute_access(!config.exec_allow_paths.is_empty())
+        | handled_execute_access(config.exec_requested)
         | handled_ioctl_access(abi_version, !config.device_ioctl_allow_paths.is_empty())?;
     let handled_access_net = handled_network_access(
         abi_version,
