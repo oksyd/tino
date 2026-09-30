@@ -1,8 +1,17 @@
+## [0.1.37] - 2026-09-30
+
+### 🐛 Bug Fixes
+
+- Ci
 ## [0.1.36] - 2026-09-30
 
 ### 🐛 Bug Fixes
 
 - Ci
+
+### ⚙️ Miscellaneous Tasks
+
+- Release tino version 0.1.36
 ## [0.1.35] - 2026-09-26
 
 ### 🐛 Bug Fixes
