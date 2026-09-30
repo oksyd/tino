@@ -749,7 +749,9 @@ fn landlock_exec_discovers_env_aliases_with_nested_context() {
     let root = unique_temp_dir("tino-env-alias");
     let work = root.join("work");
     std::fs::create_dir_all(&work).expect("create env alias fixtures");
-    let alias = root.join("env-link");
+    // Keep argv[0]'s basename valid for env implementations that inspect it.
+    // This remains an alias outside the standard /usr/bin/env and /bin/env paths.
+    let alias = root.join("env");
     std::os::unix::fs::symlink("/usr/bin/env", &alias).expect("create env alias");
     let main = root.join("main");
     let runner = work.join("runner");
@@ -766,8 +768,8 @@ fn landlock_exec_discovers_env_aliases_with_nested_context() {
             format!("#!{} -S ${{SELECTED}}\n", alias.display()),
         ),
         (
-            "#!./env-link -S -C work PATH=. SELECTED=leaf runner\n".to_owned(),
-            "#!../env-link -S ${SELECTED}\n".to_owned(),
+            "#!./env -S -C work PATH=. SELECTED=leaf runner\n".to_owned(),
+            "#!../env -S ${SELECTED}\n".to_owned(),
         ),
     ] {
         write_exec_fixture(&main, &outer);
@@ -825,8 +827,21 @@ fn landlock_exec_does_not_treat_an_unrelated_env_name_as_env() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+fn native_env_fixture_status(command: &mut Command) -> ExitStatus {
+    // GNU env and uutils differ on some option combinations. Compare tino
+    // with the same fixture executed directly by the installed interpreter.
+    let output = command.output().expect("run native env fixture");
+    assert!(
+        matches!(output.status.code(), Some(37 | 125)),
+        "unexpected native env status {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output.status
+}
+
 #[test]
-fn landlock_exec_uses_only_the_final_env_chdir_option() {
+fn landlock_exec_preserves_env_chdir_behavior() {
     if !landlock_available() {
         return;
     }
@@ -839,19 +854,23 @@ fn landlock_exec_uses_only_the_final_env_chdir_option() {
     std::fs::create_dir(&allowed).unwrap();
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
     write_exec_fixture(&work.join("runner"), "#!/bin/sh\nexit 37\n");
-    std::os::unix::fs::symlink("/usr/bin/env", root.join("env-link")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", root.join("env")).unwrap();
     let main = root.join("main");
-    for interpreter in ["/usr/bin/env", "./env-link"] {
-        for (options, expected) in [
-            ("-C missing -C work", 37),
-            ("--chdir=blocked/nested --chdir=work", 37),
-            ("-C '' -C work", 37),
-            ("-C work -C work", 37),
-            ("-C work -C missing", 125),
-            ("-C work --chdir=blocked/nested", 125),
-            ("-C work -C ''", 125),
+    for interpreter in ["/usr/bin/env", "./env"] {
+        for options in [
+            "-C missing -C work",
+            "--chdir=blocked/nested --chdir=work",
+            "-C '' -C work",
+            "-C work -C work",
+            "-C work -C missing",
+            "-C work --chdir=blocked/nested",
+            "-C work -C ''",
         ] {
             write_exec_fixture(&main, &format!("#!{interpreter} -S {options} ./runner\n"));
+            let mut native = Command::new(&main);
+            native.current_dir(&root);
+            without_capabilities(&mut native);
+            let expected = native_env_fixture_status(&mut native);
             for allow in [None, Some(&allowed), Some(&main)] {
                 let mut command = tino_command();
                 command.current_dir(&root);
@@ -863,7 +882,7 @@ fn landlock_exec_uses_only_the_final_env_chdir_option() {
                 let output = command.output().unwrap();
                 assert_eq!(
                     output.status.code(),
-                    Some(expected),
+                    expected.code(),
                     "interpreter={interpreter}, options={options}, allow={allow:?}: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -875,7 +894,7 @@ fn landlock_exec_uses_only_the_final_env_chdir_option() {
 }
 
 #[test]
-fn landlock_exec_ignores_unset_options_when_env_clears_environment() {
+fn landlock_exec_preserves_env_unset_behavior() {
     if !landlock_available() {
         return;
     }
@@ -888,19 +907,19 @@ fn landlock_exec_ignores_unset_options_when_env_clears_environment() {
     );
     let allowed = root.join("empty");
     std::fs::create_dir(&allowed).unwrap();
-    std::os::unix::fs::symlink("/usr/bin/env", root.join("env-link")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", root.join("env")).unwrap();
     let main = root.join("main");
-    for interpreter in ["/usr/bin/env", "./env-link"] {
-        for (options, expected) in [
-            ("-u = -i", 37),
-            ("-i -u =", 37),
-            ("--unset= --ignore-environment", 37),
-            ("-u = -", 37),
-            ("-u = -- -", 37),
-            ("-u = -S '-i'", 37),
-            ("-u SELECTED", 37),
-            ("-u =", 125),
-            ("--unset=", 125),
+    for interpreter in ["/usr/bin/env", "./env"] {
+        for options in [
+            "-u = -i",
+            "-i -u =",
+            "--unset= --ignore-environment",
+            "-u = -",
+            "-u = -- -",
+            "-u = -S '-i'",
+            "-u SELECTED",
+            "-u =",
+            "--unset=",
         ] {
             write_exec_fixture(
                 &main,
@@ -908,6 +927,11 @@ fn landlock_exec_ignores_unset_options_when_env_clears_environment() {
                     "#!{interpreter} -S {options} SELECTED=kept {}\n",
                     runner.display()
                 ),
+            );
+            let expected = native_env_fixture_status(
+                Command::new(&main)
+                    .current_dir(&root)
+                    .env("SELECTED", "inherited"),
             );
             for allow in [None, Some(&allowed), Some(&main)] {
                 let mut command = tino_command();
@@ -918,7 +942,7 @@ fn landlock_exec_ignores_unset_options_when_env_clears_environment() {
                 let output = command.arg("--").arg(&main).output().unwrap();
                 assert_eq!(
                     output.status.code(),
-                    Some(expected),
+                    expected.code(),
                     "interpreter={interpreter}, options={options}, allow={allow:?}: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
@@ -929,7 +953,7 @@ fn landlock_exec_ignores_unset_options_when_env_clears_environment() {
 }
 
 #[test]
-fn landlock_exec_uses_final_env_signal_dispositions() {
+fn landlock_exec_preserves_env_signal_disposition_behavior() {
     if !landlock_available() {
         return;
     }
@@ -939,35 +963,36 @@ fn landlock_exec_uses_final_env_signal_dispositions() {
     write_exec_fixture(&runner, "#!/bin/sh\nexit 37\n");
     let allowed = root.join("empty");
     std::fs::create_dir(&allowed).unwrap();
-    std::os::unix::fs::symlink("/usr/bin/env", root.join("env-link")).unwrap();
+    std::os::unix::fs::symlink("/usr/bin/env", root.join("env")).unwrap();
     let main = root.join("main");
     let mut cases = vec![
-        ("--ignore-signal=KILL --default-signal".to_owned(), 37),
-        ("--default-signal=STOP --ignore-signal".to_owned(), 37),
-        ("--default-signal --ignore-signal=KILL".to_owned(), 125),
-        ("--ignore-signal --default-signal=STOP".to_owned(), 125),
-        ("--ignore-signal=KILL --default-signal=TERM".to_owned(), 125),
-        ("--ignore-signal=KILL --default-signal=".to_owned(), 125),
-        ("--block-signal=KILL --default-signal".to_owned(), 37),
-        ("--ignore-signal=0 --default-signal".to_owned(), 125),
-        ("--ignore-signal=NOPE --default-signal".to_owned(), 125),
-        ("--ignore-signal=999 --default-signal".to_owned(), 125),
+        "--ignore-signal=KILL --default-signal".to_owned(),
+        "--default-signal=STOP --ignore-signal".to_owned(),
+        "--default-signal --ignore-signal=KILL".to_owned(),
+        "--ignore-signal --default-signal=STOP".to_owned(),
+        "--ignore-signal=KILL --default-signal=TERM".to_owned(),
+        "--ignore-signal=KILL --default-signal=".to_owned(),
+        "--block-signal=KILL --default-signal".to_owned(),
+        "--ignore-signal=0 --default-signal".to_owned(),
+        "--ignore-signal=NOPE --default-signal".to_owned(),
+        "--ignore-signal=999 --default-signal".to_owned(),
     ];
     for signal in [32, 33] {
         cases.extend([
-            (format!("--ignore-signal={signal} --default-signal"), 37),
-            (format!("--default-signal={signal} --ignore-signal"), 37),
-            (format!("--default-signal --ignore-signal={signal}"), 125),
-            (format!("--block-signal={signal} --block-signal"), 125),
-            (format!("--block-signal={signal} --default-signal"), 125),
+            format!("--ignore-signal={signal} --default-signal"),
+            format!("--default-signal={signal} --ignore-signal"),
+            format!("--default-signal --ignore-signal={signal}"),
+            format!("--block-signal={signal} --block-signal"),
+            format!("--block-signal={signal} --default-signal"),
         ]);
     }
-    for interpreter in ["/usr/bin/env", "./env-link"] {
-        for (options, expected) in &cases {
+    for interpreter in ["/usr/bin/env", "./env"] {
+        for options in &cases {
             write_exec_fixture(
                 &main,
                 &format!("#!{interpreter} -S {options} {}\n", runner.display()),
             );
+            let expected = native_env_fixture_status(Command::new(&main).current_dir(&root));
             for allow in [None, Some(&allowed), Some(&main)] {
                 let mut command = tino_command();
                 command.current_dir(&root);
@@ -977,7 +1002,7 @@ fn landlock_exec_uses_final_env_signal_dispositions() {
                 let output = command.arg("--").arg(&main).output().unwrap();
                 assert_eq!(
                     output.status.code(),
-                    Some(*expected),
+                    expected.code(),
                     "interpreter={interpreter}, options={options}, allow={allow:?}: {}",
                     String::from_utf8_lossy(&output.stderr)
                 );
