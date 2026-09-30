@@ -8,3 +8,5 @@
 !benches/**
 !src/
 !src/**
+!tests/
+!tests/**

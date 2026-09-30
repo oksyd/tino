@@ -64,8 +64,9 @@ write-preset runtime
 write-allow /data/logs
 ```
 
-CLI scalars override file values, lists append, and boolean flags only enable
-settings. `--no-config` skips the file. `TINO_SUBREAPER`,
+CLI scalars override file values; verbosity flags add to the file value.
+Lists append, and boolean flags only enable settings. `--no-config` skips the file.
+`TINO_SUBREAPER`,
 `TINO_KILL_PROCESS_GROUP`, and `TINO_VERBOSITY` supply defaults for settings still
 false or zero. Matching `TINI_*` names are accepted; `TINO_*` takes precedence.
 
