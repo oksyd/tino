@@ -44,6 +44,8 @@ tino --help
 Options precede the command; subsequent arguments are passed to the child.
 `-g` forwards signals to the child's process group, and `-s` enables subreaping.
 Use `-v` / `--verbose` for INFO logs and `-vv` for DEBUG.
+After forwarding SIGTERM, SIGINT, or SIGQUIT, tino waits `--grace-ms`
+(default: 500 ms) before sending SIGKILL.
 
 `--expand-env` supports `${VAR}`, `${VAR:-default}`, and `$$` without a shell.
 Quote expressions when invoking tino from a shell; unbraced `$VAR` is unchanged.

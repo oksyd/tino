@@ -3,7 +3,7 @@ name = "tino"
 description = "tino: tiny init process (PID 1) for Docker/Kubernetes containers, written in Rust (tini alternative)"
 version = "0.1.37"
 edition = "2024"
-rust-version = "1.98.1"
+rust-version = "1.99.0"
 license = "Apache-2.0"
 repository = "https://github.com/oksyd/tino"
 documentation = "https://docs.rs/tino"
@@ -56,6 +56,7 @@ pre-release-commit-message = "chore: release {{crate_name}} version {{version}}"
 pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"]
 
 [lints.rust]
+raw_borrows_via_references = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
 [lints.clippy]

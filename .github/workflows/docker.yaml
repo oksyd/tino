@@ -15,17 +15,13 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
     runs-on: ubuntu-26.04
     timeout-minutes: 10
-    outputs:
-      tags: ${{ steps.tags.outputs.tags }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 0
 
-      - name: Resolve image tags
-        id: tags
+      - name: Validate image version
         shell: bash
         run: |
           version="$GITHUB_REF_NAME"
@@ -39,19 +35,6 @@ jobs:
             echo "Cargo.toml version ${package_version} does not match image tag ${version}" >&2
             exit 1
           fi
-
-          latest_version="$(
-            git tag --list \
-              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-              | sort -V \
-              | tail -n 1
-          )"
-          tags=("${GHCR_IMAGE}:${version}")
-          if [ "$version" = "$latest_version" ]; then
-            tags+=("${GHCR_IMAGE}:latest")
-          fi
-
-          echo "tags=${tags[*]}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -120,10 +103,21 @@ jobs:
     name: manifest
     runs-on: ubuntu-26.04
     timeout-minutes: 10
+    # Read tags and publish under the same lock so slower old builds cannot
+    # overwrite latest. Keep all version publications queued.
+    concurrency:
+      group: tino-image-manifest
+      queue: max
     permissions:
       contents: read
       packages: write
     steps:
+      - name: Checkout current tags
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
       - name: Download digests
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -144,11 +138,17 @@ jobs:
       - name: Create and push manifest list
         shell: bash
         run: |
-          read -r -a tags <<< "${{ needs.prepare.outputs.tags }}"
-          tag_args=()
-          for tag in "${tags[@]}"; do
-            tag_args+=(--tag "$tag")
-          done
+          version="$GITHUB_REF_NAME"
+          latest_version="$(
+            git tag --list \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1
+          )"
+          tag_args=(--tag "${GHCR_IMAGE}:${version}")
+          if [ "$version" = "$latest_version" ]; then
+            tag_args+=(--tag "${GHCR_IMAGE}:latest")
+          fi
 
           sources=()
           while IFS= read -r digest_file; do

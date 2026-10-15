@@ -300,7 +300,8 @@ impl Cli {
     /// The config file is read first and the provided CLI arguments are applied
     /// afterward. Passing `--no-config`, `--print-config`,
     /// `--write-config`, or `--check-config` skips config-file loading.
-    /// Standard `--help` and `--version` requests exit during CLI-only parsing.
+    /// Standard `--help` and `--version` requests return their corresponding
+    /// [`CliParseErrorKind`] during CLI-only parsing, without exiting.
     pub fn try_parse_with_default_config_from<I, T>(args: I) -> Result<Self, CliParseError>
     where
         I: IntoIterator<Item = T>,
@@ -380,42 +381,43 @@ impl Cli {
                     count_flag(&mut cli.verbosity);
                 }
                 Arg::Short('e') | Arg::Long("remap-exit") => {
-                    *cli.remap_exit.push_mut(0) = parser.parse::<u8>().map_err(from_osarg_error)?;
+                    cli.remap_exit
+                        .push(parser.parse::<u8>().map_err(from_osarg_error)?);
                 }
                 Arg::Short('t') | Arg::Long("grace-ms") => {
                     cli.grace_ms = parser.parse::<u64>().map_err(from_osarg_error)?;
                     grace_ms_supplied = true;
                 }
                 Arg::Long("write-allow") => {
-                    *cli.write_allow.push_mut(String::new()) =
-                        parse_string_value(&mut parser, "--write-allow")?;
+                    cli.write_allow
+                        .push(parse_string_value(&mut parser, "--write-allow")?);
                 }
                 Arg::Long("write-preset") => {
                     let preset = parse_string_value(&mut parser, "--write-preset")?;
-                    *cli.write_preset.push_mut(WritePreset::Tmp) = WritePreset::parse(&preset)?;
+                    cli.write_preset.push(WritePreset::parse(&preset)?);
                 }
                 Arg::Long("bind-tcp-allow") => {
-                    *cli.bind_tcp_allow.push_mut(0) =
-                        parse_port_value(&mut parser, "--bind-tcp-allow")?;
+                    cli.bind_tcp_allow
+                        .push(parse_port_value(&mut parser, "--bind-tcp-allow")?);
                 }
                 Arg::Long("connect-tcp-allow") => {
-                    *cli.connect_tcp_allow.push_mut(0) =
-                        parse_port_value(&mut parser, "--connect-tcp-allow")?;
+                    cli.connect_tcp_allow
+                        .push(parse_port_value(&mut parser, "--connect-tcp-allow")?);
                 }
                 Arg::Long("exec-allow") => {
-                    *cli.exec_allow.push_mut(String::new()) =
-                        parse_string_value(&mut parser, "--exec-allow")?;
+                    cli.exec_allow
+                        .push(parse_string_value(&mut parser, "--exec-allow")?);
                 }
                 Arg::Long("device-ioctl-allow") => {
-                    *cli.device_ioctl_allow.push_mut(String::new()) =
-                        parse_string_value(&mut parser, "--device-ioctl-allow")?;
+                    cli.device_ioctl_allow
+                        .push(parse_string_value(&mut parser, "--device-ioctl-allow")?);
                 }
                 Arg::Value(value) => {
                     let _ = value;
                     let (command, remaining) = parser
                         .current_value_and_remaining()
                         .map_err(from_osarg_error)?;
-                    *cli.cmd.push_mut(String::new()) = os_string_into_string(command)?;
+                    cli.cmd.push(os_string_into_string(command)?);
                     cli.cmd.extend(
                         remaining
                             .into_iter()
@@ -700,7 +702,8 @@ fn apply_config_line(
         "warn-on-reap" => set_config_flag(&mut cli.warn_on_reap, path, line_no, key, value),
         "pgroup-kill" => set_config_flag(&mut cli.pgroup_kill, path, line_no, key, value),
         "remap-exit" => {
-            *cli.remap_exit.push_mut(0) = parse_config_value::<u8>(path, line_no, key, value)?;
+            cli.remap_exit
+                .push(parse_config_value::<u8>(path, line_no, key, value)?);
             Ok(())
         }
         "grace-ms" => {
@@ -709,14 +712,16 @@ fn apply_config_line(
         }
         "write-restrict" => set_config_flag(&mut cli.write_restrict, path, line_no, key, value),
         "write-allow" => {
-            *cli.write_allow.push_mut(String::new()) =
-                config_value(path, line_no, key, value)?.to_owned();
+            cli.write_allow
+                .push(config_value(path, line_no, key, value)?.to_owned());
             Ok(())
         }
         "write-preset" => {
             let preset = config_value(path, line_no, key, value)?;
-            *cli.write_preset.push_mut(WritePreset::Tmp) = WritePreset::parse(preset)
-                .map_err(|err| config_error(path, line_no, err.to_string()))?;
+            cli.write_preset.push(
+                WritePreset::parse(preset)
+                    .map_err(|err| config_error(path, line_no, err.to_string()))?,
+            );
             Ok(())
         }
         "restrict-warn-only" => {
@@ -724,11 +729,13 @@ fn apply_config_line(
         }
         "write-no-dev" => set_config_flag(&mut cli.write_no_dev, path, line_no, key, value),
         "bind-tcp-allow" => {
-            *cli.bind_tcp_allow.push_mut(0) = parse_config_port(path, line_no, key, value)?;
+            cli.bind_tcp_allow
+                .push(parse_config_port(path, line_no, key, value)?);
             Ok(())
         }
         "connect-tcp-allow" => {
-            *cli.connect_tcp_allow.push_mut(0) = parse_config_port(path, line_no, key, value)?;
+            cli.connect_tcp_allow
+                .push(parse_config_port(path, line_no, key, value)?);
             Ok(())
         }
         "scope-signals" => set_config_flag(&mut cli.scope_signals, path, line_no, key, value),
@@ -736,13 +743,13 @@ fn apply_config_line(
             set_config_flag(&mut cli.scope_abstract_unix, path, line_no, key, value)
         }
         "exec-allow" => {
-            *cli.exec_allow.push_mut(String::new()) =
-                config_value(path, line_no, key, value)?.to_owned();
+            cli.exec_allow
+                .push(config_value(path, line_no, key, value)?.to_owned());
             Ok(())
         }
         "device-ioctl-allow" => {
-            *cli.device_ioctl_allow.push_mut(String::new()) =
-                config_value(path, line_no, key, value)?.to_owned();
+            cli.device_ioctl_allow
+                .push(config_value(path, line_no, key, value)?.to_owned());
             Ok(())
         }
         "expand-env" => set_config_flag(&mut cli.expand_env, path, line_no, key, value),

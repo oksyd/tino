@@ -303,7 +303,7 @@ fn build_landlock_config_for_args(
     for preset in &cli.write_preset {
         let name = preset.as_str();
         if !preset_names.contains(&name) {
-            let _ = preset_names.push_mut(name);
+            preset_names.push(name);
         }
         for raw in preset_paths(*preset) {
             insert_landlock_writable_dir(&mut unique, raw, true)?;
@@ -1101,7 +1101,7 @@ fn parse_shebang_exec_interpreters_in_context(
                 Err(reason) => paths.push(ExecInterpreter::Unresolved { reason }),
             },
             ShebangArgument::InvalidUtf8 => {
-                let _ = paths.push_mut(ExecInterpreter::Unresolved {
+                paths.push(ExecInterpreter::Unresolved {
                     reason: "env shebang argument is not valid UTF-8",
                 });
             }
@@ -1439,7 +1439,7 @@ fn split_env_split_string(raw: &str, context: &ExecContext) -> Option<Vec<String
             match ch {
                 '_' if quote.is_none() => {
                     if in_field {
-                        let _ = fields.push_mut(std::mem::take(&mut current));
+                        fields.push(std::mem::take(&mut current));
                         in_field = false;
                     }
                 }
@@ -1517,7 +1517,7 @@ fn split_env_split_string(raw: &str, context: &ExecContext) -> Option<Vec<String
         }
         if ch.is_ascii_whitespace() {
             if in_field {
-                let _ = fields.push_mut(std::mem::take(&mut current));
+                fields.push(std::mem::take(&mut current));
                 in_field = false;
             }
             continue;
@@ -1530,7 +1530,7 @@ fn split_env_split_string(raw: &str, context: &ExecContext) -> Option<Vec<String
         return None;
     }
     if in_field {
-        let _ = fields.push_mut(current);
+        fields.push(current);
     }
     Some(fields)
 }
