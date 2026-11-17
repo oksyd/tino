@@ -3,6 +3,7 @@
 ### ⚙️ Miscellaneous Tasks
 
 - *(ci)* Update
+- Release tino version 0.1.38
 ## [0.1.37] - 2026-09-30
 
 ### 🐛 Bug Fixes

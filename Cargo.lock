@@ -16,7 +16,7 @@ checksum = "5817b9314dc3cf018d27789c9146e3085c98ac5e36e94ecbdf5000e12cb856a2"
 
 [[package]]
 name = "tino"
-version = "0.1.38"
+version = "0.1.39"
 dependencies = [
  "libc",
  "osarg",
