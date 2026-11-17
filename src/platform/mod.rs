@@ -8,6 +8,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::io::{self, Write};
+use std::mem::DropGuard;
 use std::path::{Path, PathBuf};
 
 cfg_select! {
@@ -811,21 +812,18 @@ fn write_temp_file(
                 return Err(err).with_context(|| format!("create {}", temp_path.display()));
             }
         };
-        if let Err(err) = write_with_signal_protection(|| file.write_all(content)) {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err).with_context(|| format!("write {}", temp_path.display()));
+        let temp_path = DropGuard::new(temp_path, |path| {
+            let _ = fs::remove_file(path);
+        });
+        write_with_signal_protection(|| file.write_all(content))
+            .with_context(|| format!("write {}", temp_path.display()))?;
+        if let Some(permissions) = permissions {
+            file.set_permissions(permissions.clone())
+                .with_context(|| format!("set permissions on {}", temp_path.display()))?;
         }
-        if let Some(permissions) = permissions
-            && let Err(err) = file.set_permissions(permissions.clone())
-        {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err).with_context(|| format!("set permissions on {}", temp_path.display()));
-        }
-        if let Err(err) = file.sync_all() {
-            let _ = fs::remove_file(&temp_path);
-            return Err(err).with_context(|| format!("sync {}", temp_path.display()));
-        }
-        return Ok(temp_path);
+        file.sync_all()
+            .with_context(|| format!("sync {}", temp_path.display()))?;
+        return Ok(DropGuard::dismiss(temp_path));
     }
 
     bail!(

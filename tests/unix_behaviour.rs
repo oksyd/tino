@@ -1471,6 +1471,40 @@ fn help_flag_prints_usage_and_exits_successfully() {
         "unexpected help output\n{}",
         stdout
     );
+    assert!(output.stderr.is_empty(), "help should not write to stderr");
+    for flag in [
+        "--subreaper",
+        "--parent-death-signal",
+        "--pgroup-kill",
+        "--warn-on-reap",
+        "--grace-ms",
+        "--remap-exit",
+        "--verbose",
+        "--help",
+        "--version",
+        "--write-restrict",
+        "--write-allow",
+        "--write-preset",
+        "--write-no-dev",
+        "--restrict-warn-only",
+        "--bind-tcp-allow",
+        "--connect-tcp-allow",
+        "--scope-signals",
+        "--scope-abstract-unix",
+        "--exec-allow",
+        "--device-ioctl-allow",
+        "--expand-env",
+        "--print-config",
+        "--write-config",
+        "--check-config",
+        "--no-config",
+        "--explain",
+    ] {
+        assert!(
+            stdout.split_ascii_whitespace().any(|word| word == flag),
+            "help is missing public option {flag}"
+        );
+    }
 }
 
 #[test]
@@ -2795,12 +2829,13 @@ sys.exit(0 if value.value == signal.SIGUSR1 else 101)
 fn signal_forwarding_preserves_unlisted_linux_signals() {
     let signal = libc::SIGXCPU;
     let mut child = tino_command()
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .args([
             "--",
             "sh",
             "-c",
-            "trap 'exit 45' \"$SIGNAL\"; printf 'ready\\n'; while true; do sleep 1; done",
+            "trap 'exit 45' \"$SIGNAL\"; printf 'ready\\n'; read token; exit 99",
         ])
         .env("SIGNAL", signal.to_string())
         .spawn()
@@ -3761,13 +3796,16 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
     }
 
     let mut target = Command::new("sh")
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .args([
             "-c",
-            "trap 'exit 0' TERM; printf 'ready\\n'; while true; do sleep 1; done",
+            "trap 'exit 0' TERM; printf 'ready\\n'; read token; exit 99",
         ])
         .spawn()
         .expect("spawn out-of-domain signal target");
+    // Keep read blocked until SIGTERM; Child::wait otherwise closes stdin.
+    let _target_input = target.stdin.take().expect("signal scope target stdin");
     let mut stdout = BufReader::new(target.stdout.take().expect("signal scope target stdout"));
     let mut ready = String::new();
     stdout

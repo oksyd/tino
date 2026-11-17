@@ -634,10 +634,8 @@ pub(super) fn spawn_child(
                     unsafe { _exit(1) }
                 }
             }
-            match exec_program(cmd_c, &argv_ptrs) {
-                Ok(_) => unsafe { _exit(127) },
-                Err(err) => report_exec_failure(cmd_c, err),
-            }
+            let Err(err) = exec_program(cmd_c, &argv_ptrs);
+            report_exec_failure(cmd_c, err)
         }
         ForkResult::Parent { child } => Ok(child),
     }

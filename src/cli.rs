@@ -245,6 +245,57 @@ pub struct Cli {
     pub cmd: Vec<String>,
 }
 
+struct ParsedCli {
+    cli: Cli,
+    // An explicit default value must still override the config file.
+    grace_ms_supplied: bool,
+}
+
+impl ParsedCli {
+    fn apply_to(self, mut base: Cli) -> Cli {
+        let cli = self.cli;
+        base.remap_exit.extend(cli.remap_exit);
+        base.write_allow.extend(cli.write_allow);
+        base.write_preset.extend(cli.write_preset);
+        base.bind_tcp_allow.extend(cli.bind_tcp_allow);
+        base.connect_tcp_allow.extend(cli.connect_tcp_allow);
+        base.exec_allow.extend(cli.exec_allow);
+        base.device_ioctl_allow.extend(cli.device_ioctl_allow);
+
+        Cli {
+            subreaper: base.subreaper || cli.subreaper,
+            pdeath: cli.pdeath.or(base.pdeath),
+            verbosity: base.verbosity.saturating_add(cli.verbosity),
+            warn_on_reap: base.warn_on_reap || cli.warn_on_reap,
+            pgroup_kill: base.pgroup_kill || cli.pgroup_kill,
+            remap_exit: base.remap_exit,
+            grace_ms: if self.grace_ms_supplied {
+                cli.grace_ms
+            } else {
+                base.grace_ms
+            },
+            write_restrict: base.write_restrict || cli.write_restrict,
+            write_allow: base.write_allow,
+            write_preset: base.write_preset,
+            restrict_warn_only: base.restrict_warn_only || cli.restrict_warn_only,
+            write_no_dev: base.write_no_dev || cli.write_no_dev,
+            bind_tcp_allow: base.bind_tcp_allow,
+            connect_tcp_allow: base.connect_tcp_allow,
+            scope_signals: base.scope_signals || cli.scope_signals,
+            scope_abstract_unix: base.scope_abstract_unix || cli.scope_abstract_unix,
+            exec_allow: base.exec_allow,
+            device_ioctl_allow: base.device_ioctl_allow,
+            expand_env: base.expand_env || cli.expand_env,
+            explain: cli.explain,
+            print_config: cli.print_config,
+            write_config: cli.write_config,
+            check_config: cli.check_config,
+            no_config: cli.no_config,
+            cmd: cli.cmd,
+        }
+    }
+}
+
 impl Cli {
     /// Parses command-line arguments from the process environment.
     ///
@@ -292,13 +343,13 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
     {
-        Self::try_parse_from_base(args, Self::default())
+        Self::parse_args(args).map(|parsed| parsed.cli)
     }
 
     /// Tries to parse process-like arguments and merge the fixed config file.
     ///
-    /// The config file is read first and the provided CLI arguments are applied
-    /// afterward. Passing `--no-config`, `--print-config`,
+    /// Arguments are parsed once, then merged over the config file.
+    /// Passing `--no-config`, `--print-config`,
     /// `--write-config`, or `--check-config` skips config-file loading.
     /// Standard `--help` and `--version` requests return their corresponding
     /// [`CliParseErrorKind`] during CLI-only parsing, without exiting.
@@ -307,24 +358,34 @@ impl Cli {
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
     {
-        let argv = args.into_iter().map(Into::into).collect::<Vec<_>>();
-        let cli_only = Self::try_parse_from(argv.clone())?;
-        if cli_only.no_config
-            || cli_only.print_config
-            || cli_only.write_config
-            || cli_only.check_config
-        {
-            return Ok(cli_only);
-        }
-        let base = load_default_config()?;
-        Self::try_parse_from_base(argv, base)
+        Self::try_parse_with_config_from(args, load_default_config)
     }
 
-    fn try_parse_from_base<I, T>(args: I, mut cli: Cli) -> Result<Self, CliParseError>
+    fn try_parse_with_config_from<I, T>(
+        args: I,
+        load: impl FnOnce() -> Result<Self, CliParseError>,
+    ) -> Result<Self, CliParseError>
     where
         I: IntoIterator<Item = T>,
         T: Into<OsString>,
     {
+        let parsed = Self::parse_args(args)?;
+        if parsed.cli.no_config
+            || parsed.cli.print_config
+            || parsed.cli.write_config
+            || parsed.cli.check_config
+        {
+            return Ok(parsed.cli);
+        }
+        Ok(parsed.apply_to(load()?))
+    }
+
+    fn parse_args<I, T>(args: I) -> Result<ParsedCli, CliParseError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<OsString>,
+    {
+        let mut cli = Self::default();
         let mut argv = args.into_iter().map(Into::into);
         if argv.next().is_none() {
             return Err(CliParseError::message("missing argv[0]".to_owned()));
@@ -435,7 +496,10 @@ impl Cli {
                 "--check-config does not accept --grace-ms".into(),
             ));
         }
-        Ok(cli)
+        Ok(ParsedCli {
+            cli,
+            grace_ms_supplied,
+        })
     }
 
     pub(crate) fn resolved_verbosity(&self) -> u8 {
@@ -1250,7 +1314,7 @@ mod tests {
 
     #[test]
     fn parse_supports_short_long_attached_and_repeatable_options() {
-        let cli = parse_ok([
+        let args = [
             "tino",
             "-svgw",
             "-pTERM",
@@ -1280,33 +1344,37 @@ mod tests {
             "--",
             "/bin/echo",
             "hello",
-        ]);
-
-        assert!(cli.subreaper);
-        assert_eq!(cli.pdeath.as_deref(), Some("SIGTERM"));
-        assert_eq!(cli.verbosity, 1);
-        assert!(cli.warn_on_reap);
-        assert!(cli.pgroup_kill);
-        assert_eq!(cli.remap_exit, vec![3, 7]);
-        assert_eq!(cli.grace_ms, 250);
-        assert!(cli.write_restrict);
-        assert_eq!(cli.write_allow, vec!["/tmp"]);
-        assert_eq!(cli.write_preset, vec![WritePreset::Runtime]);
-        assert!(cli.restrict_warn_only);
-        assert!(cli.write_no_dev);
-        assert_eq!(cli.bind_tcp_allow, vec![80, 443]);
-        assert_eq!(cli.connect_tcp_allow, vec![8080]);
-        assert!(cli.scope_signals);
-        assert!(cli.scope_abstract_unix);
-        assert_eq!(cli.exec_allow, vec!["/bin/sh"]);
-        assert_eq!(cli.device_ioctl_allow, vec!["/dev/null"]);
-        assert!(cli.expand_env);
-        assert!(cli.explain);
-        assert!(!cli.print_config);
-        assert!(!cli.write_config);
-        assert!(!cli.check_config);
-        assert!(!cli.no_config);
-        assert_eq!(cli.cmd, vec!["/bin/echo", "hello"]);
+        ];
+        for cli in [
+            parse_ok(args),
+            Cli::try_parse_with_config_from(args, || Ok(Cli::default())).unwrap(),
+        ] {
+            assert!(cli.subreaper);
+            assert_eq!(cli.pdeath.as_deref(), Some("SIGTERM"));
+            assert_eq!(cli.verbosity, 1);
+            assert!(cli.warn_on_reap);
+            assert!(cli.pgroup_kill);
+            assert_eq!(cli.remap_exit, vec![3, 7]);
+            assert_eq!(cli.grace_ms, 250);
+            assert!(cli.write_restrict);
+            assert_eq!(cli.write_allow, vec!["/tmp"]);
+            assert_eq!(cli.write_preset, vec![WritePreset::Runtime]);
+            assert!(cli.restrict_warn_only);
+            assert!(cli.write_no_dev);
+            assert_eq!(cli.bind_tcp_allow, vec![80, 443]);
+            assert_eq!(cli.connect_tcp_allow, vec![8080]);
+            assert!(cli.scope_signals);
+            assert!(cli.scope_abstract_unix);
+            assert_eq!(cli.exec_allow, vec!["/bin/sh"]);
+            assert_eq!(cli.device_ioctl_allow, vec!["/dev/null"]);
+            assert!(cli.expand_env);
+            assert!(cli.explain);
+            assert!(!cli.print_config);
+            assert!(!cli.write_config);
+            assert!(!cli.check_config);
+            assert!(!cli.no_config);
+            assert_eq!(cli.cmd, vec!["/bin/echo", "hello"]);
+        }
     }
 
     #[test]
@@ -1715,16 +1783,23 @@ mod tests {
     fn cli_args_apply_on_top_of_config_content() {
         let base = parse_config_content(
             Path::new(DEFAULT_CONFIG_PATH),
-            "expand-env\nwrite-allow /data/logs\nbind-tcp-allow 8900\nparent-death-signal TERM\nverbosity 1\ngrace-ms 100\n",
+            "expand-env\nwrite-allow /data/logs\nwrite-preset tmp\nremap-exit 7\n\
+             bind-tcp-allow 8900\nconnect-tcp-allow 443\nexec-allow /bin/sh\n\
+             device-ioctl-allow /dev/null\nparent-death-signal TERM\nverbosity 1\ngrace-ms 100\n",
         )
         .expect("parse config content");
-        let cli = Cli::try_parse_from_base(
+        let cli = Cli::try_parse_with_config_from(
             [
                 "tino",
                 "--write-allow",
                 "/tmp",
+                "--write-preset=runtime",
+                "--remap-exit=9",
                 "--bind-tcp-allow",
                 "9090",
+                "--connect-tcp-allow=8443",
+                "--exec-allow=/usr/bin/env",
+                "--device-ioctl-allow=/dev/pts",
                 "--parent-death-signal=USR1",
                 "--verbose",
                 "--grace-ms=250",
@@ -1732,17 +1807,95 @@ mod tests {
                 "/bin/echo",
                 "${MESSAGE:-ok}",
             ],
-            base,
+            || Ok(base),
         )
         .expect("parse args over config");
 
         assert!(cli.expand_env);
         assert_eq!(cli.write_allow, vec!["/data/logs", "/tmp"]);
+        assert_eq!(
+            cli.write_preset,
+            vec![WritePreset::Tmp, WritePreset::Runtime]
+        );
+        assert_eq!(cli.remap_exit, vec![7, 9]);
         assert_eq!(cli.bind_tcp_allow, vec![8900, 9090]);
+        assert_eq!(cli.connect_tcp_allow, vec![443, 8443]);
+        assert_eq!(cli.exec_allow, vec!["/bin/sh", "/usr/bin/env"]);
+        assert_eq!(cli.device_ioctl_allow, vec!["/dev/null", "/dev/pts"]);
         assert_eq!(cli.pdeath.as_deref(), Some("SIGUSR1"));
         assert_eq!(cli.verbosity, 2);
         assert_eq!(cli.grace_ms, 250);
         assert_eq!(cli.cmd, vec!["/bin/echo", "${MESSAGE:-ok}"]);
+    }
+
+    #[test]
+    fn cli_omitted_settings_inherit_config() {
+        let base = parse_config_content(
+            Path::new(DEFAULT_CONFIG_PATH),
+            "subreaper\nparent-death-signal TERM\nverbosity 2\nwarn-on-reap\npgroup-kill\n\
+             remap-exit 7\ngrace-ms 1250\nwrite-restrict\nwrite-allow /data\nwrite-preset runtime\n\
+             restrict-warn-only\nwrite-no-dev\nbind-tcp-allow 8900\nconnect-tcp-allow 443\n\
+             scope-signals\nscope-abstract-unix\nexec-allow /bin/sh\ndevice-ioctl-allow /dev/null\n\
+             expand-env\n",
+        )
+        .unwrap();
+        let expected = base.config_text().unwrap();
+        let cli = Cli::try_parse_with_config_from(
+            ["tino", "echo", "--no-config", "--help", "--grace-ms=500"],
+            || Ok(base),
+        )
+        .unwrap();
+
+        assert_eq!(cli.config_text().unwrap(), expected);
+        assert_eq!(cli.cmd, ["echo", "--no-config", "--help", "--grace-ms=500"]);
+    }
+
+    #[test]
+    fn cli_explicit_default_grace_overrides_config() {
+        for (options, expected) in [
+            (vec![], 1250),
+            (vec!["--grace-ms", "500"], 500),
+            (vec!["-t0"], 0),
+            (vec!["-t", "0", "--grace-ms=500"], 500),
+        ] {
+            let args = ["tino"].into_iter().chain(options).chain(["echo"]);
+            let cli = Cli::try_parse_with_config_from(args, || {
+                parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "grace-ms 1250\n")
+            })
+            .unwrap();
+            assert_eq!(cli.grace_ms, expected);
+        }
+    }
+
+    #[test]
+    fn cli_control_requests_bypass_invalid_config() {
+        let invalid_config =
+            || parse_config_content(Path::new(DEFAULT_CONFIG_PATH), "unknown-option\n");
+        for args in [
+            vec!["tino", "--no-config", "echo"],
+            vec!["tino", "--print-config"],
+            vec!["tino", "--write-config"],
+            vec!["tino", "--check-config"],
+        ] {
+            Cli::try_parse_with_config_from(args, invalid_config).unwrap();
+        }
+        for (option, kind) in [
+            ("--help", CliParseErrorKind::Help),
+            ("--version", CliParseErrorKind::Version),
+            ("--unknown", CliParseErrorKind::Message),
+        ] {
+            let error =
+                Cli::try_parse_with_config_from(["tino", option], invalid_config).unwrap_err();
+            assert_eq!(error.kind(), kind);
+        }
+        for args in [
+            vec!["tino", "echo", "--no-config"],
+            vec!["tino", "--exec-allow", "--no-config", "echo"],
+            vec!["tino", "--explain", "echo"],
+        ] {
+            let error = Cli::try_parse_with_config_from(args, invalid_config).unwrap_err();
+            assert_eq!(error.kind(), CliParseErrorKind::Config);
+        }
     }
 
     #[test]

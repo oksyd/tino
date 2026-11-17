@@ -3,7 +3,7 @@ name = "tino"
 description = "tino: tiny init process (PID 1) for Docker/Kubernetes containers, written in Rust (tini alternative)"
 version = "0.1.38"
 edition = "2024"
-rust-version = "1.99.0"
+rust-version = "1.100.0"
 license = "Apache-2.0"
 repository = "https://github.com/oksyd/tino"
 documentation = "https://docs.rs/tino"
@@ -21,8 +21,8 @@ include = [
 ]
 
 [dependencies]
-libc = { version = "0.2.189", default-features = false }
-osarg = { version = "0.1.3", default-features = false }
+libc = { version = "0.2.191", default-features = false }
+osarg = { version = "0.1.4", default-features = false }
 
 [[bench]]
 name = "logic_paths"
@@ -58,6 +58,9 @@ pre-release-hook = ["git", "cliff", "-o", "CHANGELOG.md", "--tag", "{{version}}"
 [lints.rust]
 raw_borrows_via_references = "deny"
 unsafe_op_in_unsafe_fn = "deny"
+
+[lints.cargo]
+unused_dependencies = "deny"
 
 [lints.clippy]
 dbg_macro = "deny"

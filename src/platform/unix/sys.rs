@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::{size_of, zeroed};
@@ -682,10 +681,7 @@ pub(super) unsafe fn fork_process() -> Result<ForkResult> {
     }
 }
 
-pub(super) fn exec_program(
-    program: &CString,
-    argv_ptrs: &[*const libc::c_char],
-) -> Result<Infallible> {
+pub(super) fn exec_program(program: &CString, argv_ptrs: &[*const libc::c_char]) -> Result<!> {
     // SAFETY: program and argv are valid NUL-terminated strings; argv_ptrs is
     // terminated with a trailing null pointer as required by execvp(3).
     let rc = unsafe { libc::execvp(program.as_ptr(), argv_ptrs.as_ptr()) };
