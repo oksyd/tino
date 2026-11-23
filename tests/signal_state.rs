@@ -1345,10 +1345,10 @@ mod linux {
         }
     }
 
-    fn wait_for_resumed_foreground(pid: libc::pid_t) {
+    fn wait_for_resumed_foreground(pid: libc::pid_t, group: libc::pid_t) {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
-            if unsafe { libc::tcgetpgrp(0) } == pid && !process_is_stopped(pid) {
+            if unsafe { libc::tcgetpgrp(0) } == group && !process_is_stopped(pid) {
                 return;
             }
             assert!(
@@ -1359,28 +1359,56 @@ mod linux {
         }
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum TtyJobMode {
+        SharedGroup,
+        SeparateGroup,
+        PendingContinue,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TtyJobStart {
+        Foreground,
+        Background,
+        ForegroundBeforeRead,
+    }
+
     fn exercise_terminal_job_control(
         parent_group: libc::pid_t,
         master: libc::c_int,
-        pending_cont: bool,
+        mode: TtyJobMode,
+        start: TtyJobStart,
     ) {
         unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
-        let mut command = if pending_cont {
+        let mut command = if matches!(mode, TtyJobMode::PendingContinue) {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command.arg("tty-pending-cont-supervisor");
             command
         } else {
             let mut command = Command::new(env!("CARGO_BIN_EXE_tino"));
+            command.arg("--no-config");
+            if matches!(mode, TtyJobMode::SeparateGroup) {
+                command.arg("-g");
+            }
             command
-                .args(["--no-config", "-g", "--"])
+                .arg("--")
                 .arg(std::env::current_exe().unwrap())
                 .arg("tty-read-workload");
+            if matches!(start, TtyJobStart::ForegroundBeforeRead) {
+                command.arg("wait-for-fg");
+            }
             command
         };
-        command.stdout(Stdio::piped());
+        // The workload reports its PID on this socket. For a running background
+        // job it also waits here until the shell has foregrounded the job.
+        let (mut control, workload) = std::os::unix::net::UnixStream::pair().unwrap();
+        command.stdout(OwnedFd::from(workload));
         unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == -1 || libc::tcsetpgrp(0, libc::getpgrp()) == -1 {
+            command.pre_exec(move || {
+                if libc::setpgid(0, 0) == -1
+                    || (matches!(start, TtyJobStart::Foreground)
+                        && libc::tcsetpgrp(0, libc::getpgrp()) == -1)
+                {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -1389,10 +1417,12 @@ mod linux {
         let mut supervisor = command.spawn().unwrap();
         let supervisor_pid = supervisor.id().cast_signed();
         let mut ready = String::new();
-        BufReader::new(supervisor.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
+        BufReader::new(&control).read_line(&mut ready).unwrap();
         let main_pid: libc::pid_t = ready.trim().parse().unwrap();
+        let work_group = match mode {
+            TtyJobMode::SharedGroup => supervisor_pid,
+            TtyJobMode::SeparateGroup | TtyJobMode::PendingContinue => main_pid,
+        };
         // A sibling in the original job group models the reader in a shell's
         // `tino ... | cat` pipeline. The shell needs both processes stopped.
         let mut peer = Command::new(std::env::current_exe().unwrap());
@@ -1407,8 +1437,25 @@ mod linux {
         }
         let mut peer = peer.spawn().unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert_eq!(unsafe { libc::tcgetpgrp(0) }, main_pid);
-            assert_eq!(unsafe { libc::kill(-main_pid, libc::SIGTSTP) }, 0);
+            if !matches!(start, TtyJobStart::Foreground) {
+                if matches!(start, TtyJobStart::Background) {
+                    wait_for_job_stop(supervisor_pid);
+                }
+                assert_eq!(unsafe { libc::tcgetpgrp(0) }, parent_group);
+                assert_eq!(unsafe { libc::tcsetpgrp(0, supervisor_pid) }, 0);
+                // A shell sends CONT only when the job was stopped.
+                if matches!(start, TtyJobStart::Background) {
+                    assert_eq!(unsafe { libc::kill(-supervisor_pid, libc::SIGCONT) }, 0);
+                } else {
+                    control.write_all(b"r").unwrap();
+                }
+            }
+            wait_for_resumed_foreground(main_pid, work_group);
+            // Ctrl-Z is delivered by the terminal to its foreground group.
+            assert_eq!(
+                unsafe { libc::write(master, b"\x1a".as_ptr().cast(), 1) },
+                1
+            );
             wait_for_job_stop(supervisor_pid);
             wait_for_job_stop(peer.id().cast_signed());
             assert_eq!(unsafe { libc::tcgetpgrp(0) }, supervisor_pid);
@@ -1417,8 +1464,8 @@ mod linux {
             assert_eq!(unsafe { libc::tcsetpgrp(0, parent_group) }, 0);
             assert_eq!(unsafe { libc::tcsetpgrp(0, supervisor_pid) }, 0);
             assert_eq!(unsafe { libc::kill(-supervisor_pid, libc::SIGCONT) }, 0);
-            wait_for_resumed_foreground(main_pid);
-            assert_eq!(unsafe { libc::kill(-main_pid, libc::SIGTSTP) }, 0);
+            wait_for_resumed_foreground(main_pid, work_group);
+            assert_eq!(unsafe { libc::kill(-work_group, libc::SIGTSTP) }, 0);
             wait_for_job_stop(supervisor_pid);
             wait_for_job_stop(peer.id().cast_signed());
 
@@ -1432,14 +1479,15 @@ mod linux {
 
             assert_eq!(unsafe { libc::tcsetpgrp(0, supervisor_pid) }, 0);
             assert_eq!(unsafe { libc::kill(-supervisor_pid, libc::SIGCONT) }, 0);
-            wait_for_resumed_foreground(main_pid);
+            wait_for_resumed_foreground(main_pid, work_group);
             assert_eq!(unsafe { libc::write(master, b"x\n".as_ptr().cast(), 2) }, 2);
             assert_eq!(wait_with_timeout(&mut supervisor).code(), Some(23));
         }));
         if result.is_err() {
             // Do not leave stopped jobs behind when a regression trips an assertion.
+            eprintln!("terminal job failed with {mode:?}, {start:?}");
             unsafe {
-                libc::kill(-main_pid, libc::SIGKILL);
+                libc::kill(main_pid, libc::SIGKILL);
                 libc::kill(supervisor_pid, libc::SIGCONT);
                 libc::kill(peer.id().cast_signed(), libc::SIGCONT);
             }
@@ -1885,8 +1933,21 @@ mod linux {
         assert_eq!(unsafe { libc::tcgetpgrp(0) }, own_group);
 
         if mode == "tty-job-control-probe" {
-            exercise_terminal_job_control(own_group, master, false);
-            exercise_terminal_job_control(own_group, master, true);
+            for mode in [TtyJobMode::SharedGroup, TtyJobMode::SeparateGroup] {
+                for start in [
+                    TtyJobStart::Foreground,
+                    TtyJobStart::Background,
+                    TtyJobStart::ForegroundBeforeRead,
+                ] {
+                    exercise_terminal_job_control(own_group, master, mode, start);
+                }
+            }
+            exercise_terminal_job_control(
+                own_group,
+                master,
+                TtyJobMode::PendingContinue,
+                TtyJobStart::Foreground,
+            );
             return;
         }
         if mode == "tty-orphan-supervisor-probe" {
@@ -2845,13 +2906,14 @@ mod linux {
                 return;
             }
             Some("tty-read-workload") => {
-                // Exercise ordinary terminal reads even if the test launcher
-                // inherited a blocked or ignored TTIN from its own shell.
+                // A job-control shell gives the workload ordinary stop signals.
                 unsafe {
-                    libc::signal(libc::SIGTTIN, libc::SIG_DFL);
                     let mut mask = std::mem::zeroed();
                     libc::sigemptyset(&raw mut mask);
-                    libc::sigaddset(&raw mut mask, libc::SIGTTIN);
+                    for signal in [libc::SIGTTIN, libc::SIGTSTP] {
+                        libc::signal(signal, libc::SIG_DFL);
+                        libc::sigaddset(&raw mut mask, signal);
+                    }
                     assert_eq!(
                         libc::pthread_sigmask(
                             libc::SIG_UNBLOCK,
@@ -2864,6 +2926,13 @@ mod linux {
                 println!("{}", std::process::id());
                 std::io::stdout().flush().unwrap();
                 let mut byte = [0];
+                if args.get(1).is_some_and(|arg| arg == "wait-for-fg") {
+                    assert_eq!(
+                        unsafe { libc::read(libc::STDOUT_FILENO, byte.as_mut_ptr().cast(), 1) },
+                        1
+                    );
+                    assert_eq!(byte[0], b'r');
+                }
                 std::io::stdin().read_exact(&mut byte).unwrap();
                 assert_eq!(byte[0], b'x');
                 std::process::exit(23);

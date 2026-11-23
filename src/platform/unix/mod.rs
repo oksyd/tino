@@ -26,8 +26,8 @@ mod signals;
 pub(crate) mod sys;
 
 use child::{
-    ForegroundTtyRestore, configure_parent_prctl, manage_process_group, owned_foreground_tty,
-    pdeath_signal, prepare_resolved_command, resolve_command_args, spawn_child,
+    TerminalJob, configure_parent_prctl, manage_process_group, pdeath_signal,
+    prepare_resolved_command, resolve_command_args, spawn_child, terminal_job_group,
 };
 use landlock::{LandlockConfig, PathRuleKind, PinnedPath};
 use signals::{
@@ -135,23 +135,23 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
     let (cmd_c, argv_c) =
         prepare_resolved_command(&effective_cmd).context("prepare child command")?;
     let parent_prctl = configure_parent_prctl(&cli)?;
-    let previous_foreground_group = cli.pgroup_kill.then(owned_foreground_tty).flatten();
+    let job_group = terminal_job_group();
     let child_pid = spawn_child(
         &previous_mask,
         child_pdeath,
         landlock_config.as_ref(),
         cli.pgroup_kill,
-        previous_foreground_group.is_some(),
+        job_group,
         &cmd_c,
         &argv_c,
     )
     .context("spawn child")?;
-    let foreground_tty_restore =
-        previous_foreground_group.map(|previous| ForegroundTtyRestore::new(previous, child_pid));
     // The child has its own copies, all closed by exec. The supervisor need
     // not retain policy descriptors for the entire workload lifetime.
     drop(landlock_config);
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
+    let terminal_job =
+        job_group.map(|group| TerminalJob::new(group, if use_pgroup { child_pid } else { group }));
 
     let mut result = supervise_child(
         &cli,
@@ -159,12 +159,12 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         child_pid,
         use_pgroup,
         &mut signal_fd,
-        foreground_tty_restore.as_ref(),
+        terminal_job.as_ref(),
     );
     // Restore process and terminal state while supervision's signals remain
     // blocked. Attempt every restoration even after a failure, preserving the
     // supervision error when one already exists.
-    drop(foreground_tty_restore);
+    drop(terminal_job);
     let restores = [
         parent_prctl.finish(),
         child_reaping_restore.finish(),
@@ -2526,7 +2526,7 @@ fn supervise_child(
     child_pid: Pid,
     use_pgroup: bool,
     signal_fd: &mut SignalFd,
-    foreground_tty: Option<&ForegroundTtyRestore>,
+    terminal_job: Option<&TerminalJob>,
 ) -> Result<i32> {
     let mut main_exit: Option<i32> = None;
     let result = supervise_child_inner(
@@ -2536,7 +2536,7 @@ fn supervise_child(
         use_pgroup,
         signal_fd,
         &mut main_exit,
-        foreground_tty,
+        terminal_job,
     );
     if result.is_err() {
         if main_exit.is_none() {
@@ -2625,7 +2625,7 @@ fn supervise_child_inner(
     use_pgroup: bool,
     signal_fd: &mut SignalFd,
     main_exit: &mut Option<i32>,
-    foreground_tty: Option<&ForegroundTtyRestore>,
+    terminal_job: Option<&TerminalJob>,
 ) -> Result<i32> {
     let mut shutdown_deadline: Option<ShutdownDeadline> = None;
     let mut sigkill_sent = false;
@@ -2649,22 +2649,22 @@ fn supervise_child_inner(
         if signal_fd_poll_failed(events) {
             bail!("signal fd poll failed with events {:?}", events);
         }
-        let mut suspend_requested = false;
+        let mut job_status = None;
         if events.contains(PollFlags::POLLIN) {
             let mut budget = SIGNAL_BATCH_LIMIT;
             while let Some(info) = read_forwardable_signal(signal_fd, &mut budget)? {
                 let sig = info.ssi_signo.cast_signed();
                 if sig == SIGCHLD as libc::c_int {
-                    if let Some(stopped) = handle_sigchld(cli, child_pid, main_exit)? {
-                        suspend_requested = stopped;
+                    if let Some(status) = handle_sigchld(cli, child_pid, main_exit)? {
+                        job_status = Some(status);
                     }
                 } else if sig == SIGTTIN as libc::c_int || sig == SIGTTOU as libc::c_int {
                     logging::debug(format_args!("ignoring signal {}", sig));
                 } else {
                     if sig == libc::SIGCONT {
-                        suspend_requested = false;
-                        if let Some(tty) = foreground_tty {
-                            tty.resume_job();
+                        job_status = None;
+                        if let Some(tty) = terminal_job {
+                            tty.give_terminal_to_child();
                         }
                     }
                     forward_to_main_child(use_pgroup, child_pid, sig);
@@ -2695,16 +2695,16 @@ fn supervise_child_inner(
         if main_exit.is_some() {
             break;
         }
-        if suspend_requested
+        if let Some(WaitStatus::Stopped(_, signal)) = job_status
             && shutdown_deadline.is_none()
-            && let Some(tty) = foreground_tty
-            && tty.suspend_job()
+            && let Some(tty) = terminal_job
+            && tty.handle_child_stop(child_pid, signal)
             && !signal_fd.accepts(libc::SIGCONT)
         {
             // A caller-owned pending CONT excludes this signal from the
             // signalfd. Returning from our stop still proves continuation,
             // so resume the job without consuming the caller's signal.
-            tty.resume_job();
+            tty.give_terminal_to_child();
             forward_to_main_child(use_pgroup, child_pid, libc::SIGCONT);
         }
     }
@@ -2787,15 +2787,18 @@ fn log_stopped_child(pid: Pid, sig: i32, warn_on_reap: bool) {
     }
 }
 
-fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Result<Option<bool>> {
-    let mut main_stopped = None;
+fn handle_sigchld(
+    cli: &Cli,
+    child_pid: Pid,
+    main_exit: &mut Option<i32>,
+) -> Result<Option<WaitStatus>> {
+    let mut job_status = None;
     loop {
         match waitpid_any_nohang() {
             Ok(status) => {
-                match status {
-                    WaitStatus::Stopped(pid, _) if pid == child_pid => main_stopped = Some(true),
-                    WaitStatus::Continued(pid) if pid == child_pid => main_stopped = Some(false),
-                    _ => {}
+                if matches!(status, WaitStatus::Stopped(pid, _) | WaitStatus::Continued(pid) if pid == child_pid)
+                {
+                    job_status = Some(status);
                 }
                 match handle_wait_status(status, cli, child_pid, main_exit) {
                     WaitLoop::Continue => continue,
@@ -2810,11 +2813,7 @@ fn handle_sigchld(cli: &Cli, child_pid: Pid, main_exit: &mut Option<i32>) -> Res
             Err(e) => bail!("waitpid: {e}"),
         }
     }
-    Ok(if main_exit.is_some() {
-        Some(false)
-    } else {
-        main_stopped
-    })
+    Ok(job_status)
 }
 
 fn handle_wait_status(

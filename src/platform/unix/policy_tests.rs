@@ -37,7 +37,7 @@ fn run_policy(config: &LandlockConfig, args: &[&str]) -> i32 {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     let (program, argv) = prepare_resolved_command(&args).expect("prepare policy probe");
     let mask = SigSet::thread_get_mask().expect("read test signal mask");
-    let pid = spawn_child(&mask, None, Some(config), false, false, &program, &argv)
+    let pid = spawn_child(&mask, None, Some(config), false, None, &program, &argv)
         .expect("spawn policy probe")
         .as_raw();
     let deadline = Instant::now() + Duration::from_secs(5);

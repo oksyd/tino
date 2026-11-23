@@ -1,6 +1,6 @@
 use crate::{Context, Error, Result, bail, cli::Cli, diagnostic::escape_str, logging};
 use libc::{_exit, PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
-use std::{cell::Cell, env, ffi::CString};
+use std::{env, ffi::CString};
 
 use super::landlock;
 use super::signals;
@@ -458,41 +458,53 @@ const fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
     }
 }
 
-fn claim_foreground_tty() {
-    // SAFETY: `STDIN_FILENO` is a valid file descriptor constant and the libc calls are used
-    // exactly as documented for best-effort tty foreground management.
-    unsafe {
-        let pgid = libc::getpgrp();
-        let _ = libc::tcsetpgrp(libc::STDIN_FILENO, pgid);
+fn foreground_group() -> std::result::Result<Pid, Errno> {
+    let group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+    if group == -1 {
+        Err(Errno::last())
+    } else {
+        Ok(Pid::from_raw(group))
     }
 }
 
-pub(super) fn owned_foreground_tty() -> Option<Pid> {
-    // A background supervisor must not take the controlling terminal away
-    // from the shell or another foreground job.
-    let own_group = process_group_of(Pid::from_raw(0)).ok()?;
-    // SAFETY: tcgetpgrp only queries stdin; a non-terminal returns -1.
-    let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-    (foreground == own_group.as_raw()).then_some(own_group)
+// The shell may have assigned the terminal to another job since launch.
+fn transfer_terminal(from: Pid, to: Pid) -> std::result::Result<bool, Errno> {
+    if foreground_group()? != from || from == to {
+        return Ok(false);
+    }
+    if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, to.as_raw()) } == -1 {
+        return Err(Errno::last());
+    }
+    Ok(true)
 }
 
-pub(super) struct ForegroundTtyRestore {
-    previous_group: Pid,
+pub(super) fn terminal_job_group() -> Option<Pid> {
+    foreground_group().ok()?;
+    process_group_of(Pid::from_raw(0)).ok()
+}
+
+pub(super) struct TerminalJob {
+    job_group: Pid,
     child_group: Pid,
-    job_control_started: Cell<bool>,
 }
 
-impl ForegroundTtyRestore {
-    pub(super) const fn new(previous_group: Pid, child_group: Pid) -> Self {
+impl TerminalJob {
+    pub(super) const fn new(job_group: Pid, child_group: Pid) -> Self {
         Self {
-            previous_group,
+            job_group,
             child_group,
-            job_control_started: Cell::new(false),
         }
     }
 
-    pub(super) fn suspend_job(&self) -> bool {
-        if process_group_of(self.child_group).ok() != Some(self.child_group) {
+    /// Returns true if the supervisor stopped and has since been continued.
+    pub(super) fn handle_child_stop(&self, child_pid: Pid, signal: i32) -> bool {
+        // A shell can foreground a running background job without sending CONT.
+        // Its first terminal I/O then stops the separate child group.
+        if matches!(signal, libc::SIGTTIN | libc::SIGTTOU) && self.give_terminal_to_child() {
+            signals::send_signal(true, self.child_group, libc::SIGCONT);
+            return false;
+        }
+        if process_group_of(child_pid).ok() != Some(self.child_group) {
             return false;
         }
         let supervisor = current_process_id();
@@ -502,35 +514,27 @@ impl ForegroundTtyRestore {
         // session. An orphan group or a caller sharing its parent's group has
         // no established job-control parent to resume a forced SIGSTOP.
         let session = unsafe { libc::getsid(0) };
-        if process_group_of(supervisor).ok() != Some(self.previous_group)
-            || parent_group.is_none_or(|group| group == self.previous_group)
+        if process_group_of(supervisor).ok() != Some(self.job_group)
+            || parent_group.is_none_or(|group| group == self.job_group)
             || session == -1
             || unsafe { libc::getsid(parent.as_raw()) } != session
         {
             return false;
         }
-        // A first stop must belong to the foreground job we established. Once
-        // suspended/resumed, also report background reads stopped by SIGTTIN,
-        // while leaving the shell's foreground group untouched.
-        let foreground = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-        if foreground == self.child_group.as_raw() {
-            if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_group.as_raw()) } == -1 {
-                logging::warn(format_args!(
-                    "return foreground terminal before stopping: {}",
-                    Errno::last()
-                ));
-                return false;
-            }
-            self.job_control_started.set(true);
-        } else if foreground == -1 || !self.job_control_started.get() {
+        // A background read also stops the shell job. Only return the terminal
+        // when it was held by a separate child group.
+        if let Err(err) = transfer_terminal(self.child_group, self.job_group) {
+            logging::warn(format_args!(
+                "return foreground terminal before stopping: {err}"
+            ));
             return false;
         }
         // A shell pipeline needs all members stopped before its prompt can
         // return. Signal our original job group only when we still lead it;
         // the parent checked above is outside that group. SIGSTOP cannot remain
         // pending behind the supervisor's signal mask.
-        let stopped = if supervisor == self.previous_group {
-            send_process_group_signal(self.previous_group, libc::SIGSTOP)
+        let stopped = if supervisor == self.job_group {
+            send_process_group_signal(self.job_group, libc::SIGSTOP)
         } else {
             send_process_signal(supervisor, libc::SIGSTOP)
         };
@@ -541,30 +545,28 @@ impl ForegroundTtyRestore {
         true
     }
 
-    pub(super) fn resume_job(&self) {
+    pub(super) fn give_terminal_to_child(&self) -> bool {
         // `fg` hands the terminal to the supervisor before sending CONT; `bg`
         // does not. Only the foreground case should hand it on to the child.
-        if process_group_of(self.child_group).ok() == Some(self.child_group)
-            && unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) } == self.previous_group.as_raw()
-            && unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, self.child_group.as_raw()) } == -1
+        if self.job_group == self.child_group
+            || process_group_of(self.child_group).ok() != Some(self.child_group)
         {
-            logging::warn(format_args!(
-                "restore child foreground terminal after continue: {}",
-                Errno::last()
-            ));
+            return false;
         }
+        transfer_terminal(self.job_group, self.child_group).unwrap_or_else(|err| {
+            logging::warn(format_args!("give foreground terminal to child: {err}"));
+            false
+        })
     }
 }
 
-impl Drop for ForegroundTtyRestore {
+impl Drop for TerminalJob {
     fn drop(&mut self) {
         // Restore only a terminal still owned by the group we handed it to.
         // Another job may have taken foreground ownership during supervision.
         // SIGTTOU remains blocked until the supervisor's signal guard is dropped.
-        unsafe {
-            if libc::tcgetpgrp(libc::STDIN_FILENO) == self.child_group.as_raw() {
-                let _ = libc::tcsetpgrp(libc::STDIN_FILENO, self.previous_group.as_raw());
-            }
+        if self.job_group != self.child_group {
+            let _ = transfer_terminal(self.child_group, self.job_group);
         }
     }
 }
@@ -574,7 +576,7 @@ pub(super) fn spawn_child(
     child_pdeath: Option<libc::c_int>,
     landlock_config: Option<&landlock::LandlockConfig>,
     pgroup_kill: bool,
-    claim_tty: bool,
+    job_group: Option<Pid>,
     cmd_c: &CString,
     argv_c: &[CString],
 ) -> Result<Pid> {
@@ -615,8 +617,8 @@ pub(super) fn spawn_child(
             }
             if pgroup_kill {
                 if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_ok() {
-                    if claim_tty {
-                        claim_foreground_tty();
+                    if let Some(group) = job_group {
+                        let _ = transfer_terminal(group, current_process_id());
                     }
                 } else {
                     child_write(b"tino: failed to establish child process group\n");
