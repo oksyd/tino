@@ -1,17 +1,17 @@
 use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::sys::Errno;
+use super::sys::{self, Errno};
 
 pub(super) struct LandlockConfig {
     pub write_requested: bool,
     pub exec_requested: bool,
     pub warn_only: bool,
-    pub no_dev: bool,
     pub preset_names: Vec<&'static str>,
     pub writable_dirs: Vec<PinnedPath>,
     pub dev_dir: Option<PinnedPath>,
@@ -33,14 +33,22 @@ pub(super) struct PinnedPath {
 
 impl PinnedPath {
     pub(super) fn open(path: &Path, kind: PathRuleKind) -> io::Result<Self> {
+        let extra_flags = match kind {
+            PathRuleKind::Any => 0,
+            PathRuleKind::Directory => libc::O_DIRECTORY,
+        };
         let raw = CString::new(path.as_os_str().as_bytes())?;
-        let fd = open_rule_path(&raw, kind)
-            .map_err(|errno| io::Error::from_raw_os_error(errno.raw()))?;
-        // SAFETY: open_rule_path returned a new descriptor with O_CLOEXEC.
+        // Open with O_PATH directly: std's OpenOptions on musl masks out this flag.
+        // SAFETY: raw is NUL-terminated, and these flags do not require a mode argument.
+        let fd = unsafe { libc::open(raw.as_ptr(), libc::O_PATH | libc::O_CLOEXEC | extra_flags) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: open returned a newly owned file descriptor.
         let file = unsafe { File::from_raw_fd(fd) };
         // Obtain a label after pinning. A fallback label never participates in
         // rule application, including when procfs is unavailable to --explain.
-        let canonical = std::fs::read_link(format!("/proc/self/fd/{fd}"))
+        let canonical = std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
             .or_else(|_| std::fs::canonicalize(path))?;
         Ok(Self {
             path: CString::new(canonical.as_os_str().as_bytes())?,
@@ -58,6 +66,10 @@ impl PinnedPath {
 
     pub(super) fn metadata(&self) -> io::Result<std::fs::Metadata> {
         self.file.metadata()
+    }
+
+    pub(super) fn may_execute(&self) -> sys::Result<bool> {
+        sys::may_execute_at(self.file.as_raw_fd(), c"")
     }
 
     pub(super) fn open_read(&self) -> io::Result<File> {
@@ -94,6 +106,56 @@ pub(super) enum LandlockError<'a> {
     RestrictSelf(Errno),
 }
 
+impl fmt::Display for LandlockError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let errno = match self {
+            Self::NotSupported => return f.write_str("not supported (kernel/LSM)"),
+            Self::AbiTooOld {
+                feature,
+                required_abi,
+                current_abi,
+            } => {
+                return write!(
+                    f,
+                    "{feature} requires ABI {required_abi} but kernel reports ABI {current_abi}"
+                );
+            }
+            Self::QueryAbi(errno) => {
+                f.write_str("query ABI")?;
+                errno
+            }
+            Self::CreateRuleset(errno) => {
+                f.write_str("create ruleset")?;
+                errno
+            }
+            Self::AddRule { path, errno } => {
+                write!(f, "add rule {}", path.to_bytes().escape_ascii())?;
+                errno
+            }
+            Self::AddNetPortRule {
+                port,
+                action,
+                errno,
+            } => {
+                write!(f, "add {action} rule for port {port}")?;
+                errno
+            }
+            Self::SetNoNewPrivs(errno) => {
+                return write!(f, "PR_SET_NO_NEW_PRIVS errno {}", errno.raw());
+            }
+            Self::RestrictSelf(errno) => {
+                f.write_str("restrict self")?;
+                errno
+            }
+        };
+        write!(f, " errno {}", errno.raw())?;
+        if matches!(*errno, Errno::EPERM | Errno::EACCES) {
+            f.write_str("; blocked by seccomp?")?;
+        }
+        Ok(())
+    }
+}
+
 const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
 const LANDLOCK_RULE_NET_PORT: u32 = 2;
@@ -118,18 +180,7 @@ const LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1;
 const LANDLOCK_SCOPE_SIGNAL: u64 = 2;
 
 #[repr(C)]
-struct LandlockRulesetAttrV1 {
-    handled_access_fs: u64,
-}
-
-#[repr(C)]
-struct LandlockRulesetAttrV4 {
-    handled_access_fs: u64,
-    handled_access_net: u64,
-}
-
-#[repr(C)]
-struct LandlockRulesetAttrV6 {
+struct LandlockRulesetAttr {
     handled_access_fs: u64,
     handled_access_net: u64,
     scoped: u64,
@@ -145,17 +196,6 @@ struct LandlockPathBeneathAttr {
 struct LandlockNetPortAttr {
     allowed_access: u64,
     port: u64,
-}
-
-struct OwnedFd(i32);
-
-impl Drop for OwnedFd {
-    fn drop(&mut self) {
-        // SAFETY: the file descriptor is owned by this wrapper and must be closed exactly once.
-        unsafe {
-            libc::close(self.0);
-        }
-    }
 }
 
 pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
@@ -186,47 +226,43 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
     }
     let allowed_writes = allowed_write_access_fs(handled_writes);
 
-    let ruleset_fd = match create_ruleset(
+    let ruleset = match create_ruleset(
         abi_version,
         handled_access_fs,
         handled_access_net,
         scoped_access,
     ) {
-        Ok(fd) => OwnedFd(fd),
+        Ok(fd) => fd,
         Err(errno) if errno_indicates_not_supported(errno) => {
             return Err(LandlockError::NotSupported);
         }
         Err(errno) => return Err(LandlockError::CreateRuleset(errno)),
     };
 
+    let ruleset_fd = ruleset.as_raw_fd();
     if let Some(dev_dir) = &config.dev_dir {
-        add_path_beneath_rule(ruleset_fd.0, dev_dir, LANDLOCK_ACCESS_FS_WRITE_FILE)?;
+        add_path_beneath_rule(ruleset_fd, dev_dir, LANDLOCK_ACCESS_FS_WRITE_FILE)?;
     }
 
     for dir in &config.writable_dirs {
-        add_path_beneath_rule(ruleset_fd.0, dir, allowed_writes)?;
+        add_path_beneath_rule(ruleset_fd, dir, allowed_writes)?;
     }
 
     for path in &config.exec_allow_paths {
-        add_path_beneath_rule(ruleset_fd.0, path, LANDLOCK_ACCESS_FS_EXECUTE)?;
+        add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_EXECUTE)?;
     }
 
     for path in &config.device_ioctl_allow_paths {
-        add_path_beneath_rule(ruleset_fd.0, path, LANDLOCK_ACCESS_FS_IOCTL_DEV)?;
+        add_path_beneath_rule(ruleset_fd, path, LANDLOCK_ACCESS_FS_IOCTL_DEV)?;
     }
 
     for port in &config.bind_tcp_ports {
-        add_net_port_rule(
-            ruleset_fd.0,
-            *port,
-            LANDLOCK_ACCESS_NET_BIND_TCP,
-            "bind TCP",
-        )?;
+        add_net_port_rule(ruleset_fd, *port, LANDLOCK_ACCESS_NET_BIND_TCP, "bind TCP")?;
     }
 
     for port in &config.connect_tcp_ports {
         add_net_port_rule(
-            ruleset_fd.0,
+            ruleset_fd,
             *port,
             LANDLOCK_ACCESS_NET_CONNECT_TCP,
             "connect TCP",
@@ -234,7 +270,7 @@ pub(super) fn apply(config: &LandlockConfig) -> Result<u32, LandlockError<'_>> {
     }
 
     set_no_new_privs().map_err(LandlockError::SetNoNewPrivs)?;
-    match restrict_self(ruleset_fd.0) {
+    match restrict_self(ruleset_fd) {
         Ok(()) => {}
         Err(errno) if errno_indicates_not_supported(errno) => {
             return Err(LandlockError::NotSupported);
@@ -382,55 +418,33 @@ fn create_ruleset(
     handled_access_fs: u64,
     handled_access_net: u64,
     scoped: u64,
-) -> std::result::Result<i32, Errno> {
-    let ret = if abi_version >= 6 {
-        let attr = LandlockRulesetAttrV6 {
-            handled_access_fs,
-            handled_access_net,
-            scoped,
-        };
-        // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible
-        // struct matching the supported ABI.
-        unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                &raw const attr,
-                std::mem::size_of::<LandlockRulesetAttrV6>(),
-                0u32,
-            )
-        }
-    } else if abi_version >= 4 {
-        let attr = LandlockRulesetAttrV4 {
-            handled_access_fs,
-            handled_access_net,
-        };
-        // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible
-        // struct matching the supported ABI.
-        unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                &raw const attr,
-                std::mem::size_of::<LandlockRulesetAttrV4>(),
-                0u32,
-            )
-        }
-    } else {
-        let attr = LandlockRulesetAttrV1 { handled_access_fs };
-        // SAFETY: calling the Landlock create_ruleset syscall with a pointer to a C-compatible
-        // struct matching the supported ABI.
-        unsafe {
-            libc::syscall(
-                libc::SYS_landlock_create_ruleset,
-                &raw const attr,
-                std::mem::size_of::<LandlockRulesetAttrV1>(),
-                0u32,
-            )
-        }
+) -> std::result::Result<OwnedFd, Errno> {
+    let attr = LandlockRulesetAttr {
+        handled_access_fs,
+        handled_access_net,
+        scoped,
+    };
+    // Each ABI extends the same struct. Pass only the fields the kernel knows.
+    let size = match abi_version {
+        0..=3 => std::mem::offset_of!(LandlockRulesetAttr, handled_access_net),
+        4..=5 => std::mem::offset_of!(LandlockRulesetAttr, scoped),
+        _ => size_of::<LandlockRulesetAttr>(),
+    };
+    // SAFETY: size selects a fully initialized prefix of this repr(C) value.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &raw const attr,
+            size,
+            0u32,
+        )
     };
     if ret == -1 {
         Err(Errno::last())
     } else {
-        i32::try_from(ret).map_err(|_| Errno::EINVAL)
+        let fd = i32::try_from(ret).map_err(|_| Errno::EINVAL)?;
+        // SAFETY: a successful create_ruleset syscall returns a newly owned descriptor.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
     }
 }
 
@@ -498,21 +512,6 @@ fn add_net_port_rule(
     Ok(())
 }
 
-fn open_rule_path(path: &CStr, kind: PathRuleKind) -> std::result::Result<i32, Errno> {
-    let extra_flags = match kind {
-        PathRuleKind::Any => 0,
-        PathRuleKind::Directory => libc::O_DIRECTORY,
-    };
-    open_path_with_flags(path, extra_flags)
-}
-
-fn open_path_with_flags(path: &CStr, extra_flags: libc::c_int) -> std::result::Result<i32, Errno> {
-    let flags = libc::O_PATH | libc::O_CLOEXEC | extra_flags;
-    // SAFETY: `path` is NUL-terminated and the libc `open` flags are passed as documented.
-    let fd = unsafe { libc::open(path.as_ptr(), flags) };
-    if fd == -1 { Err(Errno::last()) } else { Ok(fd) }
-}
-
 fn set_no_new_privs() -> std::result::Result<(), Errno> {
     // SAFETY: `prctl` is invoked with documented constants to enable `no_new_privs`.
     let ret = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -540,7 +539,6 @@ fn errno_indicates_not_supported(errno: Errno) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt;
 
     #[test]
     fn allowed_write_mask_excludes_device_nodes() {
@@ -669,19 +667,12 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("create test directory");
         std::fs::write(&file, b"not a directory").expect("write test file");
 
-        let dir_c = CString::new(dir.as_os_str().as_bytes()).expect("directory path CString");
-        let file_c = CString::new(file.as_os_str().as_bytes()).expect("file path CString");
-
-        let dir_fd = open_rule_path(dir_c.as_c_str(), PathRuleKind::Directory)
-            .expect("directory path should open as directory");
-        let _dir_fd = OwnedFd(dir_fd);
-        let file_fd = open_rule_path(file_c.as_c_str(), PathRuleKind::Any)
-            .expect("regular file should open for non-directory rule");
-        let _file_fd = OwnedFd(file_fd);
-        let err = open_rule_path(file_c.as_c_str(), PathRuleKind::Directory)
+        PinnedPath::open(&dir, PathRuleKind::Directory).expect("pin directory");
+        PinnedPath::open(&file, PathRuleKind::Any).expect("pin regular file");
+        let err = PinnedPath::open(&file, PathRuleKind::Directory)
             .expect_err("regular file must not open as directory rule");
 
-        assert_eq!(err, Errno::ENOTDIR);
+        assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
         let _ = std::fs::remove_dir_all(&root);
     }
 

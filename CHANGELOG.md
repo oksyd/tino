@@ -1,3 +1,18 @@
+## Unreleased
+
+- **Breaking change.** `--remap-exit` preserves child setup and exec failures
+  (`1`, `126`, `127`). The same codes returned by the service can still map to success.
+- `--explain` reports `tcp_restrict.bind_mode` and `tcp_restrict.connect_mode`
+  as `allowlist` or `unrestricted` alongside the allowed ports.
+- **Breaking change.** Removed `command.present` and `write_restrict.dev_writable`
+  from `--explain`. Use `command.effective` for the argument list and
+  `write_restrict.auto_allow_dev` for the automatic `/dev` rule.
+- **Breaking change.** Replaced `pdeath` with `parent-death-signal` in config files
+  and `parent_death_signal` in `--explain` output.
+- **Breaking change.** `TINI_SUBREAPER` and `TINI_KILL_PROCESS_GROUP` now follow
+  Tini's convention of enabling the option whenever the variable is set, including
+  to `0`. Use the corresponding `TINO_*` variable for an explicit boolean value.
+
 ## [0.1.38] - 2026-10-15
 
 ### ⚙️ Miscellaneous Tasks

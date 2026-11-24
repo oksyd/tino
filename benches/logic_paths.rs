@@ -45,63 +45,13 @@ print("hello")
         }
 
         fn bench_parse_elf_interpreter() {
-            let elf = sample_elf_with_interp("/lib64/ld-linux-x86-64.so.2");
+            let executable = std::env::current_exe().expect("locate benchmark executable");
+            let elf = std::fs::read(executable).expect("read native ELF executable");
 
             bench("parse_elf_interpreter", || {
                 tino::bench_support::parse_elf_interpreter(black_box(&elf))
-                    .expect("ELF interpreter benchmark should succeed")
+                    .expect("parse native ELF executable")
             });
-        }
-
-        fn sample_elf_with_interp(interpreter: &str) -> Vec<u8> {
-            const ELF_HEADER_LEN: usize = 64;
-            const PROGRAM_HEADER_LEN: usize = 56;
-            const PT_INTERP: u32 = 3;
-
-            let interp = format!("{interpreter}\0");
-            let phoff = u64::try_from(ELF_HEADER_LEN).expect("ELF header length should fit u64");
-            let interp_offset = u64::try_from(ELF_HEADER_LEN + PROGRAM_HEADER_LEN)
-                .expect("sample ELF offset should fit u64");
-            let file_size = usize::try_from(interp_offset)
-                .expect("sample ELF offset should fit usize")
-                + interp.len();
-            let interp_len =
-                u64::try_from(interp.len()).expect("sample interpreter length should fit u64");
-
-            let mut bytes = vec![0u8; file_size];
-            bytes[0..4].copy_from_slice(b"\x7FELF");
-            bytes[4] = 2;
-            bytes[5] = 1;
-            bytes[6] = 1;
-            bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
-            bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
-            bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-            bytes[32..40].copy_from_slice(&phoff.to_le_bytes());
-            bytes[52..54].copy_from_slice(
-                &u16::try_from(ELF_HEADER_LEN)
-                    .expect("ELF header length should fit u16")
-                    .to_le_bytes(),
-            );
-            bytes[54..56].copy_from_slice(
-                &u16::try_from(PROGRAM_HEADER_LEN)
-                    .expect("program header length should fit u16")
-                    .to_le_bytes(),
-            );
-            bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
-
-            let program_header = ELF_HEADER_LEN;
-            bytes[program_header..program_header + 4].copy_from_slice(&PT_INTERP.to_le_bytes());
-            bytes[program_header + 8..program_header + 16]
-                .copy_from_slice(&interp_offset.to_le_bytes());
-            bytes[program_header + 32..program_header + 40]
-                .copy_from_slice(&interp_len.to_le_bytes());
-            bytes[program_header + 40..program_header + 48]
-                .copy_from_slice(&interp_len.to_le_bytes());
-
-            let interp_offset =
-                usize::try_from(interp_offset).expect("sample ELF offset should fit usize");
-            bytes[interp_offset..].copy_from_slice(interp.as_bytes());
-            bytes
         }
     }
     _ => {}

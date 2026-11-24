@@ -1,53 +1,51 @@
-use crate::{Context, Error, Result, bail, cli::Cli, diagnostic::escape_str, logging};
+use crate::{Context, Error, Result, bail, cli::Cli, logging};
 use libc::{_exit, PR_GET_CHILD_SUBREAPER, PR_SET_CHILD_SUBREAPER, PR_SET_PDEATHSIG};
-use std::{env, ffi::CString};
+use std::{
+    env,
+    ffi::CString,
+    fs::OpenOptions,
+    io,
+    os::fd::{AsFd, AsRawFd, OwnedFd},
+    os::unix::fs::OpenOptionsExt,
+    ptr::NonNull,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use super::landlock;
 use super::signals;
 use super::sys::{
-    Errno, ForkResult, Pid, SIGPIPE, SigSet, SignalAction, current_process_id, exec_program,
-    fork_process, parent_process_id, process_group_exists, process_group_of,
+    Errno, ForkResult, Pid, SIGCHLD, SIGPIPE, SigSet, SignalAction, current_process_id,
+    exec_program, fork_process, parent_process_id, process_group_exists, process_group_of,
     send_process_group_signal, send_process_signal, set_process_group,
 };
 
 #[derive(Default)]
-pub(super) struct ParentPrctlOutcome {
-    pub subreaper_enabled: bool,
-    subreaper_restore: Option<SubreaperRestore>,
-}
-
-impl ParentPrctlOutcome {
-    pub(super) fn finish(mut self) -> Result<()> {
-        self.subreaper_restore
-            .take()
-            .map_or(Ok(()), SubreaperRestore::finish)
-    }
-}
-
-struct SubreaperRestore {
-    previous: libc::c_int,
+pub(super) struct SubreaperRestore {
     active: bool,
 }
 
 impl SubreaperRestore {
-    fn restore(&self) -> Result<()> {
-        // SAFETY: restore the captured child-subreaper flag for this process.
-        if unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, self.previous) } == -1 {
+    fn restore() -> Result<()> {
+        // SAFETY: this guard only undoes its own activation.
+        if unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, 0) } == -1 {
             return Err(Errno::last()).context("restore child subreaper state");
         }
         Ok(())
     }
 
-    fn finish(mut self) -> Result<()> {
-        self.active = false;
-        self.restore()
+    pub(super) fn finish(mut self) -> Result<()> {
+        if self.active {
+            self.active = false;
+            Self::restore()?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for SubreaperRestore {
     fn drop(&mut self) {
         if self.active
-            && let Err(err) = self.restore()
+            && let Err(err) = Self::restore()
         {
             logging::warn(format_args!(
                 "restore child subreaper state failed: {err:#}"
@@ -57,45 +55,31 @@ impl Drop for SubreaperRestore {
 }
 
 pub(super) fn pdeath_signal(cli: &Cli) -> Result<Option<libc::c_int>> {
-    let Some(sig_name) = &cli.pdeath else {
-        return Ok(None);
-    };
-    let signal = signals::signal_by_name(sig_name).ok_or_else(|| {
-        Error::usage(format!(
-            "invalid signal '{}'; supported values align with `tino --help`",
-            escape_str(sig_name)
-        ))
-    })?;
-    Ok(Some(signal as libc::c_int))
+    cli.parent_death_signal()
+        .map(|signal| signal.map(|signal| signal.number as libc::c_int))
+        .map_err(Error::usage)
 }
 
-pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<ParentPrctlOutcome> {
-    let mut outcome = ParentPrctlOutcome::default();
-    if cli.subreaper {
-        let previous_subreaper =
-            current_child_subreaper_state().context("capture child subreaper state")?;
-        // SAFETY: enabling the child subreaper flag is safe for the current process.
-        unsafe {
-            if libc::prctl(PR_SET_CHILD_SUBREAPER, 1) == -1 {
-                let err = Errno::last();
-                if err == Errno::EPERM {
-                    logging::warn(format_args!(
-                        "subreaper capability rejected; continuing without subreaper: {}",
-                        err
-                    ));
-                } else {
-                    bail!("prctl SUBREAPER: {}", err);
-                }
-            } else {
-                outcome.subreaper_enabled = true;
-                outcome.subreaper_restore = Some(SubreaperRestore {
-                    previous: previous_subreaper,
-                    active: true,
-                });
-            }
-        }
+pub(super) fn configure_parent_prctl(cli: &Cli) -> Result<SubreaperRestore> {
+    // The namespace init already adopts orphans without the subreaper flag.
+    if !cli.subreaper
+        || current_process_id().as_raw() == 1
+        || current_child_subreaper_state().context("capture child subreaper state")? != 0
+    {
+        return Ok(SubreaperRestore::default());
     }
-    Ok(outcome)
+    // SAFETY: enabling the child-subreaper flag affects only this process.
+    if unsafe { libc::prctl(PR_SET_CHILD_SUBREAPER, 1) } == -1 {
+        let err = Errno::last();
+        if err != Errno::EPERM {
+            bail!("prctl SUBREAPER: {}", err);
+        }
+        logging::warn(format_args!(
+            "subreaper capability rejected; continuing without subreaper: {err}"
+        ));
+        return Ok(SubreaperRestore::default());
+    }
+    Ok(SubreaperRestore { active: true })
 }
 
 fn current_child_subreaper_state() -> std::result::Result<libc::c_int, Errno> {
@@ -119,43 +103,19 @@ fn set_child_pdeath_signal(sig: libc::c_int) -> std::result::Result<(), Errno> {
     }
 }
 
-fn self_signal(sig: libc::c_int) -> std::result::Result<(), Errno> {
-    // SAFETY: signal number was resolved before fork and targets the current process.
-    let ret = unsafe { libc::kill(current_process_id().as_raw(), sig) };
-    if ret == -1 {
-        Err(Errno::last())
-    } else {
-        Ok(())
-    }
-}
-
 const MAX_ENV_EXPANSION_DEPTH: usize = 32;
 
-pub(super) fn resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
-    let args = if expand_env {
-        expand_command_args(cmd)
-    } else {
-        Ok(cmd.to_vec())
-    }?;
+pub(super) fn resolve_command_args(mut args: Vec<String>, expand_env: bool) -> Result<Vec<String>> {
+    if expand_env {
+        for (index, arg) in args.iter_mut().enumerate() {
+            if arg.contains('$') {
+                *arg = expand_command_arg(arg)
+                    .with_context(|| format!("expand environment references in argv[{index}]"))?;
+            }
+        }
+    }
     validate_command_args(&args)?;
     Ok(args)
-}
-
-pub(super) fn prepare_resolved_command(args: &[String]) -> Result<(CString, Vec<CString>)> {
-    if args.is_empty() {
-        return Err(Error::usage("missing CMD (use --help)"));
-    }
-
-    let program = CString::new(args[0].as_str())
-        .map_err(|_| Error::usage("command argument contains embedded NUL byte"))?;
-    let argv = args
-        .iter()
-        .map(|s| {
-            CString::new(s.as_str())
-                .map_err(|_| Error::usage("command argument contains embedded NUL byte"))
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok((program, argv))
 }
 
 fn validate_command_args(args: &[String]) -> Result<()> {
@@ -168,15 +128,13 @@ fn validate_command_args(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn expand_command_args(cmd: &[String]) -> Result<Vec<String>> {
-    cmd.iter().map(|arg| expand_command_arg(arg)).collect()
-}
-
 fn expand_command_arg(arg: &str) -> Result<String> {
-    expand_command_arg_with_depth(arg, 0).context("expand environment references in child argument")
+    let mut expanded = String::with_capacity(arg.len());
+    expand_command_arg_into(arg, 0, &mut expanded)?;
+    Ok(expanded)
 }
 
-fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
+fn expand_command_arg_into(mut arg: &str, depth: usize, expanded: &mut String) -> Result<()> {
     if depth > MAX_ENV_EXPANSION_DEPTH {
         return Err(Error::usage(format!(
             "environment expansion nesting exceeds {} levels",
@@ -184,74 +142,50 @@ fn expand_command_arg_with_depth(arg: &str, depth: usize) -> Result<String> {
         )));
     }
 
-    let mut expanded = String::with_capacity(arg.len());
-    let mut idx = 0;
-    let bytes = arg.as_bytes();
-
-    while idx < arg.len() {
-        let Some(offset) = arg[idx..].find('$') else {
-            expanded.push_str(&arg[idx..]);
-            break;
-        };
-        let dollar = idx + offset;
-        expanded.push_str(&arg[idx..dollar]);
-
-        if dollar + 1 >= arg.len() {
+    while let Some((literal, tail)) = arg.split_once('$') {
+        expanded.push_str(literal);
+        if let Some(rest) = tail.strip_prefix('$') {
             expanded.push('$');
-            break;
-        }
-
-        match bytes[dollar + 1] {
-            b'$' => {
-                expanded.push('$');
-                idx = dollar + 2;
-            }
-            b'{' => {
-                let closing = find_matching_brace(arg, dollar + 2)?;
-                let body = &arg[dollar + 2..closing];
-                expanded.push_str(&expand_braced_env(body, depth + 1)?);
-                idx = closing + 1;
-            }
-            _ => {
-                expanded.push('$');
-                idx = dollar + 1;
-            }
+            arg = rest;
+        } else if let Some(expression) = tail.strip_prefix('{') {
+            let (separator, end) = braced_delimiters(expression)?;
+            let body = &expression[..end];
+            expand_braced_env(body, separator, depth + 1, expanded)?;
+            arg = &expression[end + 1..];
+        } else {
+            expanded.push('$');
+            arg = tail;
         }
     }
-
-    Ok(expanded)
+    expanded.push_str(arg);
+    Ok(())
 }
 
-fn expand_braced_env(body: &str, depth: usize) -> Result<String> {
-    if let Some((name, default)) = split_braced_default(body) {
-        if !is_valid_env_name(name) {
-            return Err(Error::usage(format!(
-                "invalid environment variable name '{}'",
-                escape_str(name)
-            )));
-        }
-        resolve_env_value(name, Some(default), depth)
-    } else if is_valid_env_name(body) {
-        resolve_env_value(body, None, depth)
-    } else {
-        Err(Error::usage(format!(
-            "unsupported braced environment expansion '${{{}}}'",
-            escape_str(body)
-        )))
+fn expand_braced_env(
+    body: &str,
+    separator: Option<usize>,
+    depth: usize,
+    expanded: &mut String,
+) -> Result<()> {
+    let (name, default) =
+        separator.map_or((body, None), |idx| (&body[..idx], Some(&body[idx + 2..])));
+    if !super::is_env_variable_name(name) {
+        return Err(Error::usage(
+            "unsupported braced environment expansion (expected ${VAR} or ${VAR:-default})",
+        ));
     }
-}
-
-fn resolve_env_value(name: &str, default: Option<&str>, depth: usize) -> Result<String> {
     match env::var(name) {
-        Ok(value) if default.is_none() || !value.is_empty() => Ok(value),
-        Ok(_) | Err(env::VarError::NotPresent) if let Some(fallback) = default => {
-            expand_command_arg_with_depth(fallback, depth)
+        Ok(value) if !value.is_empty() => expanded.push_str(&value),
+        Ok(_) | Err(env::VarError::NotPresent) => {
+            if let Some(fallback) = default {
+                expand_command_arg_into(fallback, depth, expanded)?;
+            }
         }
-        Ok(_) | Err(env::VarError::NotPresent) => Ok(String::new()),
         Err(env::VarError::NotUnicode(_)) => {
             bail!("environment variable '{name}' contains non-Unicode data")
         }
     }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -260,194 +194,60 @@ enum EnvBraceFrame {
     Literal,
 }
 
-fn find_matching_brace(arg: &str, mut idx: usize) -> Result<usize> {
-    let bytes = arg.as_bytes();
-    let mut stack = vec![EnvBraceFrame::Expansion];
-
-    while idx < arg.len() {
-        if bytes[idx] == b'$' && idx + 1 < arg.len() {
-            match bytes[idx + 1] {
-                b'$' => {
-                    if idx + 2 < arg.len() && bytes[idx + 2] == b'{' {
-                        stack.push(EnvBraceFrame::Literal);
-                        idx += 3;
-                    } else {
-                        idx += 2;
-                    }
-                    continue;
-                }
-                b'{' => {
-                    stack.push(EnvBraceFrame::Expansion);
-                    idx += 2;
-                    continue;
-                }
-                _ => {}
-            }
-        }
-        if stack.last() == Some(&EnvBraceFrame::Literal) && bytes[idx] == b'{' {
-            stack.push(EnvBraceFrame::Literal);
-            idx += 1;
-            continue;
-        }
-        if bytes[idx] == b'}' {
-            let _ = stack.pop();
-            if stack.is_empty() {
-                return Ok(idx);
-            }
-            idx += 1;
-            continue;
-        }
-        idx += 1;
-    }
-
-    Err(Error::usage("missing closing '}'"))
-}
-
-fn split_braced_default(body: &str) -> Option<(&str, &str)> {
-    let bytes = body.as_bytes();
-    let mut idx = 0;
+// Locate the first top-level `:-` and the closing brace in the same pass.
+fn braced_delimiters(expression: &str) -> Result<(Option<usize>, usize)> {
+    let bytes = expression.as_bytes();
     let mut stack = Vec::new();
-
-    while idx < body.len() {
-        if bytes[idx] == b'$' && idx + 1 < body.len() {
-            match bytes[idx + 1] {
-                b'$' => {
-                    if idx + 2 < body.len() && bytes[idx + 2] == b'{' {
-                        stack.push(EnvBraceFrame::Literal);
-                        idx += 3;
-                    } else {
-                        idx += 2;
-                    }
-                    continue;
-                }
-                b'{' => {
-                    stack.push(EnvBraceFrame::Expansion);
-                    idx += 2;
-                    continue;
-                }
-                _ => {}
+    let mut separator = None;
+    let mut idx = 0;
+    loop {
+        match &bytes[idx..] {
+            [] => return Err(Error::usage("missing closing '}'")),
+            [b'$', b'$', b'{', ..] => {
+                stack.push(EnvBraceFrame::Literal);
+                idx += 3;
             }
-        }
-        if stack.last() == Some(&EnvBraceFrame::Literal) && bytes[idx] == b'{' {
-            stack.push(EnvBraceFrame::Literal);
-            idx += 1;
-            continue;
-        }
-        if bytes[idx] == b'}' && !stack.is_empty() {
-            let _ = stack.pop();
-            idx += 1;
-            continue;
-        }
-        if stack.is_empty() && bytes[idx] == b':' && idx + 1 < body.len() && bytes[idx + 1] == b'-'
-        {
-            return Some((&body[..idx], &body[idx + 2..]));
-        }
-        idx += 1;
-    }
-
-    None
-}
-
-fn is_valid_env_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    !bytes.is_empty()
-        && is_env_name_start(bytes[0])
-        && bytes[1..].iter().all(|byte| is_env_name_continue(*byte))
-}
-
-const fn is_env_name_start(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphabetic()
-}
-
-const fn is_env_name_continue(byte: u8) -> bool {
-    byte == b'_' || byte.is_ascii_alphanumeric()
-}
-
-fn child_write(bytes: &[u8]) {
-    let Some(mut stderr) = super::sys::DiagnosticWriter::stderr() else {
-        return;
-    };
-    let _ = stderr.write_all(bytes);
-}
-
-fn child_write_escaped(bytes: &[u8]) {
-    for &byte in bytes {
-        match byte {
-            b'\n' => child_write(b"\\n"),
-            b'\r' => child_write(b"\\r"),
-            b'\t' => child_write(b"\\t"),
-            b'\\' => child_write(b"\\\\"),
-            b'\'' => child_write(b"\\'"),
-            b'"' => child_write(b"\\\""),
-            0x20..=0x7e => child_write_byte(byte),
-            _ => {
-                child_write(b"\\x");
-                child_write_hex_byte(byte);
+            [b'$', b'$', ..] => idx += 2,
+            [b'$', b'{', ..] => {
+                stack.push(EnvBraceFrame::Expansion);
+                idx += 2;
             }
+            [b'{', ..] if stack.last() == Some(&EnvBraceFrame::Literal) => {
+                stack.push(EnvBraceFrame::Literal);
+                idx += 1;
+            }
+            [b'}', ..] => {
+                if stack.pop().is_none() {
+                    return Ok((separator, idx));
+                }
+                idx += 1;
+            }
+            [b':', b'-', ..] if stack.is_empty() && separator.is_none() => {
+                separator = Some(idx);
+                idx += 2;
+            }
+            _ => idx += 1,
         }
-    }
-}
-
-fn child_write_byte(byte: u8) {
-    child_write(&[byte]);
-}
-
-fn child_write_hex_byte(byte: u8) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    child_write(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0f) as usize]]);
-}
-
-fn child_write_errno(errno: Errno) {
-    child_write_u32(errno.raw().cast_unsigned());
-}
-
-fn child_write_u32(mut value: u32) {
-    let mut buf = [0u8; 12];
-    let mut idx = buf.len();
-    if value == 0 {
-        idx -= 1;
-        buf[idx] = b'0';
-    } else {
-        while value > 0 {
-            let digit = (value % 10) as u8;
-            idx -= 1;
-            buf[idx] = b'0' + digit;
-            value /= 10;
-        }
-    }
-    child_write(&buf[idx..]);
-}
-
-fn child_write_exec_failure_hint(errno: Errno) {
-    match errno {
-        Errno::ENOENT => {
-            child_write(b": file not found; check the path or PATH lookup");
-        }
-        Errno::EACCES => {
-            child_write(b": permission denied or file is not executable");
-        }
-        Errno::ENOEXEC => {
-            child_write(b": file is not a recognized executable format");
-        }
-        Errno::ENOTDIR => {
-            child_write(b": a path component is not a directory");
-        }
-        Errno::E2BIG => {
-            child_write(b": argument list or environment is too large");
-        }
-        _ => {}
     }
 }
 
 fn report_exec_failure(program: &CString, errno: Errno) -> ! {
     std::hint::cold_path();
-    child_write(b"tino: execvp failed for '");
-    child_write_escaped(program.as_bytes());
-    child_write(b"'");
-    child_write_exec_failure_hint(errno);
-    child_write(b" (errno ");
-    child_write_errno(errno);
-    child_write(b")\n");
+    let hint = match errno {
+        Errno::ENOENT => ": file not found; check the path or PATH lookup",
+        Errno::EACCES => ": permission denied or file is not executable",
+        Errno::ENOEXEC => ": file is not a recognized executable format",
+        Errno::ENOTDIR => ": a path component is not a directory",
+        Errno::E2BIG => ": argument list or environment is too large",
+        _ => "",
+    };
+    logging::stderr_line(format_args!(
+        "tino: execvp failed for '{}'{} (errno {})",
+        program.as_bytes().escape_ascii(),
+        hint,
+        errno.raw()
+    ));
+    // SAFETY: terminate the forked child without unwinding or running destructors.
     unsafe { _exit(exec_failure_exit_code(errno)) }
 }
 
@@ -458,49 +258,134 @@ const fn exec_failure_exit_code(errno: Errno) -> libc::c_int {
     }
 }
 
-fn foreground_group() -> std::result::Result<Pid, Errno> {
-    let group = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-    if group == -1 {
-        Err(Errno::last())
-    } else {
-        Ok(Pid::from_raw(group))
+pub(super) struct ControllingTerminal {
+    fd: OwnedFd,
+    job_group: Pid,
+    foreground_on_launch: bool,
+}
+
+impl ControllingTerminal {
+    pub(super) fn open() -> Option<Self> {
+        let session = unsafe { libc::getsid(0) };
+        if session == -1 {
+            return None;
+        }
+        let in_session =
+            |fd: &std::os::fd::BorrowedFd<'_>| unsafe { libc::tcgetsid(fd.as_raw_fd()) == session };
+        let fd = [
+            io::stdin().as_fd(),
+            io::stdout().as_fd(),
+            io::stderr().as_fd(),
+        ]
+        .into_iter()
+        .find(in_session)
+        .and_then(|fd| fd.try_clone_to_owned().ok())
+        .or_else(|| {
+            let file = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+                .open("/dev/tty")
+                .ok()?;
+            in_session(&file.as_fd()).then(|| file.into())
+        })?;
+        let job_group = process_group_of(Pid::from_raw(0)).ok()?;
+        let supervisor = current_process_id();
+        // A shell pipeline shares its foreground group. Leave it there unless
+        // the managed command actually needs the terminal (SIGTTIN/SIGTTOU).
+        let foreground_on_launch = supervisor == job_group
+            && (supervisor.as_raw() == session
+                || ![libc::STDIN_FILENO, libc::STDOUT_FILENO]
+                    .into_iter()
+                    .any(is_pipe));
+        Some(Self {
+            fd,
+            job_group,
+            foreground_on_launch,
+        })
+    }
+
+    // The shell may have assigned the terminal to another job since launch.
+    fn transfer(&self, from: Pid, to: Pid) -> std::result::Result<bool, Errno> {
+        let fd = self.fd.as_raw_fd();
+        let foreground = unsafe { libc::tcgetpgrp(fd) };
+        if foreground == -1 {
+            return Err(Errno::last());
+        }
+        if foreground != from.as_raw() || from == to {
+            return Ok(false);
+        }
+        if unsafe { libc::tcsetpgrp(fd, to.as_raw()) } == -1 {
+            return Err(Errno::last());
+        }
+        Ok(true)
     }
 }
 
-// The shell may have assigned the terminal to another job since launch.
-fn transfer_terminal(from: Pid, to: Pid) -> std::result::Result<bool, Errno> {
-    if foreground_group()? != from || from == to {
-        return Ok(false);
+fn is_pipe(fd: libc::c_int) -> bool {
+    let mut stat = std::mem::MaybeUninit::uninit();
+    // SAFETY: fstat initializes stat on success.
+    unsafe {
+        libc::fstat(fd, stat.as_mut_ptr()) == 0
+            && stat.assume_init().st_mode & libc::S_IFMT == libc::S_IFIFO
     }
-    if unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, to.as_raw()) } == -1 {
-        return Err(Errno::last());
-    }
-    Ok(true)
-}
-
-pub(super) fn terminal_job_group() -> Option<Pid> {
-    foreground_group().ok()?;
-    process_group_of(Pid::from_raw(0)).ok()
 }
 
 pub(super) struct TerminalJob {
-    job_group: Pid,
+    tty: ControllingTerminal,
     child_group: Pid,
+    launch_gate: Option<io::PipeWriter>,
 }
 
 impl TerminalJob {
-    pub(super) const fn new(job_group: Pid, child_group: Pid) -> Self {
+    pub(super) fn new(
+        tty: ControllingTerminal,
+        separate_group: Option<Pid>,
+        launch_gate: Option<io::PipeWriter>,
+    ) -> Self {
         Self {
-            job_group,
-            child_group,
+            child_group: separate_group.unwrap_or(tty.job_group),
+            tty,
+            launch_gate,
         }
+    }
+
+    pub(super) fn release_child_when_ready(
+        &mut self,
+        signal_fd: &super::sys::SignalFd,
+    ) -> Result<()> {
+        if self.launch_gate.is_some() {
+            // A terminal event before fork only reached the supervisor. Let the
+            // normal signal loop relay queued terminal signals while the child is
+            // still blocking them, so any copy it already has coalesces.
+            let pending = SigSet::pending().context("query pending terminal signals")?;
+            if !Self::FOREGROUND_SIGNALS
+                .iter()
+                .any(|&sig| signal_fd.accepts(sig) && pending.contains_raw(sig))
+            {
+                drop(self.launch_gate.take());
+            }
+        }
+        Ok(())
+    }
+
+    const FOREGROUND_SIGNALS: [i32; 4] =
+        [libc::SIGINT, libc::SIGQUIT, libc::SIGTSTP, libc::SIGWINCH];
+
+    pub(super) fn signaled_foreground_group(&self, info: &libc::signalfd_siginfo) -> Option<Pid> {
+        // Linux broadcasts keyboard and window-size signals to the foreground group.
+        // A userspace signal sent directly to the supervisor has a different code.
+        (self.launch_gate.is_none()
+            && info.ssi_code == libc::SI_KERNEL
+            && Self::FOREGROUND_SIGNALS.contains(&info.ssi_signo.cast_signed()))
+        .then(|| Pid::from_raw(unsafe { libc::getpgrp() }))
     }
 
     /// Returns true if the supervisor stopped and has since been continued.
     pub(super) fn handle_child_stop(&self, child_pid: Pid, signal: i32) -> bool {
         // A shell can foreground a running background job without sending CONT.
         // Its first terminal I/O then stops the separate child group.
-        if matches!(signal, libc::SIGTTIN | libc::SIGTTOU) && self.give_terminal_to_child() {
+        let terminal_io = matches!(signal, libc::SIGTTIN | libc::SIGTTOU);
+        if terminal_io && self.give_terminal_to_child() {
             signals::send_signal(true, self.child_group, libc::SIGCONT);
             return false;
         }
@@ -514,8 +399,8 @@ impl TerminalJob {
         // session. An orphan group or a caller sharing its parent's group has
         // no established job-control parent to resume a forced SIGSTOP.
         let session = unsafe { libc::getsid(0) };
-        if process_group_of(supervisor).ok() != Some(self.job_group)
-            || parent_group.is_none_or(|group| group == self.job_group)
+        if process_group_of(supervisor).ok() != Some(self.tty.job_group)
+            || parent_group.is_none_or(|group| group == self.tty.job_group)
             || session == -1
             || unsafe { libc::getsid(parent.as_raw()) } != session
         {
@@ -523,18 +408,21 @@ impl TerminalJob {
         }
         // A background read also stops the shell job. Only return the terminal
         // when it was held by a separate child group.
-        if let Err(err) = transfer_terminal(self.child_group, self.job_group) {
-            logging::warn(format_args!(
-                "return foreground terminal before stopping: {err}"
-            ));
-            return false;
-        }
-        // A shell pipeline needs all members stopped before its prompt can
-        // return. Signal our original job group only when we still lead it;
-        // the parent checked above is outside that group. SIGSTOP cannot remain
-        // pending behind the supervisor's signal mask.
-        let stopped = if supervisor == self.job_group {
-            send_process_group_signal(self.job_group, libc::SIGSTOP)
+        let had_terminal = match self.tty.transfer(self.child_group, self.tty.job_group) {
+            Ok(transferred) => transferred,
+            Err(err) => {
+                logging::warn(format_args!(
+                    "return foreground terminal before stopping: {err}"
+                ));
+                return false;
+            }
+        };
+        // While the child held the terminal, Ctrl-Z missed the shell pipeline.
+        // Suspend its peers as well, keeping the session leader's group alive.
+        let suspended_pipeline =
+            had_terminal && signal == libc::SIGTSTP && self.tty.job_group.as_raw() != session;
+        let stopped = if supervisor == self.tty.job_group || suspended_pipeline {
+            send_process_group_signal(self.tty.job_group, libc::SIGSTOP)
         } else {
             send_process_signal(supervisor, libc::SIGSTOP)
         };
@@ -542,21 +430,28 @@ impl TerminalJob {
             logging::warn(format_args!("stop foreground supervisor: {err}"));
             return false;
         }
+        // Upon fg, restore the terminal only to a command that used or
+        // requested it. A resumed pipeline otherwise keeps keyboard signals.
+        if had_terminal || terminal_io {
+            self.give_terminal_to_child();
+        }
         true
     }
 
-    pub(super) fn give_terminal_to_child(&self) -> bool {
+    fn give_terminal_to_child(&self) -> bool {
         // `fg` hands the terminal to the supervisor before sending CONT; `bg`
         // does not. Only the foreground case should hand it on to the child.
-        if self.job_group == self.child_group
+        if self.tty.job_group == self.child_group
             || process_group_of(self.child_group).ok() != Some(self.child_group)
         {
             return false;
         }
-        transfer_terminal(self.job_group, self.child_group).unwrap_or_else(|err| {
-            logging::warn(format_args!("give foreground terminal to child: {err}"));
-            false
-        })
+        self.tty
+            .transfer(self.tty.job_group, self.child_group)
+            .unwrap_or_else(|err| {
+                logging::warn(format_args!("give foreground terminal to child: {err}"));
+                false
+            })
     }
 }
 
@@ -565,22 +460,87 @@ impl Drop for TerminalJob {
         // Restore only a terminal still owned by the group we handed it to.
         // Another job may have taken foreground ownership during supervision.
         // SIGTTOU remains blocked until the supervisor's signal guard is dropped.
-        if self.job_group != self.child_group {
-            let _ = transfer_terminal(self.child_group, self.job_group);
+        if self.tty.job_group != self.child_group {
+            let _ = self.tty.transfer(self.child_group, self.tty.job_group);
         }
     }
 }
 
+// The supervisor checks this flag after reaping. The mapping is shared across
+// fork and discarded in the child on exec, without a handshake or an extra fd.
+pub(super) struct ExecStatus(NonNull<AtomicBool>);
+
+impl ExecStatus {
+    pub(super) fn new() -> io::Result<Self> {
+        let len = size_of::<AtomicBool>();
+        // SAFETY: request a fresh, page-aligned mapping shared only across fork.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if addr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(flag) = NonNull::<AtomicBool>::new(addr.cast()) else {
+            // SAFETY: release the mapping, which cannot hold a Rust reference at zero.
+            unsafe { libc::munmap(addr, len) };
+            return Err(io::Error::other("child launch flag mapped at address zero"));
+        };
+        // SAFETY: initialize the new mapping before sharing it with the child.
+        unsafe { flag.write(AtomicBool::new(false)) };
+        Ok(Self(flag))
+    }
+
+    fn flag(&self) -> &AtomicBool {
+        // SAFETY: the initialized mapping lives for self's lifetime in each process.
+        unsafe { self.0.as_ref() }
+    }
+
+    pub(super) fn can_remap(&self) -> bool {
+        self.flag().load(Ordering::Acquire)
+    }
+}
+
+impl Drop for ExecStatus {
+    fn drop(&mut self) {
+        // SAFETY: unmap exactly the region owned by this process.
+        unsafe { libc::munmap(self.0.as_ptr().cast(), size_of::<AtomicBool>()) };
+    }
+}
+
+pub(super) struct ChildSignals<'a> {
+    pub mask: &'a SigSet,
+    pub ignore_sigchld: bool,
+    pub pdeath: Option<libc::c_int>,
+}
+
 pub(super) fn spawn_child(
-    child_mask: &SigSet,
-    child_pdeath: Option<libc::c_int>,
+    child_signals: ChildSignals<'_>,
     landlock_config: Option<&landlock::LandlockConfig>,
     pgroup_kill: bool,
-    job_group: Option<Pid>,
-    cmd_c: &CString,
-    argv_c: &[CString],
-) -> Result<Pid> {
-    let mut argv_ptrs = argv_c.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+    terminal: Option<&ControllingTerminal>,
+    args: Vec<String>,
+    exec_status: Option<&ExecStatus>,
+) -> Result<(Pid, Option<io::PipeWriter>)> {
+    let argv = args
+        .into_iter()
+        .map(CString::new)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| Error::usage("command argument contains embedded NUL byte"))?;
+    let program = argv
+        .first()
+        .ok_or_else(|| Error::usage("missing CMD (use --help)"))?;
+    let gate = terminal
+        .map(|_| io::pipe())
+        .transpose()
+        .context("open terminal launch pipe")?;
+    let mut argv_ptrs = argv.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
     argv_ptrs.push(std::ptr::null());
     let expected_parent = current_process_id();
 
@@ -591,41 +551,68 @@ pub(super) fn spawn_child(
             // applying restrictions. A forwarded signal in that window must
             // not execute a library caller's inherited handler in the child.
             if let Err(errno) = SignalAction::reset_caught_handlers() {
-                child_write(b"tino: failed to reset child signal handlers (errno ");
-                child_write_errno(errno);
-                child_write(b")\n");
+                logging::stderr_line(format_args!(
+                    "tino: failed to reset child signal handlers (errno {})",
+                    errno.raw()
+                ));
                 unsafe { _exit(1) }
             }
             // Rust ignores SIGPIPE in the supervisor. Do not pass that runtime
             // policy to the managed program; reset it while signals are blocked.
             if SignalAction::set_default(SIGPIPE).is_err() {
-                child_write(b"tino: failed to reset SIGPIPE in child\n");
+                logging::stderr_line(format_args!("tino: failed to reset SIGPIPE in child"));
                 unsafe { _exit(1) }
             }
-            if let Some(sig) = child_pdeath
+            // Linux exec preserves an explicit SIG_IGN. Only the supervisor
+            // needs SIGCHLD at its default disposition to reap the main child.
+            if child_signals.ignore_sigchld
+                && SignalAction::set_ignored_raw(SIGCHLD as libc::c_int).is_err()
+            {
+                logging::stderr_line(format_args!("tino: failed to restore SIGCHLD in child"));
+                unsafe { _exit(1) }
+            }
+            if let Some(sig) = child_signals.pdeath
                 && let Err(errno) = set_child_pdeath_signal(sig)
             {
-                child_write(b"tino: failed to set child parent-death signal (errno ");
-                child_write_errno(errno);
-                child_write(b")\n");
+                logging::stderr_line(format_args!(
+                    "tino: failed to set child parent-death signal (errno {})",
+                    errno.raw()
+                ));
                 unsafe { _exit(1) }
             }
-            if let Some(sig) = child_pdeath
+            if let Some(sig) = child_signals.pdeath
                 && parent_process_id() != expected_parent
             {
-                let _ = self_signal(sig);
+                let _ = send_process_signal(current_process_id(), sig);
             }
             if pgroup_kill {
                 if set_process_group(Pid::from_raw(0), Pid::from_raw(0)).is_ok() {
-                    if let Some(group) = job_group {
-                        let _ = transfer_terminal(group, current_process_id());
+                    if let Some(tty) = terminal
+                        && tty.foreground_on_launch
+                    {
+                        let _ = tty.transfer(tty.job_group, current_process_id());
                     }
                 } else {
-                    child_write(b"tino: failed to establish child process group\n");
+                    logging::stderr_line(format_args!(
+                        "tino: failed to establish child process group"
+                    ));
                 }
             }
-            if child_mask.thread_set_mask().is_err() {
-                child_write(b"tino: failed to restore signal mask in child\n");
+            if let Some((reader, writer)) = gate {
+                drop(writer);
+                let mut byte = 0u8;
+                // EOF releases the child once startup interrupts have been handled.
+                while unsafe { libc::read(reader.as_raw_fd(), (&raw mut byte).cast(), 1) } == -1 {
+                    if Errno::last() != Errno::EINTR {
+                        logging::stderr_line(format_args!(
+                            "tino: failed to synchronize terminal launch"
+                        ));
+                        unsafe { _exit(1) }
+                    }
+                }
+            }
+            if child_signals.mask.thread_set_mask().is_err() {
+                logging::stderr_line(format_args!("tino: failed to restore signal mask in child"));
                 unsafe { _exit(1) }
             }
             if let Some(config) = landlock_config
@@ -636,82 +623,32 @@ pub(super) fn spawn_child(
                     unsafe { _exit(1) }
                 }
             }
-            let Err(err) = exec_program(cmd_c, &argv_ptrs);
-            report_exec_failure(cmd_c, err)
+            // A signal during exec counts as signal termination of the command.
+            // If exec returns, restore startup-error handling before reporting it.
+            let mark_exec = |started| {
+                if let Some(status) = exec_status {
+                    status.flag().store(started, Ordering::Release);
+                }
+            };
+            mark_exec(true);
+            let Err(err) = exec_program(program, &argv_ptrs);
+            mark_exec(false);
+            report_exec_failure(program, err)
         }
-        ForkResult::Parent { child } => Ok(child),
+        ForkResult::Parent { child } => Ok((child, gate.map(|(_, writer)| writer))),
     }
 }
 
 fn report_landlock_failure(warn_only: bool, err: landlock::LandlockError<'_>) {
     std::hint::cold_path();
-    if warn_only {
-        child_write(b"tino: access restriction unavailable; continuing (backend landlock: ");
+    let outcome = if warn_only {
+        "unavailable; continuing"
     } else {
-        child_write(b"tino: access restriction failed (backend landlock: ");
-    }
-    match err {
-        landlock::LandlockError::NotSupported => {
-            child_write(b"not supported (kernel/LSM)");
-        }
-        landlock::LandlockError::AbiTooOld {
-            feature,
-            required_abi,
-            current_abi,
-        } => {
-            child_write(feature.as_bytes());
-            child_write(b" requires ABI ");
-            child_write_u32(required_abi);
-            child_write(b" but kernel reports ABI ");
-            child_write_u32(current_abi);
-        }
-        landlock::LandlockError::QueryAbi(errno) => {
-            child_write(b"query ABI errno ");
-            child_write_errno(errno);
-            child_write_seccomp_hint(errno);
-        }
-        landlock::LandlockError::CreateRuleset(errno) => {
-            child_write(b"create ruleset errno ");
-            child_write_errno(errno);
-            child_write_seccomp_hint(errno);
-        }
-        landlock::LandlockError::AddRule { path, errno } => {
-            child_write(b"add rule ");
-            child_write_escaped(path.to_bytes());
-            child_write(b" errno ");
-            child_write_errno(errno);
-            child_write_seccomp_hint(errno);
-        }
-        landlock::LandlockError::AddNetPortRule {
-            port,
-            action,
-            errno,
-        } => {
-            child_write(b"add ");
-            child_write(action.as_bytes());
-            child_write(b" rule for port ");
-            child_write_u32(u32::from(port));
-            child_write(b" errno ");
-            child_write_errno(errno);
-            child_write_seccomp_hint(errno);
-        }
-        landlock::LandlockError::SetNoNewPrivs(errno) => {
-            child_write(b"PR_SET_NO_NEW_PRIVS errno ");
-            child_write_errno(errno);
-        }
-        landlock::LandlockError::RestrictSelf(errno) => {
-            child_write(b"restrict self errno ");
-            child_write_errno(errno);
-            child_write_seccomp_hint(errno);
-        }
-    }
-    child_write(b")\n");
-}
-
-fn child_write_seccomp_hint(errno: Errno) {
-    if errno == Errno::EPERM || errno == Errno::EACCES {
-        child_write(b"; blocked by seccomp?");
-    }
+        "failed"
+    };
+    logging::stderr_line(format_args!(
+        "tino: access restriction {outcome} (backend landlock: {err})"
+    ));
 }
 
 pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
@@ -720,16 +657,10 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
     }
     match set_process_group(child_pid, child_pid) {
         Ok(()) => true,
-        Err(Errno::EACCES) => match process_group_of(child_pid) {
-            Ok(pgid) if pgid == child_pid => true,
-            Ok(pgid) => {
-                logging::warn(format_args!(
-                    "child PID {} is in PGID {} (disabling --pgroup-kill)",
-                    child_pid, pgid
-                ));
-                false
-            }
-            Err(Errno::ESRCH) => process_group_exists_after_child_exit(child_pid),
+        // After exec or exit the original group may still contain workers,
+        // even if its leader has since joined another group.
+        Err(Errno::EACCES | Errno::ESRCH) => match process_group_exists(child_pid) {
+            Ok(exists) => exists,
             Err(err) => {
                 logging::warn(format_args!(
                     "cannot query child process group (disabling --pgroup-kill): {}",
@@ -738,23 +669,9 @@ pub(super) fn manage_process_group(requested: bool, child_pid: Pid) -> bool {
                 false
             }
         },
-        Err(Errno::ESRCH) => process_group_exists_after_child_exit(child_pid),
         Err(err) => {
             logging::warn(format_args!(
                 "cannot manage process group (disabling --pgroup-kill): {}",
-                err
-            ));
-            false
-        }
-    }
-}
-
-fn process_group_exists_after_child_exit(child_pid: Pid) -> bool {
-    match process_group_exists(child_pid) {
-        Ok(exists) => exists,
-        Err(err) => {
-            logging::warn(format_args!(
-                "cannot query process group after child exit (disabling --pgroup-kill): {}",
                 err
             ));
             false
@@ -855,6 +772,11 @@ mod tests {
         let err = pdeath_signal(&cli).expect_err("invalid pdeath signal must fail");
         let message = format!("{err:#}");
 
+        let expected = Cli::try_parse_from(["tino", "--parent-death-signal", "\u{1b}[31m"])
+            .unwrap_err()
+            .to_string();
+        assert_eq!(message, expected);
+        assert_eq!(crate::run(cli).unwrap_err().to_string(), expected);
         assert!(message.contains(r"\u{1b}"));
         assert!(!message.contains('\u{1b}'));
     }
@@ -877,7 +799,7 @@ mod tests {
             "PR_GET_CHILD_SUBREAPER failed: {}",
             io::Error::last_os_error()
         );
-        if outcome.subreaper_enabled {
+        if outcome.active {
             assert_eq!(current, 1, "subreaper flag expected to be enabled");
         } else {
             assert_eq!(
@@ -896,7 +818,7 @@ mod tests {
         {
             let outcome =
                 configure_parent_prctl(&cli).expect("configure parent prctl with subreaper flag");
-            if !outcome.subreaper_enabled {
+            if !outcome.active {
                 return;
             }
             let mut current = guard.subreaper;
@@ -927,7 +849,7 @@ mod tests {
     }
 
     #[test]
-    fn manage_process_group_detects_group_after_leader_exit() {
+    fn manage_process_group_tracks_workers_after_leader_moves_or_exits() {
         let _lock = super::super::CHILD_TEST_LOCK.lock().unwrap();
         let guard = PrctlStateGuard::capture();
         // SAFETY: the test temporarily enables subreaper mode so the forked
@@ -973,9 +895,15 @@ mod tests {
                 }
                 let bytes = (&raw const grandchild).cast::<libc::c_void>();
                 let written = libc::write(pipe_fds[1], bytes, size_of::<libc::pid_t>());
-                libc::close(pipe_fds[1]);
-                if written == size_of::<libc::pid_t>().cast_signed() {
-                    libc::_exit(0);
+                if written == size_of::<libc::pid_t>().cast_signed()
+                    && libc::setpgid(0, libc::getpgid(libc::getppid())) == 0
+                {
+                    libc::execl(
+                        c"/bin/sleep".as_ptr(),
+                        c"sleep".as_ptr(),
+                        c"30".as_ptr(),
+                        std::ptr::null::<libc::c_char>(),
+                    );
                 }
                 libc::_exit(103);
             }
@@ -987,11 +915,20 @@ mod tests {
         }
 
         let grandchild = read_pid_from_pipe(pipe_fds[0]);
-        // SAFETY: parent owns the read end.
+        // The close-on-exec pipe reaches EOF after the leader has changed groups
+        // and execed. Its worker still belongs to the original group.
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { libc::read(pipe_fds[0], (&raw mut byte).cast(), 1) },
+            0
+        );
+        let moved = manage_process_group(true, Pid::from_raw(leader));
+        // SAFETY: the parent owns the read end and the leader is its unreaped child.
         unsafe {
             libc::close(pipe_fds[0]);
+            libc::kill(leader, libc::SIGKILL);
         }
-        wait_for_pid(leader);
+        let leader_status = wait_for_pid(leader);
 
         let detected = manage_process_group(true, Pid::from_raw(leader));
 
@@ -1000,6 +937,12 @@ mod tests {
         wait_for_pid(grandchild);
         drop(guard);
 
+        assert!(libc::WIFSIGNALED(leader_status));
+        assert_eq!(libc::WTERMSIG(leader_status), libc::SIGKILL);
+        assert!(
+            moved,
+            "workers should remain managed after the leader changes groups"
+        );
         assert!(
             detected,
             "process group should remain manageable after the leader exits"
@@ -1035,13 +978,13 @@ mod tests {
         pid
     }
 
-    fn wait_for_pid(pid: libc::pid_t) {
+    fn wait_for_pid(pid: libc::pid_t) -> libc::c_int {
         loop {
             let mut status = 0;
             // SAFETY: pid is a child or subreaper-adopted descendant created by this test.
             let rc = unsafe { libc::waitpid(pid, &raw mut status, 0) };
             if rc == pid {
-                return;
+                return status;
             }
             if rc == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
                 continue;
@@ -1133,7 +1076,7 @@ mod tests {
     #[test]
     fn resolve_command_rejects_empty_program_after_expansion() {
         let missing = format!("__TINO_TEST_MISSING_PROGRAM_{}__", std::process::id());
-        let err = resolve_command_args(&[format!("${{{missing}}}")], true)
+        let err = resolve_command_args(vec![format!("${{{missing}}}")], true)
             .expect_err("expanded empty command must fail");
 
         assert!(
@@ -1149,13 +1092,13 @@ mod tests {
                 vec!["/bin/tr\0ue".into()],
                 vec!["/bin/true".into(), "embedded\0argument".into()],
             ] {
-                let err = resolve_command_args(&args, expand_env)
+                let err = resolve_command_args(args, expand_env)
                     .expect_err("NUL bytes must fail during shared command validation");
                 assert_eq!(err.exit_code(), 2);
                 assert!(err.to_string().contains("embedded NUL byte"));
             }
             assert!(
-                resolve_command_args(&[], expand_env)
+                resolve_command_args(vec![], expand_env)
                     .expect("explain may omit a command")
                     .is_empty()
             );

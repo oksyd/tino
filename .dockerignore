@@ -4,9 +4,5 @@
 !Cargo.toml
 !Dockerfile
 !LICENSE
-!benches/
-!benches/**
 !src/
 !src/**
-!tests/
-!tests/**

@@ -1,3 +1,4 @@
+use super::LandlockExplain;
 use crate::{
     Context, Error, Result, bail,
     cli::{Cli, WritePreset},
@@ -10,11 +11,11 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CString, OsString},
     fs::File,
-    io,
-    os::fd::AsFd,
+    io::{self, Read},
     os::unix::ffi::{OsStrExt, OsStringExt},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -26,24 +27,23 @@ mod signals;
 pub(crate) mod sys;
 
 use child::{
-    TerminalJob, configure_parent_prctl, manage_process_group, pdeath_signal,
-    prepare_resolved_command, resolve_command_args, spawn_child, terminal_job_group,
+    ChildSignals, ControllingTerminal, ExecStatus, TerminalJob, configure_parent_prctl,
+    manage_process_group, pdeath_signal, resolve_command_args, spawn_child,
 };
 use landlock::{LandlockConfig, PathRuleKind, PinnedPath};
 use signals::{
-    ChildReapingRestore, read_forwardable_signal, restore_signal_delivery, send_signal,
+    SignalDispositionRestore, read_forwardable_signal, restore_signal_delivery, send_signal,
     setup_signal_delivery,
 };
+pub(crate) use signals::{parse_stop_signal, signal_name};
 #[cfg(test)]
 use sys::Signal;
 use sys::{
-    Errno, Pid, PollFd, PollFlags, PollTimeout, SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM,
-    SIGTTIN, SIGTTOU, SigSet, SignalFd, WaitStatus, poll_fds, process_group_exists,
-    process_group_of, send_process_group_signal, send_process_signal, waitpid_any_nohang,
-    waitpid_child, waitpid_group_nohang,
+    Errno, Pid, PollTimeout, SIGCHLD, SIGINT, SIGKILL, SIGQUIT, SIGTERM, SIGTTIN, SIGTTOU, SigSet,
+    SignalFd, WaitStatus, process_group_exists, process_group_of, send_process_group_signal,
+    send_process_signal, waitpid_any_nohang, waitpid_child, waitpid_group_nohang,
 };
 
-type ExitCodeRemap = super::ExitCodeRemap;
 type PinnedPaths = BTreeMap<Vec<u8>, PinnedPath>;
 
 // Tests that fork or call waitpid(-1) share the libtest process under cargo test.
@@ -66,36 +66,21 @@ enum ExecSearchPathOverride {
     Default,
 }
 
-pub(super) struct LandlockExplain {
-    pub write_requested: bool,
-    pub exec_requested: bool,
-    pub warn_only: bool,
-    pub no_dev: bool,
-    pub preset_names: Vec<String>,
-    pub writable_dirs: Vec<String>,
-    pub bind_tcp_ports: Vec<u16>,
-    pub connect_tcp_ports: Vec<u16>,
-    pub scope_signals: bool,
-    pub scope_abstract_unix: bool,
-    pub exec_allow_paths: Vec<String>,
-    pub device_ioctl_allow_paths: Vec<String>,
-}
-
-pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
+pub(super) fn run_impl(mut cli: Cli) -> Result<i32> {
+    let child_pdeath = pdeath_signal(&cli)?;
     let (previous_mask, mut signal_fd) = setup_signal_delivery()?;
     let signal_mask_restore = SignalMaskRestore::new(&previous_mask);
     // Reset inherited SIG_IGN/SA_NOCLDWAIT before fork, and restore the caller's
     // disposition before unblocking signals when supervision ends.
-    let child_reaping_restore = ChildReapingRestore::enable()?;
-    let child_pdeath = pdeath_signal(&cli)?;
-    let effective_cmd =
-        resolve_command_args(&cli.cmd, cli.expand_env).context("prepare child command")?;
+    let child_reaping_restore = SignalDispositionRestore::enable_child_reaping()?;
+    let effective_cmd = resolve_command_args(std::mem::take(&mut cli.cmd), cli.expand_env)
+        .context("prepare child command")?;
     let landlock_config = build_landlock_config_for_args(&cli, &effective_cmd)?;
     if let Some(config) = &landlock_config {
         logging::debug(format_args!(
-            "landlock restriction enabled: warn_only={}, no_dev={}, writable_dirs={}, bind_tcp_ports={}, connect_tcp_ports={}, scope_signals={}, scope_abstract_unix={}, exec_allow_paths={}, device_ioctl_allow_paths={}",
+            "landlock restriction enabled: warn_only={}, auto_allow_dev={}, writable_dirs={}, bind_tcp_ports={}, connect_tcp_ports={}, scope_signals={}, scope_abstract_unix={}, exec_allow_paths={}, device_ioctl_allow_paths={}",
             config.warn_only,
-            config.no_dev,
+            config.dev_dir.is_some(),
             config.writable_dirs.len(),
             config.bind_tcp_ports.len(),
             config.connect_tcp_ports.len(),
@@ -132,42 +117,57 @@ pub(super) fn run_impl(cli: Cli, expect_zero: ExitCodeRemap) -> Result<i32> {
         }
     }
 
-    let (cmd_c, argv_c) =
-        prepare_resolved_command(&effective_cmd).context("prepare child command")?;
+    let exec_status = (!cli.remap_exit.is_empty())
+        .then(ExecStatus::new)
+        .transpose()
+        .context("track service exit status")?;
     let parent_prctl = configure_parent_prctl(&cli)?;
-    let job_group = terminal_job_group();
-    let child_pid = spawn_child(
-        &previous_mask,
-        child_pdeath,
+    let terminal = ControllingTerminal::open();
+    let (child_pid, launch_gate) = spawn_child(
+        ChildSignals {
+            mask: &previous_mask,
+            ignore_sigchld: child_reaping_restore.was_ignored(),
+            pdeath: child_pdeath,
+        },
         landlock_config.as_ref(),
         cli.pgroup_kill,
-        job_group,
-        &cmd_c,
-        &argv_c,
+        terminal.as_ref(),
+        effective_cmd,
+        exec_status.as_ref(),
     )
     .context("spawn child")?;
     // The child has its own copies, all closed by exec. The supervisor need
     // not retain policy descriptors for the entire workload lifetime.
     drop(landlock_config);
     let use_pgroup = manage_process_group(cli.pgroup_kill, child_pid);
-    let terminal_job =
-        job_group.map(|group| TerminalJob::new(group, if use_pgroup { child_pid } else { group }));
+    let mut terminal_job =
+        terminal.map(|tty| TerminalJob::new(tty, use_pgroup.then_some(child_pid), launch_gate));
 
     let mut result = supervise_child(
         &cli,
-        &expect_zero,
         child_pid,
         use_pgroup,
         &mut signal_fd,
-        terminal_job.as_ref(),
-    );
+        terminal_job.as_mut(),
+    )
+    .map(|status| {
+        let code = if exec_status.as_ref().is_some_and(ExecStatus::can_remap) {
+            compute_exit_code(status, &cli.remap_exit)
+        } else {
+            status
+        };
+        logging::info(format_args!("exiting with {code}"));
+        code
+    });
     // Restore process and terminal state while supervision's signals remain
     // blocked. Attempt every restoration even after a failure, preserving the
     // supervision error when one already exists.
     drop(terminal_job);
     let restores = [
         parent_prctl.finish(),
-        child_reaping_restore.finish(),
+        child_reaping_restore
+            .finish()
+            .context("restore SIGCHLD disposition"),
         signal_mask_restore.finish(),
     ];
     for restore in restores {
@@ -213,37 +213,29 @@ impl Drop for SignalMaskRestore<'_> {
     }
 }
 
-pub(super) fn explain_effective_command(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
-    resolve_command_args(cmd, expand_env)
+pub(super) fn validate_landlock_config(cli: &Cli) -> Result<()> {
+    build_landlock_config_for_args(cli, &[]).map(drop)
 }
 
 pub(crate) fn bench_resolve_command_args(cmd: &[String], expand_env: bool) -> Result<Vec<String>> {
-    resolve_command_args(cmd, expand_env)
+    resolve_command_args(cmd.to_vec(), expand_env)
 }
 
 pub(crate) fn bench_parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
-    parse_shebang_interpreter(bytes)
+    parse_shebang(bytes).map(|(path, _)| path.to_string_lossy().into_owned())
 }
 
-pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
-    parse_elf_interpreter(bytes)
-}
-
-pub(super) fn explain_landlock_config(
-    cli: &Cli,
-    effective_cmd: &[String],
-) -> Result<Option<LandlockExplain>> {
-    let config = build_landlock_config_for_args(cli, effective_cmd)?;
-    Ok(config.map(|config| LandlockExplain {
+pub(super) fn explain_config(cli: &Cli) -> Result<(Vec<String>, LandlockExplain)> {
+    let command = resolve_command_args(cli.cmd.clone(), cli.expand_env)?;
+    let Some(config) = build_landlock_config_for_args(cli, &command)? else {
+        return Ok((command, LandlockExplain::default()));
+    };
+    let policy = LandlockExplain {
         write_requested: config.write_requested,
         exec_requested: config.exec_requested,
         warn_only: config.warn_only,
-        no_dev: config.no_dev,
-        preset_names: config
-            .preset_names
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
+        auto_allow_dev: config.dev_dir.is_some(),
+        preset_names: config.preset_names,
         writable_dirs: config
             .writable_dirs
             .iter()
@@ -263,7 +255,8 @@ pub(super) fn explain_landlock_config(
             .iter()
             .map(|path| explain_landlock_path(path.as_c_str()))
             .collect(),
-    }))
+    };
+    Ok((command, policy))
 }
 
 fn explain_landlock_path(path: &std::ffi::CStr) -> String {
@@ -272,7 +265,7 @@ fn explain_landlock_path(path: &std::ffi::CStr) -> String {
 
 #[cfg(test)]
 fn build_landlock_config(cli: &Cli) -> Result<Option<LandlockConfig>> {
-    let effective_cmd = resolve_command_args(&cli.cmd, cli.expand_env)?;
+    let effective_cmd = resolve_command_args(cli.cmd.clone(), cli.expand_env)?;
     build_landlock_config_for_args(cli, &effective_cmd)
 }
 
@@ -295,8 +288,9 @@ fn build_landlock_config_for_args(
         return Ok(None);
     }
 
-    let mut unique = PinnedPaths::new();
+    let mut writable_dirs = PinnedPaths::new();
     let mut preset_names = Vec::new();
+    let mut write_dirs = BTreeMap::new();
     let mut exec_allow = PinnedPaths::new();
     let mut device_ioctl_allow = PinnedPaths::new();
 
@@ -304,41 +298,56 @@ fn build_landlock_config_for_args(
         let name = preset.as_str();
         if !preset_names.contains(&name) {
             preset_names.push(name);
-        }
-        for raw in preset_paths(*preset) {
-            insert_landlock_writable_dir(&mut unique, raw, true)?;
+            for &dir in preset_paths(*preset) {
+                write_dirs.insert(dir, true);
+            }
         }
     }
-
     for raw in &cli.write_allow {
-        let path = landlock_absolute_path_option("--write-allow", raw)?;
-        insert_landlock_writable_dir(&mut unique, path, false)?;
+        let path = landlock_absolute_path_option("--write-allow DIR", raw)?;
+        write_dirs.insert(path, false);
+    }
+    let dev = Path::new("/dev");
+    let mut auto_allow_dev = write_requested && !cli.write_no_dev;
+    for (raw, allow_missing) in write_dirs {
+        let path = Path::new(raw);
+        let kind = if allow_missing {
+            "--write-preset directory"
+        } else {
+            "--write-allow directory"
+        };
+        if let Some(dir) = pin_writable_dir(path, allow_missing, kind)? {
+            // A writable rule for /dev, including a symlink to it, already grants WRITE_FILE.
+            if path == dev || dir.path() == dev {
+                auto_allow_dev = false;
+            }
+            writable_dirs.insert(dir.as_c_str().to_bytes().to_vec(), dir);
+        }
     }
 
-    if exec_requested && let Some(program) = effective_cmd.first() {
-        insert_landlock_main_exec_path(&mut exec_allow, program)?;
+    if exec_requested {
+        let mut context = ExecContext::inherited();
+        if let Some(program) = effective_cmd.first() {
+            context.insert_exec_path(&mut exec_allow, ExecAllowMode::Auto, program)?;
+        }
+        // Explicit entries may be launched later by a different libc.
+        context.shell_fallback = true;
+        for raw in distinct_path_options(&cli.exec_allow) {
+            let path = landlock_exec_path_option("--exec-allow PATH", raw)?;
+            context.insert_exec_path(&mut exec_allow, ExecAllowMode::Strict, path)?;
+        }
     }
 
-    for raw in &cli.exec_allow {
-        let path = landlock_exec_path_option("--exec-allow", raw)?;
-        insert_landlock_exec_path(&mut exec_allow, path)?;
-    }
-
-    for raw in &cli.device_ioctl_allow {
-        let path = landlock_absolute_path_option("--device-ioctl-allow", raw)?;
+    for raw in distinct_path_options(&cli.device_ioctl_allow) {
+        let path = landlock_absolute_path_option("--device-ioctl-allow PATH", raw)?;
         insert_landlock_device_ioctl_path(&mut device_ioctl_allow, path)?;
     }
 
-    let writable_dirs = unique.into_values().collect();
+    let writable_dirs = writable_dirs.into_values().collect();
     let exec_allow_paths = exec_allow.into_values().collect();
     let device_ioctl_allow_paths = device_ioctl_allow.into_values().collect();
-    let dev_dir = if write_requested && !cli.write_no_dev {
-        pin_allow_path(
-            "/dev",
-            true,
-            "default writable directory",
-            PathRuleKind::Directory,
-        )?
+    let dev_dir = if auto_allow_dev {
+        pin_writable_dir(dev, true, "default writable directory")?
     } else {
         None
     };
@@ -349,7 +358,6 @@ fn build_landlock_config_for_args(
     Ok(Some(LandlockConfig {
         write_requested,
         warn_only: cli.restrict_warn_only,
-        no_dev: cli.write_no_dev,
         preset_names,
         writable_dirs,
         dev_dir,
@@ -361,6 +369,14 @@ fn build_landlock_config_for_args(
         exec_allow_paths,
         device_ioctl_allow_paths,
     }))
+}
+
+fn distinct_path_options(paths: &[String]) -> impl Iterator<Item = &str> {
+    let mut seen = BTreeSet::new();
+    paths
+        .iter()
+        .map(String::as_str)
+        .filter(move |path| seen.insert(*path))
 }
 
 fn unique_ports(option: &str, raw_ports: &[u16]) -> Result<Vec<u16>> {
@@ -382,11 +398,12 @@ fn unique_ports(option: &str, raw_ports: &[u16]) -> Result<Vec<u16>> {
 
 fn landlock_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
     if raw.is_empty() {
-        return Err(Error::usage(format!("{option} PATH cannot be empty")));
+        return Err(Error::usage(format!("{option} cannot be empty")));
     }
     if raw != raw.trim() {
         return Err(Error::usage(format!(
-            "{option} PATH cannot have surrounding whitespace"
+            "{option} cannot have surrounding whitespace: '{}'",
+            escape_str(raw)
         )));
     }
     Ok(raw)
@@ -395,7 +412,10 @@ fn landlock_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
 fn landlock_absolute_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> {
     let path = landlock_path_option(option, raw)?;
     if !Path::new(path).is_absolute() {
-        return Err(Error::usage(format!("{option} PATH must be absolute")));
+        return Err(Error::usage(format!(
+            "{option} must be absolute: '{}'",
+            escape_str(path)
+        )));
     }
     Ok(path)
 }
@@ -404,7 +424,8 @@ fn landlock_exec_path_option<'a>(option: &str, raw: &'a str) -> Result<&'a str> 
     let path = landlock_path_option(option, raw)?;
     if path.contains('/') && !Path::new(path).is_absolute() {
         return Err(Error::usage(format!(
-            "{option} PATH must be absolute when it contains '/'"
+            "{option} must be absolute when it contains '/': '{}'",
+            escape_str(path)
         )));
     }
     Ok(path)
@@ -417,28 +438,11 @@ const fn preset_paths(preset: WritePreset) -> &'static [&'static str] {
     }
 }
 
-fn insert_landlock_writable_dir(
-    unique: &mut PinnedPaths,
-    raw: &str,
-    allow_missing: bool,
-) -> Result<()> {
-    let Some(path) = pin_allow_path(
-        raw,
-        allow_missing,
-        "write allow path",
-        PathRuleKind::Directory,
-    )?
-    else {
-        return Ok(());
-    };
-    unique.insert(path.as_c_str().to_bytes().to_vec(), path);
-    Ok(())
-}
-
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ExecContext {
-    environment: BTreeMap<OsString, OsString>,
+    environment: Rc<BTreeMap<OsString, OsString>>,
     cwd: Option<PathBuf>,
+    shell_fallback: bool,
 }
 
 impl ExecContext {
@@ -456,16 +460,17 @@ impl ExecContext {
             }
         }
         Self {
-            environment,
+            environment: Rc::new(environment),
             cwd: None,
+            shell_fallback: !cfg!(target_env = "musl"),
         }
     }
 
-    fn search_path(&self) -> OsString {
+    fn search_path(&self, default: impl FnOnce() -> OsString) -> OsString {
         self.environment
             .get(std::ffi::OsStr::new("PATH"))
             .cloned()
-            .unwrap_or_else(default_exec_search_path)
+            .unwrap_or_else(default)
     }
 
     fn path(&self, path: &Path) -> PathBuf {
@@ -476,75 +481,51 @@ impl ExecContext {
         }
         path.to_path_buf()
     }
-}
 
-type ExecVisits = BTreeSet<(PathBuf, ExecContext)>;
-
-fn insert_landlock_exec_path(unique: &mut PinnedPaths, raw: &str) -> Result<()> {
-    let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(
-        unique,
-        raw,
-        &mut visited,
-        ExecAllowMode::Strict,
-        &ExecContext::inherited(),
-    )
-}
-
-fn insert_landlock_main_exec_path(unique: &mut PinnedPaths, raw: &str) -> Result<()> {
-    let mut visited = BTreeSet::new();
-    insert_landlock_exec_path_inner(
-        unique,
-        raw,
-        &mut visited,
-        ExecAllowMode::Auto,
-        &ExecContext::inherited(),
-    )
-}
-
-fn insert_landlock_exec_path_inner(
-    unique: &mut PinnedPaths,
-    raw: &str,
-    visited: &mut ExecVisits,
-    mode: ExecAllowMode,
-    context: &ExecContext,
-) -> Result<()> {
-    if !raw.contains('/') {
-        let candidates =
-            executable_paths_in_search_path(raw, &context.search_path(), context.cwd.as_deref());
-        if candidates.is_empty() && mode == ExecAllowMode::Strict {
-            bail!("resolve exec allow path '{}' from PATH", escape_str(raw));
+    fn insert_exec_path(
+        &self,
+        unique: &mut PinnedPaths,
+        mode: ExecAllowMode,
+        raw: &str,
+    ) -> Result<()> {
+        let mut visited = ExecVisits::new();
+        if !raw.contains('/') {
+            let candidates = executable_paths_in_search_path(
+                raw,
+                &self.search_path(default_exec_search_path),
+                self.cwd.as_deref(),
+            );
+            return insert_exec_search_candidates(unique, candidates, &mut visited, mode, self)
+                .with_context(|| {
+                    format!("resolve exec allow path '{}' from PATH", escape_str(raw))
+                });
         }
-        return insert_exec_search_candidates(unique, candidates, visited, context);
+        let Some(resolved) = resolve_exec_allow_path(Path::new(raw), mode)? else {
+            return Ok(());
+        };
+        insert_resolved_exec_path(unique, resolved, &mut visited, mode, self).map(|_| ())
     }
-    let resolved = match mode {
-        ExecAllowMode::Strict => Some(resolve_exec_allow_path(raw)?),
-        ExecAllowMode::Auto => resolve_main_exec_allow_path(raw)?,
-    };
-    let Some(resolved) = resolved else {
-        return Ok(());
-    };
-    insert_resolved_exec_path(unique, resolved, visited, mode, context)
 }
+
+type ExecVisits = BTreeMap<(PathBuf, ExecContext), Option<EnvLibc>>;
 
 fn insert_exec_search_candidates(
     unique: &mut PinnedPaths,
     candidates: Vec<PathBuf>,
     visited: &mut ExecVisits,
+    mode: ExecAllowMode,
     context: &ExecContext,
 ) -> Result<()> {
     // execvp can fall back to another candidate. An unreadable or otherwise
     // uninspectable candidate must not prevent a different match from running.
     // Keep only discovered file grants; never grant a containing directory.
+    let mut found = false;
+    let mut last_error = None;
     for path in candidates {
         let result = (|| {
-            let Some(resolved) =
-                resolve_exec_allow_path_from_path(path.clone(), ExecAllowMode::Auto)?
-            else {
-                return Ok(());
-            };
-            if is_executable_file(&resolved.metadata) {
+            if let Some(resolved) = resolve_exec_allow_path(&path, ExecAllowMode::Auto)? {
                 insert_resolved_exec_path(unique, resolved, visited, ExecAllowMode::Auto, context)?;
+                found = true;
             }
             Ok::<(), Error>(())
         })();
@@ -553,9 +534,35 @@ fn insert_exec_search_candidates(
                 "skip interpreter discovery for PATH candidate '{}': {err}",
                 escape_path(&path)
             ));
+            if mode == ExecAllowMode::Strict && !found {
+                found = exec_candidate_already_pinned(unique, &path);
+                last_error = Some(err);
+            }
         }
     }
+    if mode == ExecAllowMode::Strict && !found {
+        return Err(
+            last_error.unwrap_or_else(|| Error::msg("no executable PATH candidate remains"))
+        );
+    }
     Ok(())
+}
+
+fn exec_candidate_already_pinned(unique: &PinnedPaths, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(target) = std::fs::metadata(path) else {
+        return false;
+    };
+    let pinned = unique.values().any(|pinned| {
+        pinned
+            .metadata()
+            .is_ok_and(|known| known.dev() == target.dev() && known.ino() == target.ino())
+    });
+    // A bind mount can expose a previously pinned inode with different mount flags.
+    pinned
+        && CString::new(path.as_os_str().as_bytes())
+            .is_ok_and(|raw| sys::may_execute_at(libc::AT_FDCWD, &raw) == Ok(true))
 }
 
 fn insert_resolved_exec_path(
@@ -564,20 +571,26 @@ fn insert_resolved_exec_path(
     visited: &mut ExecVisits,
     mode: ExecAllowMode,
     context: &ExecContext,
-) -> Result<()> {
-    if !visited.insert((resolved.canonical.clone(), context.clone())) {
-        return Ok(());
+) -> Result<Option<EnvLibc>> {
+    let visit = (resolved.canonical.clone(), context.clone());
+    if let Some(libc) = visited.get(&visit) {
+        return Ok(*libc);
     }
     // env can re-exec a script with a different environment or directory. Bound
     // that graph as well as detecting cycles with identical execution contexts.
-    if visited.len() > 256 {
+    if visited.len() >= 256 {
         bail!("exec interpreter discovery exceeds 256 file/context pairs");
     }
-    let interpreters = if is_executable_file(&resolved.metadata) {
-        detect_exec_interpreters_in_context(&resolved.pinned, context)
+    let interpreter = if is_executable_file(&resolved.metadata) {
+        detect_pinned_exec_interpreter(&resolved.pinned)
     } else {
-        Ok(Vec::new())
+        Ok(None)
     };
+    let libc = match &interpreter {
+        Ok(Some(ExecInterpreter::ElfLoader(loader))) => env_libc(loader),
+        _ => None,
+    };
+    visited.insert(visit, libc);
     // Pin the executable even when optional interpreter discovery fails. This
     // applies equally to absolute main commands and PATH candidates; explicitly
     // listed files still require successful inspection.
@@ -586,7 +599,7 @@ fn insert_resolved_exec_path(
         resolved.pinned,
     );
     let discovery = (|| {
-        for interpreter in interpreters? {
+        if let Some(interpreter) = interpreter? {
             insert_exec_interpreter(unique, interpreter, visited, mode, context)?;
         }
         Ok(())
@@ -598,9 +611,9 @@ fn insert_resolved_exec_path(
             "skip interpreter discovery for executable '{}': {err}",
             escape_path(&resolved.canonical)
         ));
-        return Ok(());
+        return Ok(libc);
     }
-    discovery
+    discovery.map(|()| libc)
 }
 
 fn insert_exec_interpreter(
@@ -610,63 +623,35 @@ fn insert_exec_interpreter(
     mode: ExecAllowMode,
     context: &ExecContext,
 ) -> Result<()> {
-    match interpreter {
-        ExecInterpreter::Candidate(path) => {
-            insert_landlock_exec_path_candidate(unique, path, None, visited, mode, context)
-        }
-        ExecInterpreter::ShebangCandidate { path, argument } => {
-            insert_landlock_exec_path_candidate(
-                unique,
-                path,
-                Some(argument),
-                visited,
-                mode,
-                context,
-            )
-        }
+    let (path, argument) = match interpreter {
+        ExecInterpreter::ShellFallback if !context.shell_fallback => return Ok(()),
+        ExecInterpreter::ShellFallback => (EXECVP_FALLBACK_SHELL.into(), None),
+        ExecInterpreter::Candidate(path) | ExecInterpreter::ElfLoader(path) => (path, None),
+        ExecInterpreter::ShebangCandidate { path, argument } => (path, Some(argument)),
         ExecInterpreter::SearchCandidates(paths) => {
-            insert_exec_search_candidates(unique, paths, visited, context)
+            return insert_exec_search_candidates(unique, paths, visited, mode, context);
         }
-        ExecInterpreter::EnvCommand(command) => {
-            insert_exec_interpreter(unique, command.resolve(), visited, mode, &command.context)
-        }
-        ExecInterpreter::Missing { .. } | ExecInterpreter::Unresolved { .. }
-            if mode == ExecAllowMode::Auto =>
-        {
-            Ok(())
-        }
+        ExecInterpreter::Missing { .. } if mode == ExecAllowMode::Auto => return Ok(()),
         ExecInterpreter::Missing { command } => bail!(
             "resolve exec allow path '{}' from shebang PATH",
             escape_str(&command)
         ),
-        ExecInterpreter::Unresolved { reason } => bail!("{reason}"),
-    }
+    };
+    insert_landlock_exec_path_candidate(unique, path, argument, visited, mode, context)
 }
 
 fn insert_landlock_exec_path_candidate(
     unique: &mut PinnedPaths,
     path: PathBuf,
-    shebang_argument: Option<OwnedShebangArgument>,
+    shebang_argument: Option<OsString>,
     visited: &mut ExecVisits,
     mode: ExecAllowMode,
     context: &ExecContext,
 ) -> Result<()> {
-    if !path.as_os_str().as_bytes().contains(&b'/') {
-        let Some(command) = path.to_str() else {
-            if mode == ExecAllowMode::Auto {
-                return Ok(());
-            }
-            bail!("resolve exec allow path from non-Unicode PATH command");
-        };
-        return insert_landlock_exec_path_inner(unique, command, visited, mode, context);
-    }
-    let Some(resolved) = resolve_exec_allow_path_from_path(context.path(&path), mode)? else {
+    let Some(resolved) = resolve_exec_allow_path(&context.path(&path), mode)? else {
         return Ok(());
     };
     if !is_executable_file(&resolved.metadata) {
-        if mode == ExecAllowMode::Auto {
-            return Ok(());
-        }
         bail!(
             "exec interpreter path '{}' is not an executable file",
             escape_path(&resolved.canonical)
@@ -674,26 +659,29 @@ fn insert_landlock_exec_path_candidate(
     }
     // Identify aliases from the same pinned object used for the rule, rather
     // than assuming an executable named "env" implements GNU env semantics.
-    let env_argument = shebang_argument.filter(|_| is_env_executable(&resolved.metadata));
-    insert_resolved_exec_path(unique, resolved, visited, mode, context)?;
-    if let Some(argument) = env_argument {
-        let argument = match argument {
-            OwnedShebangArgument::Utf8(argument) => argument,
-            OwnedShebangArgument::InvalidUtf8 => {
-                bail!("env shebang argument is not valid UTF-8");
-            }
-        };
-        if let Some(command) = env_shebang_command(&argument, context).map_err(Error::msg)? {
-            insert_exec_interpreter(
-                unique,
-                ExecInterpreter::EnvCommand(command),
-                visited,
-                mode,
-                context,
-            )?;
-        }
+    let env_argument = shebang_argument.filter(|_| {
+        is_env_interpreter(path.as_os_str().as_bytes())
+            || is_env_executable(&path, &resolved.metadata)
+    });
+    let libc = insert_resolved_exec_path(unique, resolved, visited, mode, context)?;
+    if let Some(argument) = env_argument
+        && let Some(command) = parse_env_argument(&argument, context, libc).map_err(Error::msg)?
+    {
+        let interpreter = command.resolve(|| env_default_search_path(libc));
+        insert_exec_interpreter(unique, interpreter, visited, mode, &command.context)?;
     }
     Ok(())
+}
+
+fn parse_env_argument(
+    argument: &std::ffi::OsStr,
+    context: &ExecContext,
+    libc: Option<EnvLibc>,
+) -> std::result::Result<Option<EnvShebangCommand>, &'static str> {
+    let argument = argument
+        .to_str()
+        .ok_or("env shebang argument is not valid UTF-8")?;
+    env_shebang_command(argument, context, libc)
 }
 
 fn is_executable_file(metadata: &std::fs::Metadata) -> bool {
@@ -728,18 +716,11 @@ fn insert_landlock_device_ioctl_path(unique: &mut PinnedPaths, raw: &str) -> Res
     Ok(())
 }
 
-fn pin_allow_path(
-    raw: &str,
-    allow_missing: bool,
-    kind: &str,
-    rule_kind: PathRuleKind,
-) -> Result<Option<PinnedPath>> {
-    match PinnedPath::open(Path::new(raw), rule_kind) {
+fn pin_writable_dir(raw: &Path, allow_missing: bool, kind: &str) -> Result<Option<PinnedPath>> {
+    match PinnedPath::open(raw, PathRuleKind::Directory) {
         Ok(path) => Ok(Some(path)),
         Err(err) if allow_missing && err.kind() == io::ErrorKind::NotFound => Ok(None),
-        Err(err) => {
-            Err(err).with_context(|| format!("open {kind} '{}'", escape_path(Path::new(raw))))
-        }
+        Err(err) => Err(err).with_context(|| format!("open {kind} '{}'", escape_path(raw))),
     }
 }
 
@@ -755,84 +736,43 @@ enum ExecAllowMode {
     Auto,
 }
 
-fn resolve_exec_allow_path(raw: &str) -> Result<ResolvedExecAllowPath> {
-    let resolved = resolve_exec_allow_path_candidate(raw)?;
-    resolved_exec_allow_path_from_candidate(&resolved)
-}
-
-fn resolve_main_exec_allow_path(raw: &str) -> Result<Option<ResolvedExecAllowPath>> {
-    let Some(candidate) = resolve_main_exec_allow_path_candidate(raw)? else {
-        return Ok(None);
+fn resolve_exec_allow_path(
+    path: &Path,
+    mode: ExecAllowMode,
+) -> Result<Option<ResolvedExecAllowPath>> {
+    let pinned = match PinnedPath::open(path, PathRuleKind::Any) {
+        Ok(pinned) => pinned,
+        Err(err) if mode == ExecAllowMode::Auto && auto_exec_candidate_is_unavailable(&err) => {
+            return Ok(None);
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("open exec allow path '{}'", escape_path(path)));
+        }
     };
-    let resolved = resolved_exec_allow_path_from_candidate(&candidate)?;
-    if is_executable_file(&resolved.metadata) {
-        Ok(Some(resolved))
-    } else {
-        Ok(None)
-    }
-}
-
-fn resolved_exec_allow_path_from_candidate(resolved: &Path) -> Result<ResolvedExecAllowPath> {
-    let pinned = PinnedPath::open(resolved, PathRuleKind::Any)
-        .with_context(|| format!("open exec allow path '{}'", escape_path(resolved)))?;
     let canonical = pinned.path().to_path_buf();
     let metadata = pinned
         .metadata()
         .with_context(|| format!("inspect exec allow path '{}'", escape_path(&canonical)))?;
+    if mode == ExecAllowMode::Auto
+        && (!is_executable_file(&metadata)
+            || !pinned
+                .may_execute()
+                .with_context(|| format!("check exec access to '{}'", escape_path(&canonical)))?)
+    {
+        return Ok(None);
+    }
     if !metadata.is_dir() && !metadata.is_file() {
         bail!(
             "exec allow path '{}' is neither a regular file nor a directory",
             escape_path(&canonical)
         );
     }
-    Ok(ResolvedExecAllowPath {
+    Ok(Some(ResolvedExecAllowPath {
         canonical,
         metadata,
         pinned,
-    })
-}
-
-fn resolve_exec_allow_path_from_path(
-    path: PathBuf,
-    mode: ExecAllowMode,
-) -> Result<Option<ResolvedExecAllowPath>> {
-    if mode == ExecAllowMode::Auto {
-        match std::fs::metadata(&path) {
-            Ok(_) => {}
-            Err(err) if auto_exec_candidate_is_unavailable(&err) => return Ok(None),
-            Err(err) => {
-                return Err(err).with_context(|| {
-                    format!(
-                        "inspect main exec allow path candidate '{}'",
-                        escape_path(&path)
-                    )
-                });
-            }
-        }
-    }
-
-    resolved_exec_allow_path_from_candidate(&path).map(Some)
-}
-
-fn resolve_main_exec_allow_path_candidate(raw: &str) -> Result<Option<PathBuf>> {
-    if raw.contains('/') {
-        return match std::fs::metadata(raw) {
-            // FIFOs, device nodes and directories cannot be main executables.
-            // Leave their native execution failure to the child without grants.
-            Ok(metadata) if !metadata.is_file() => Ok(None),
-            Ok(_) => Ok(Some(PathBuf::from(raw))),
-            Err(err) if auto_exec_candidate_is_unavailable(&err) => Ok(None),
-            Err(err) => Err(err).with_context(|| {
-                format!(
-                    "inspect main exec allow path candidate '{}'",
-                    escape_path(Path::new(raw))
-                )
-            }),
-        };
-    }
-
-    let search_path = exec_search_path();
-    Ok(find_executable_in_search_path(raw, &search_path, None))
+    }))
 }
 
 fn auto_exec_candidate_is_unavailable(err: &io::Error) -> bool {
@@ -852,37 +792,11 @@ fn auto_exec_candidate_is_unavailable(err: &io::Error) -> bool {
     )
 }
 
-fn resolve_exec_allow_path_candidate(raw: &str) -> Result<PathBuf> {
-    let path = PathBuf::from(raw);
-    if raw.contains('/') {
-        return Ok(path);
-    }
-
-    let search_path = exec_search_path();
-    if let Some(candidate) = find_executable_in_search_path(raw, &search_path, None) {
-        return Ok(candidate);
-    }
-
-    bail!("resolve exec allow path '{}' from PATH", escape_str(raw))
-}
-
-fn find_executable_in_search_path(
-    raw: &str,
-    search_path: &OsString,
-    relative_to: Option<&Path>,
-) -> Option<PathBuf> {
-    executable_paths_in_search_path(raw, search_path, relative_to)
-        .into_iter()
-        .next()
-}
-
 fn executable_paths_in_search_path(
     raw: &str,
     search_path: &OsString,
     relative_to: Option<&Path>,
 ) -> Vec<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
-
     let mut candidates = Vec::new();
     for dir in std::env::split_paths(&search_path) {
         let candidate = if dir.is_relative() {
@@ -890,30 +804,12 @@ fn executable_paths_in_search_path(
         } else {
             dir.join(raw)
         };
-        let Ok(metadata) = std::fs::metadata(&candidate) else {
-            continue;
-        };
-        if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 {
-            let Ok(path) = CString::new(candidate.as_os_str().as_bytes()) else {
-                continue;
-            };
-            if sys::check_executable_access(&path).is_ok() {
-                candidates.push(candidate);
-            }
+        // Effective execute access is checked on the pinned candidate during resolution.
+        if std::fs::metadata(&candidate).is_ok_and(|metadata| is_executable_file(&metadata)) {
+            candidates.push(candidate);
         }
     }
     candidates
-}
-
-fn exec_search_path() -> OsString {
-    #[cfg(test)]
-    match test_exec_search_path_override() {
-        ExecSearchPathOverride::Inherit => {}
-        ExecSearchPathOverride::Value(path) => return path,
-        ExecSearchPathOverride::Default => return default_exec_search_path(),
-    }
-
-    std::env::var_os("PATH").unwrap_or_else(default_exec_search_path)
 }
 
 #[cfg(test)]
@@ -921,7 +817,44 @@ fn test_exec_search_path_override() -> ExecSearchPathOverride {
     TEST_EXEC_SEARCH_PATH.with(|path| path.borrow().clone())
 }
 
+const MUSL_EXEC_PATH: &str = "/usr/local/bin:/bin:/usr/bin";
+
 fn default_exec_search_path() -> OsString {
+    // musl's execvp searches /usr/local/bin even though confstr(_CS_PATH)
+    // omits it. This fallback belongs to tino, not to a script's external env.
+    if cfg!(target_env = "musl") {
+        OsString::from(MUSL_EXEC_PATH)
+    } else {
+        standard_search_path()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum EnvLibc {
+    Musl,
+    Glibc,
+}
+
+fn env_libc(loader: &Path) -> Option<EnvLibc> {
+    // A static tino can run a dynamically linked env from another libc.
+    let name = loader.file_name()?.as_bytes();
+    if name.starts_with(b"ld-musl-") && name.ends_with(b".so.1") {
+        Some(EnvLibc::Musl)
+    } else if name.starts_with(b"ld-linux") {
+        Some(EnvLibc::Glibc)
+    } else {
+        None
+    }
+}
+
+fn env_default_search_path(libc: Option<EnvLibc>) -> OsString {
+    match libc {
+        Some(EnvLibc::Musl) => OsString::from(MUSL_EXEC_PATH),
+        _ => standard_search_path(),
+    }
+}
+
+fn standard_search_path() -> OsString {
     let fallback = || OsString::from("/bin:/usr/bin");
     // SAFETY: the first call queries the required buffer length for _CS_PATH.
     let len = unsafe { libc::confstr(libc::_CS_PATH, std::ptr::null_mut(), 0) };
@@ -940,52 +873,42 @@ fn default_exec_search_path() -> OsString {
 }
 
 #[cfg(test)]
-fn detect_exec_interpreters(path: &Path) -> Result<Vec<ExecInterpreter>> {
+fn detect_exec_interpreter(path: &Path) -> Result<Option<ExecInterpreter>> {
     let pinned = PinnedPath::open(path, PathRuleKind::Any).context("pin interpreter fixture")?;
-    detect_exec_interpreters_in_context(&pinned, &ExecContext::inherited())
+    detect_pinned_exec_interpreter(&pinned)
 }
 
-fn detect_exec_interpreters_in_context(
-    pinned: &PinnedPath,
-    context: &ExecContext,
-) -> Result<Vec<ExecInterpreter>> {
+fn detect_pinned_exec_interpreter(pinned: &PinnedPath) -> Result<Option<ExecInterpreter>> {
     let path = pinned.path();
-    let file = pinned.open_read().with_context(|| {
+    let mut file = pinned.open_read().with_context(|| {
         format!(
             "open exec allow file '{}' for interpreter discovery",
             escape_path(path)
         )
     })?;
-    let shebang_prefix = read_file_prefix_from(&file, EXEC_PROBE_PREFIX_LEN)
+    let prefix = read_file_prefix_from(&mut file, LINUX_BINPRM_BUF_SIZE)
         .with_context(|| format!("read exec allow file '{}'", escape_path(path)))?;
-    let shebang_interpreters = parse_shebang_exec_interpreters_in_context(&shebang_prefix, context);
-    if !shebang_interpreters.is_empty() {
-        return Ok(shebang_interpreters);
+    if let Some(interpreter) = ExecInterpreter::from_shebang(&prefix) {
+        return Ok(Some(interpreter));
     }
-    if shebang_prefix.starts_with(b"#!") {
-        return Ok(Vec::new());
+    if prefix.starts_with(ELF_MAGIC) {
+        return Ok(
+            match read_elf_interpreter(ElfImage::File(&file), &prefix)
+                .with_context(|| format!("inspect ELF file '{}'", escape_path(path)))?
+            {
+                // PT_INTERP is a filesystem path, even when it is a bare name.
+                // Keep it out of the command-name PATH search, as with shebangs.
+                ElfInterpreter::Interpreter(path) => Some(ExecInterpreter::ElfLoader(
+                    filesystem_interpreter_path(path.into_os_string()),
+                )),
+                ElfInterpreter::NoInterpreter => None,
+                ElfInterpreter::Invalid => Some(ExecInterpreter::ShellFallback),
+            },
+        );
     }
-    if shebang_prefix.starts_with(ELF_MAGIC) {
-        return Ok(match read_elf_interpreter_from_file(&file, path)? {
-            // PT_INTERP is a filesystem path, even when it is a bare name.
-            // Keep it out of the command-name PATH search, as with shebangs.
-            ElfInterpreter::Interpreter(path) => vec![ExecInterpreter::Candidate(
-                filesystem_interpreter_path(path.into_os_string()),
-            )],
-            ElfInterpreter::NoInterpreter => Vec::new(),
-            ElfInterpreter::Invalid => {
-                vec![ExecInterpreter::Candidate(PathBuf::from(
-                    EXECVP_FALLBACK_SHELL,
-                ))]
-            }
-        });
-    }
-    Ok(vec![ExecInterpreter::Candidate(PathBuf::from(
-        EXECVP_FALLBACK_SHELL,
-    ))])
+    Ok(Some(ExecInterpreter::ShellFallback))
 }
 
-const EXEC_PROBE_PREFIX_LEN: usize = 4096;
 const ELF_INTERPRETER_MAX_LEN: usize = 4096;
 const ELF_PROGRAM_HEADER_TABLE_MAX_LEN: usize = 1024 * 1024;
 const ELF_MAGIC: &[u8; 4] = b"\x7FELF";
@@ -998,141 +921,71 @@ enum ElfInterpreter {
     Invalid,
 }
 
-fn read_file_prefix_from(file: &File, max_len: usize) -> io::Result<Vec<u8>> {
-    let mut buf = vec![0u8; max_len];
-    let mut len = 0usize;
-    while len < max_len {
-        match file.read_at(&mut buf[len..], len as u64) {
-            Ok(0) => break,
-            Ok(read) => len += read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    buf.truncate(len);
+fn read_file_prefix_from(file: &mut File, max_len: usize) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(max_len);
+    file.take(max_len as u64).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
-fn parse_shebang_interpreter(bytes: &[u8]) -> Option<String> {
-    parse_shebang_exec_paths(bytes).into_iter().next()
-}
-
+#[cfg(test)]
 fn parse_shebang_exec_paths(bytes: &[u8]) -> Vec<String> {
-    parse_shebang_exec_interpreters(bytes)
-        .into_iter()
-        .flat_map(ExecInterpreter::into_display_paths)
-        .collect()
+    ExecInterpreter::from_shebang(bytes)
+        .map(ExecInterpreter::into_display_paths)
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ExecInterpreter {
+    ShellFallback,
+    ElfLoader(PathBuf),
     Candidate(PathBuf),
-    ShebangCandidate {
-        path: PathBuf,
-        argument: OwnedShebangArgument,
-    },
+    ShebangCandidate { path: PathBuf, argument: OsString },
     SearchCandidates(Vec<PathBuf>),
-    EnvCommand(EnvShebangCommand),
-    Missing {
-        command: String,
-    },
-    Unresolved {
-        reason: &'static str,
-    },
+    Missing { command: String },
 }
 
 impl ExecInterpreter {
+    fn from_shebang(bytes: &[u8]) -> Option<Self> {
+        let (path, argument) = parse_shebang(bytes)?;
+        Some(if argument.is_empty() {
+            Self::Candidate(path)
+        } else {
+            Self::ShebangCandidate {
+                path,
+                argument: OsString::from_vec(argument.to_vec()),
+            }
+        })
+    }
+
+    #[cfg(test)]
     fn into_display_paths(self) -> Vec<String> {
         match self {
-            Self::Candidate(path) => vec![path.to_string_lossy().into_owned()],
-            Self::ShebangCandidate { path, .. } => vec![path.to_string_lossy().into_owned()],
+            Self::ShellFallback => vec![EXECVP_FALLBACK_SHELL.into()],
+            Self::Candidate(path) | Self::ElfLoader(path) => {
+                vec![path.to_string_lossy().into_owned()]
+            }
+            Self::ShebangCandidate { path, argument } => {
+                let mut paths = vec![path.to_string_lossy().into_owned()];
+                if is_env_interpreter(path.as_os_str().as_bytes()) {
+                    let inherited = ExecContext::inherited();
+                    match parse_env_argument(&argument, &inherited, None) {
+                        Ok(Some(command)) => paths.extend(command.into_display_paths(&inherited)),
+                        Ok(None) => {}
+                        Err(reason) => paths.push(reason.to_owned()),
+                    }
+                }
+                paths
+            }
             Self::SearchCandidates(paths) => paths
                 .into_iter()
                 .map(|path| path.to_string_lossy().into_owned())
                 .collect(),
-            Self::EnvCommand(command) => command.resolve().into_display_paths(),
             Self::Missing { command } => vec![command],
-            Self::Unresolved { reason } => vec![reason.to_owned()],
         }
     }
 }
 
-fn parse_shebang_exec_interpreters(bytes: &[u8]) -> Vec<ExecInterpreter> {
-    parse_shebang_exec_interpreters_in_context(bytes, &ExecContext::inherited())
-}
-
-fn parse_shebang_exec_interpreters_in_context(
-    bytes: &[u8],
-    context: &ExecContext,
-) -> Vec<ExecInterpreter> {
-    let Some(shebang) = parse_shebang(bytes) else {
-        return Vec::new();
-    };
-    let parts = match shebang {
-        Shebang::Parts(parts) => parts,
-        Shebang::ExecvpFallback => {
-            return vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL,
-            ))];
-        }
-    };
-
-    let path = shebang_interpreter_path(parts.interpreter);
-    if !is_env_interpreter(parts.interpreter) {
-        return vec![match parts.argument {
-            ShebangArgument::None => ExecInterpreter::Candidate(path),
-            ShebangArgument::Utf8(argument) => ExecInterpreter::ShebangCandidate {
-                path,
-                argument: OwnedShebangArgument::Utf8(argument.to_owned()),
-            },
-            ShebangArgument::InvalidUtf8 => ExecInterpreter::ShebangCandidate {
-                path,
-                argument: OwnedShebangArgument::InvalidUtf8,
-            },
-        }];
-    }
-    let mut paths = vec![ExecInterpreter::Candidate(path)];
-    if is_env_interpreter(parts.interpreter) {
-        match parts.argument {
-            ShebangArgument::None => {}
-            ShebangArgument::Utf8(argument) => match env_shebang_command(argument, context) {
-                Ok(Some(command)) => paths.push(ExecInterpreter::EnvCommand(command)),
-                Ok(None) => {}
-                Err(reason) => paths.push(ExecInterpreter::Unresolved { reason }),
-            },
-            ShebangArgument::InvalidUtf8 => {
-                paths.push(ExecInterpreter::Unresolved {
-                    reason: "env shebang argument is not valid UTF-8",
-                });
-            }
-        }
-    }
-    paths
-}
-
-struct ShebangParts<'a> {
-    interpreter: &'a [u8],
-    argument: ShebangArgument<'a>,
-}
-
-enum ShebangArgument<'a> {
-    None,
-    Utf8(&'a str),
-    InvalidUtf8,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum OwnedShebangArgument {
-    Utf8(String),
-    InvalidUtf8,
-}
-
-enum Shebang<'a> {
-    Parts(ShebangParts<'a>),
-    ExecvpFallback,
-}
-
-fn parse_shebang(bytes: &[u8]) -> Option<Shebang<'_>> {
+fn parse_shebang(bytes: &[u8]) -> Option<(PathBuf, &[u8])> {
     if !bytes.starts_with(b"#!") {
         return None;
     }
@@ -1148,41 +1001,20 @@ fn parse_shebang(bytes: &[u8]) -> Option<Shebang<'_>> {
         // passing the optional argument to the interpreter.
         &visible[2..visible.len().min(LINUX_BINPRM_BUF_SIZE - 1)]
     } else {
-        return Some(Shebang::ExecvpFallback);
+        &[]
     };
 
-    Some(parse_shebang_line(line))
-}
-
-fn parse_shebang_line(line: &[u8]) -> Shebang<'_> {
-    let line = trim_shebang_space_end(line);
-    let interpreter_start = line.iter().position(|byte| !is_shebang_space(*byte));
-    let Some(interpreter_start) = interpreter_start else {
-        return Shebang::ExecvpFallback;
-    };
-    let rest = &line[interpreter_start..];
-    let interpreter_end = rest
+    let line = trim_shebang_space_start(trim_shebang_space_end(line));
+    if line.is_empty() {
+        return None;
+    }
+    let split = line
         .iter()
-        .position(|byte| is_shebang_space(*byte))
-        .unwrap_or(rest.len());
-    let interpreter = &rest[..interpreter_end];
-    let argument = trim_shebang_space_start(&rest[interpreter_end..]);
-    let argument = if argument.is_empty() {
-        ShebangArgument::None
-    } else {
-        match std::str::from_utf8(argument) {
-            Ok(argument) => ShebangArgument::Utf8(argument),
-            Err(_) => ShebangArgument::InvalidUtf8,
-        }
-    };
-    Shebang::Parts(ShebangParts {
-        interpreter,
-        argument,
-    })
-}
-
-fn shebang_interpreter_path(interpreter: &[u8]) -> PathBuf {
-    filesystem_interpreter_path(OsString::from_vec(interpreter.to_vec()))
+        .position(|&byte| is_shebang_space(byte))
+        .unwrap_or(line.len());
+    let (interpreter, tail) = line.split_at(split);
+    let path = filesystem_interpreter_path(OsString::from_vec(interpreter.to_vec()));
+    Some((path, trim_shebang_space_start(tail)))
 }
 
 fn filesystem_interpreter_path(path: OsString) -> PathBuf {
@@ -1201,31 +1033,42 @@ fn is_env_interpreter(path: &[u8]) -> bool {
         .any(|candidate| path == candidate.as_bytes())
 }
 
-fn is_env_executable(metadata: &std::fs::Metadata) -> bool {
+fn is_env_executable(invoked: &Path, metadata: &std::fs::Metadata) -> bool {
     #[cfg(test)]
     if let Some((env, shell)) = TEST_ENV_IDENTITY_PATHS.with(|paths| paths.borrow().clone()) {
-        return env_reference_matches(metadata, &env, &shell);
+        return env_reference_matches(invoked, metadata, &env, &shell);
     }
     ENV_INTERPRETER_PATHS.iter().any(|path| {
-        env_reference_matches(metadata, Path::new(path), Path::new(EXECVP_FALLBACK_SHELL))
+        env_reference_matches(
+            invoked,
+            metadata,
+            Path::new(path),
+            Path::new(EXECVP_FALLBACK_SHELL),
+        )
     })
 }
 
-fn env_reference_matches(metadata: &std::fs::Metadata, env: &Path, shell: &Path) -> bool {
+fn env_reference_matches(
+    invoked: &Path,
+    metadata: &std::fs::Metadata,
+    env: &Path,
+    shell: &Path,
+) -> bool {
     use std::os::unix::fs::MetadataExt;
 
-    // Multicall binaries dispatch by argv[0], so inode identity alone does not
-    // make an alias behave as env. Reject references to another executable name
-    // and hardlink installs that share their inode with the system shell.
-    if !std::fs::canonicalize(env)
-        .is_ok_and(|path| path.file_name() == Some(std::ffi::OsStr::new("env")))
-        || std::fs::metadata(shell)
+    let same_file = |path: &Path| {
+        std::fs::metadata(path)
             .is_ok_and(|known| known.dev() == metadata.dev() && known.ino() == metadata.ino())
-    {
+    };
+    if !same_file(env) {
         return false;
     }
-    std::fs::metadata(env)
-        .is_ok_and(|known| known.dev() == metadata.dev() && known.ino() == metadata.ino())
+    // A multicall executable selects its env applet by the invoked basename.
+    // For an alias with another name, keep recognizing standalone env binaries.
+    let name = Some(std::ffi::OsStr::new("env"));
+    invoked.file_name() == name
+        || (std::fs::canonicalize(env).is_ok_and(|path| path.file_name() == name)
+            && !same_file(shell))
 }
 
 fn shebang_interpreter_is_terminated(visible: &[u8]) -> bool {
@@ -1262,25 +1105,15 @@ fn trim_shebang_space_end(mut bytes: &[u8]) -> &[u8] {
 struct EnvShebangCommand {
     command: String,
     context: ExecContext,
-    search_modified: bool,
-}
-
-struct EnvShebangFields {
-    fields: Vec<String>,
-    ignore_environment: bool,
 }
 
 #[derive(Default)]
 struct EnvShebangOptions {
+    libc: Option<EnvLibc>,
     ignore_environment: bool,
     unset_names: Vec<String>,
     chdir: Option<String>,
     invalid_signal_disposition: bool,
-}
-
-struct EnvSplitString<'a> {
-    value: &'a str,
-    ignore_environment: bool,
 }
 
 enum EnvSplitExpansion {
@@ -1290,16 +1123,22 @@ enum EnvSplitExpansion {
 
 enum EnvOptionAction {
     Continue,
-    Return(Option<EnvShebangCommand>),
     SplitString(String),
-    Invalid,
+    NoCommand,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnvValueOption {
+    Argv0,
+    Chdir,
+    SplitString,
+    Unset,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EnvLongOption {
-    Argv0,
+    WithValue(EnvValueOption),
     BlockSignal,
-    Chdir,
     Debug,
     DefaultSignal,
     Help,
@@ -1307,15 +1146,13 @@ enum EnvLongOption {
     IgnoreSignal,
     ListSignalHandling,
     Null,
-    SplitString,
-    Unset,
     Version,
 }
 
 const ENV_LONG_OPTIONS: &[(EnvLongOption, &str)] = &[
-    (EnvLongOption::Argv0, "argv0"),
+    (EnvLongOption::WithValue(EnvValueOption::Argv0), "argv0"),
     (EnvLongOption::BlockSignal, "block-signal"),
-    (EnvLongOption::Chdir, "chdir"),
+    (EnvLongOption::WithValue(EnvValueOption::Chdir), "chdir"),
     (EnvLongOption::Debug, "debug"),
     (EnvLongOption::DefaultSignal, "default-signal"),
     (EnvLongOption::Help, "help"),
@@ -1323,102 +1160,45 @@ const ENV_LONG_OPTIONS: &[(EnvLongOption, &str)] = &[
     (EnvLongOption::IgnoreSignal, "ignore-signal"),
     (EnvLongOption::ListSignalHandling, "list-signal-handling"),
     (EnvLongOption::Null, "null"),
-    (EnvLongOption::SplitString, "split-string"),
-    (EnvLongOption::Unset, "unset"),
+    (
+        EnvLongOption::WithValue(EnvValueOption::SplitString),
+        "split-string",
+    ),
+    (EnvLongOption::WithValue(EnvValueOption::Unset), "unset"),
     (EnvLongOption::Version, "version"),
 ];
 
 impl EnvShebangCommand {
-    fn new(command: &str, context: ExecContext, inherited: &ExecContext) -> Self {
-        let search_modified = context.cwd != inherited.cwd
-            || context.environment.get(std::ffi::OsStr::new("PATH"))
-                != inherited.environment.get(std::ffi::OsStr::new("PATH"));
-        Self {
-            command: command.to_owned(),
-            context,
-            search_modified,
-        }
-    }
-
-    fn resolve(&self) -> ExecInterpreter {
+    fn resolve(&self, default_search_path: impl FnOnce() -> OsString) -> ExecInterpreter {
         if self.command.contains('/') {
             return ExecInterpreter::Candidate(self.context.path(Path::new(&self.command)));
         }
-        if self.search_modified {
-            let candidates = executable_paths_in_search_path(
-                &self.command,
-                &self.context.search_path(),
-                self.context.cwd.as_deref(),
-            );
-            if !candidates.is_empty() {
-                return ExecInterpreter::SearchCandidates(candidates);
-            }
-            return ExecInterpreter::Missing {
+        let candidates = executable_paths_in_search_path(
+            &self.command,
+            &self.context.search_path(default_search_path),
+            self.context.cwd.as_deref(),
+        );
+        if candidates.is_empty() {
+            ExecInterpreter::Missing {
                 command: self.command.clone(),
-            };
-        }
-        ExecInterpreter::Candidate(PathBuf::from(&self.command))
-    }
-}
-
-fn env_shebang_command(
-    argument: &str,
-    context: &ExecContext,
-) -> std::result::Result<Option<EnvShebangCommand>, &'static str> {
-    let Some(parsed) = env_shebang_argument_fields(argument, context) else {
-        return Ok(None);
-    };
-    let options = EnvShebangOptions {
-        ignore_environment: parsed.ignore_environment,
-        ..EnvShebangOptions::default()
-    };
-    env_shebang_command_fields(parsed.fields, options, context)
-}
-
-fn env_shebang_argument_fields(argument: &str, context: &ExecContext) -> Option<EnvShebangFields> {
-    if let Some(split) = env_split_string(argument) {
-        return Some(EnvShebangFields {
-            fields: split_env_split_string(split.value, context)?,
-            ignore_environment: split.ignore_environment,
-        });
-    }
-    Some(EnvShebangFields {
-        fields: vec![argument.to_owned()],
-        ignore_environment: false,
-    })
-}
-
-fn env_split_string(arg: &str) -> Option<EnvSplitString<'_>> {
-    if let Some((EnvLongOption::SplitString, Some(split))) = classify_env_long_option(arg) {
-        return Some(EnvSplitString {
-            value: split,
-            ignore_environment: false,
-        });
-    }
-    if !arg.starts_with('-') || arg.starts_with("--") {
-        return None;
-    }
-
-    let mut idx = 1usize;
-    let mut ignore_environment = false;
-    while idx < arg.len() {
-        let opt = arg[idx..].chars().next()?;
-        idx += opt.len_utf8();
-        match opt {
-            'S' => {
-                return Some(EnvSplitString {
-                    value: &arg[idx..],
-                    ignore_environment,
-                });
             }
-            'i' => {
-                ignore_environment = true;
-            }
-            'v' => {}
-            _ => return None,
+        } else {
+            ExecInterpreter::SearchCandidates(candidates)
         }
     }
-    None
+
+    #[cfg(test)]
+    fn into_display_paths(self, inherited: &ExecContext) -> Vec<String> {
+        let path = std::ffi::OsStr::new("PATH");
+        if !self.command.contains('/')
+            && self.context.cwd == inherited.cwd
+            && self.context.environment.get(path) == inherited.environment.get(path)
+        {
+            vec![self.command]
+        } else {
+            self.resolve(standard_search_path).into_display_paths()
+        }
+    }
 }
 
 fn split_env_split_string(raw: &str, context: &ExecContext) -> Option<Vec<String>> {
@@ -1515,7 +1295,8 @@ fn split_env_split_string(raw: &str, context: &ExecContext) -> Option<Vec<String
         if ch == '#' && !in_field {
             break;
         }
-        if ch.is_ascii_whitespace() {
+        // GNU env also treats an unquoted vertical tab as a field separator.
+        if ch.is_ascii_whitespace() || ch == '\x0b' {
             if in_field {
                 fields.push(std::mem::take(&mut current));
                 in_field = false;
@@ -1546,7 +1327,7 @@ fn expand_env_split_variable(
     let name_start = *idx + 1;
     let name_end = name_start + raw[name_start..].find('}')?;
     let name = &raw[name_start..name_end];
-    if !is_env_split_variable_name(name) {
+    if !is_env_variable_name(name) {
         return None;
     }
     *idx = name_end + 1;
@@ -1556,20 +1337,27 @@ fn expand_env_split_variable(
     })
 }
 
-fn is_env_split_variable_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    !bytes.is_empty()
-        && (bytes[0] == b'_' || bytes[0].is_ascii_alphabetic())
-        && bytes[1..]
+fn is_env_variable_name(name: &str) -> bool {
+    let Some((&first, rest)) = name.as_bytes().split_first() else {
+        return false;
+    };
+    (first == b'_' || first.is_ascii_alphabetic())
+        && rest
             .iter()
-            .all(|byte| *byte == b'_' || byte.is_ascii_alphanumeric())
+            .all(|&byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-fn env_shebang_command_fields(
-    mut fields: Vec<String>,
-    mut options: EnvShebangOptions,
+fn env_shebang_command(
+    argument: &str,
     inherited: &ExecContext,
+    libc: Option<EnvLibc>,
 ) -> std::result::Result<Option<EnvShebangCommand>, &'static str> {
+    // Linux supplies the entire optional shebang argument as one argv entry.
+    let mut fields = vec![argument.to_owned()];
+    let mut options = EnvShebangOptions {
+        libc,
+        ..EnvShebangOptions::default()
+    };
     let mut idx = 0usize;
     let mut split_steps = 0;
 
@@ -1592,8 +1380,7 @@ fn env_shebang_command_fields(
             };
             match action {
                 EnvOptionAction::Continue => continue,
-                EnvOptionAction::Return(command) => return Ok(command),
-                EnvOptionAction::Invalid => return Ok(None),
+                EnvOptionAction::NoCommand => return Ok(None),
                 EnvOptionAction::SplitString(split) => {
                     // Variables can expand back to the same -S argument. Keep
                     // reparsing iterative and bounded, including long options.
@@ -1627,59 +1414,18 @@ fn env_long_option_action(
     options: &mut EnvShebangOptions,
 ) -> EnvOptionAction {
     let Some((option, value)) = classify_env_long_option(arg) else {
-        return EnvOptionAction::Invalid;
+        return EnvOptionAction::NoCommand;
     };
 
     match option {
-        EnvLongOption::SplitString => {
-            let split = if let Some(split) = value {
-                split
-            } else {
-                let Some(split) = fields.get(*idx) else {
-                    return EnvOptionAction::Continue;
-                };
-                *idx += 1;
-                split.as_str()
-            };
-            EnvOptionAction::SplitString(split.to_owned())
+        EnvLongOption::WithValue(option) => {
+            env_value_option_action(option, value, fields, idx, options)
         }
         EnvLongOption::IgnoreEnvironment => {
             if value.is_some() {
-                return EnvOptionAction::Invalid;
+                return EnvOptionAction::NoCommand;
             }
             options.ignore_environment = true;
-            EnvOptionAction::Continue
-        }
-        EnvLongOption::Unset => {
-            let name = if let Some(name) = value {
-                name
-            } else {
-                let Some(name) = fields.get(*idx) else {
-                    return EnvOptionAction::Continue;
-                };
-                *idx += 1;
-                name.as_str()
-            };
-            options.unset_names.push(name.to_owned());
-            EnvOptionAction::Continue
-        }
-        EnvLongOption::Chdir => {
-            let dir = if let Some(dir) = value {
-                dir
-            } else {
-                let Some(dir) = fields.get(*idx) else {
-                    return EnvOptionAction::Invalid;
-                };
-                *idx += 1;
-                dir.as_str()
-            };
-            options.chdir = Some(dir.to_owned());
-            EnvOptionAction::Continue
-        }
-        EnvLongOption::Argv0 => {
-            if value.is_none() {
-                *idx = idx.saturating_add(1).min(fields.len());
-            }
             EnvOptionAction::Continue
         }
         EnvLongOption::BlockSignal => validate_env_signal_option(value, true, options),
@@ -1687,15 +1433,11 @@ fn env_long_option_action(
             validate_env_signal_option(value, false, options)
         }
         EnvLongOption::Help | EnvLongOption::Null | EnvLongOption::Version => {
-            if value.is_some() {
-                EnvOptionAction::Invalid
-            } else {
-                EnvOptionAction::Return(None)
-            }
+            EnvOptionAction::NoCommand
         }
         EnvLongOption::Debug | EnvLongOption::ListSignalHandling => {
             if value.is_some() {
-                EnvOptionAction::Invalid
+                EnvOptionAction::NoCommand
             } else {
                 EnvOptionAction::Continue
             }
@@ -1709,59 +1451,48 @@ fn env_short_option_action(
     idx: &mut usize,
     options: &mut EnvShebangOptions,
 ) -> EnvOptionAction {
-    let mut chars = arg.char_indices();
-    let _ = chars.next();
-    for (offset, opt) in chars {
-        let value_start = offset + opt.len_utf8();
-        match opt {
+    let mut chars = arg[1..].chars();
+    while let Some(opt) = chars.next() {
+        let option = match opt {
             'i' => {
                 options.ignore_environment = true;
+                continue;
             }
-            'v' => {}
-            '0' => return EnvOptionAction::Return(None),
-            'u' => {
-                let name = if value_start == arg.len() {
-                    let Some(name) = fields.get(*idx) else {
-                        return EnvOptionAction::Continue;
-                    };
-                    *idx += 1;
-                    name.as_str()
-                } else {
-                    &arg[value_start..]
-                };
-                options.unset_names.push(name.to_owned());
-                return EnvOptionAction::Continue;
-            }
-            'a' => {
-                if value_start == arg.len() {
-                    *idx = idx.saturating_add(1).min(fields.len());
-                }
-                return EnvOptionAction::Continue;
-            }
-            'C' => {
-                if value_start < arg.len() {
-                    options.chdir = Some(arg[value_start..].to_owned());
-                } else if let Some(dir) = fields.get(*idx) {
-                    options.chdir = Some(dir.to_owned());
-                    *idx += 1;
-                } else {
-                    return EnvOptionAction::Invalid;
-                }
-                return EnvOptionAction::Continue;
-            }
-            'S' => {
-                let split = if value_start < arg.len() {
-                    &arg[value_start..]
-                } else if let Some(split) = fields.get(*idx) {
-                    *idx += 1;
-                    split
-                } else {
-                    return EnvOptionAction::Continue;
-                };
-                return EnvOptionAction::SplitString(split.to_owned());
-            }
-            _ => return EnvOptionAction::Invalid,
-        }
+            'v' => continue,
+            'a' => EnvValueOption::Argv0,
+            'C' => EnvValueOption::Chdir,
+            'S' => EnvValueOption::SplitString,
+            'u' => EnvValueOption::Unset,
+            _ => return EnvOptionAction::NoCommand,
+        };
+        let tail = chars.as_str();
+        let attached = (!tail.is_empty()).then_some(tail);
+        return env_value_option_action(option, attached, fields, idx, options);
+    }
+    EnvOptionAction::Continue
+}
+
+fn env_value_option_action(
+    option: EnvValueOption,
+    attached: Option<&str>,
+    fields: &[String],
+    idx: &mut usize,
+    options: &mut EnvShebangOptions,
+) -> EnvOptionAction {
+    let value = if let Some(value) = attached {
+        value
+    } else {
+        let Some(next) = fields.get(*idx) else {
+            return EnvOptionAction::NoCommand;
+        };
+        *idx += 1;
+        next.as_str()
+    };
+    match option {
+        EnvValueOption::Argv0 => {}
+        EnvValueOption::Chdir => options.chdir = Some(value.to_owned()),
+        EnvValueOption::SplitString => return EnvOptionAction::SplitString(value.to_owned()),
+        EnvValueOption::Unset => options.unset_names.push(value.to_owned()),
     }
     EnvOptionAction::Continue
 }
@@ -1783,21 +1514,22 @@ fn env_shebang_command_operands(
         fields
     };
     let mut context = inherited.clone();
+    context.shell_fallback = !matches!(options.libc, Some(EnvLibc::Musl));
     if options.ignore_environment {
         // GNU env skips unsets entirely when clearing the environment, even
         // names that would otherwise make unsetenv fail.
-        context.environment.clear();
+        context.environment = Rc::default();
     } else {
         for name in &options.unset_names {
             if !valid_env_unset_name(name) {
                 return None;
             }
-            context.environment.remove(std::ffi::OsStr::new(name));
+            Rc::make_mut(&mut context.environment).remove(std::ffi::OsStr::new(name));
         }
     }
     for arg in fields.iter().map(String::as_str) {
         if let Some((name, value)) = arg.split_once('=') {
-            context.environment.insert(name.into(), value.into());
+            Rc::make_mut(&mut context.environment).insert(name.into(), value.into());
             continue;
         }
         return finish_env_shebang_command(arg, context, inherited, options.chdir.as_deref());
@@ -1816,7 +1548,10 @@ fn finish_env_shebang_command(
     if let Some(dir) = chdir {
         options.cwd = Some(env_chdir(dir, inherited)?);
     }
-    Some(EnvShebangCommand::new(command, options, inherited))
+    Some(EnvShebangCommand {
+        command: command.to_owned(),
+        context: options,
+    })
 }
 
 fn classify_env_long_option(arg: &str) -> Option<(EnvLongOption, Option<&str>)> {
@@ -1846,8 +1581,10 @@ fn env_chdir(dir: &str, inherited: &ExecContext) -> Option<PathBuf> {
     if dir.is_empty() {
         return None;
     }
-    let dir = inherited.path(Path::new(dir)).canonicalize().ok()?;
-    dir.is_dir().then_some(dir)
+    let dir = inherited.path(Path::new(dir));
+    // Looking up "." requires search permission on the directory, as chdir does.
+    dir.join(".").metadata().ok()?;
+    dir.canonicalize().ok()
 }
 
 fn validate_env_signal_option(
@@ -1863,121 +1600,29 @@ fn validate_env_signal_option(
         }
         return EnvOptionAction::Continue;
     };
+    // libc reserves signals at the start of the Linux realtime range for
+    // internal use. Validate against the interpreter that sets the disposition.
+    let rtmin = match options.libc {
+        Some(EnvLibc::Glibc) => 34,
+        Some(EnvLibc::Musl) => 35,
+        None => libc::SIGRTMIN(),
+    };
     for signal in signals.split(',').filter(|signal| !signal.is_empty()) {
-        let Some(number) = env_signal_number(signal) else {
-            return EnvOptionAction::Invalid;
+        let Some(number) = signals::signal_number(signal, rtmin) else {
+            return EnvOptionAction::NoCommand;
         };
-        // As with RTMIN name parsing, this boundary comes from tino's linked
-        // libc; an env binary linked against another libc can differ.
-        let reserved = (32..libc::SIGRTMIN()).contains(&number);
+        let reserved = (32..rtmin).contains(&number);
         if block_signal {
             // Blocking KILL/STOP is tolerated, but libc's reserved signals
             // fail independently of later disposition options.
             if reserved {
-                return EnvOptionAction::Invalid;
+                return EnvOptionAction::NoCommand;
             }
         } else if reserved || number == libc::SIGKILL || number == libc::SIGSTOP {
             options.invalid_signal_disposition = true;
         }
     }
     EnvOptionAction::Continue
-}
-
-fn env_signal_number(raw: &str) -> Option<libc::c_int> {
-    let signal = match raw.get(..3) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("SIG") => &raw[3..],
-        _ => raw,
-    };
-    if let Some(number) = env_named_signal_number(signal) {
-        return Some(number);
-    }
-    if let Some(number) = env_realtime_signal_number(signal) {
-        return Some(number);
-    }
-    parse_env_unsigned_c_int(signal).filter(|number| valid_env_signal_number(*number))
-}
-
-fn env_named_signal_number(signal: &str) -> Option<libc::c_int> {
-    let number = match signal.to_ascii_uppercase().as_str() {
-        "HUP" => libc::SIGHUP,
-        "INT" => libc::SIGINT,
-        "QUIT" => libc::SIGQUIT,
-        "ILL" => libc::SIGILL,
-        "TRAP" => libc::SIGTRAP,
-        "ABRT" | "IOT" => libc::SIGABRT,
-        "BUS" => libc::SIGBUS,
-        "FPE" => libc::SIGFPE,
-        "KILL" => libc::SIGKILL,
-        "USR1" => libc::SIGUSR1,
-        "SEGV" => libc::SIGSEGV,
-        "USR2" => libc::SIGUSR2,
-        "PIPE" => libc::SIGPIPE,
-        "ALRM" => libc::SIGALRM,
-        "TERM" => libc::SIGTERM,
-        "STKFLT" => libc::SIGSTKFLT,
-        "CHLD" | "CLD" => libc::SIGCHLD,
-        "CONT" => libc::SIGCONT,
-        "STOP" => libc::SIGSTOP,
-        "TSTP" => libc::SIGTSTP,
-        "TTIN" => libc::SIGTTIN,
-        "TTOU" => libc::SIGTTOU,
-        "URG" => libc::SIGURG,
-        "XCPU" => libc::SIGXCPU,
-        "XFSZ" => libc::SIGXFSZ,
-        "VTALRM" => libc::SIGVTALRM,
-        "PROF" => libc::SIGPROF,
-        "WINCH" => libc::SIGWINCH,
-        "IO" | "POLL" => libc::SIGPOLL,
-        "PWR" => libc::SIGPWR,
-        "SYS" => libc::SIGSYS,
-        _ => return None,
-    };
-    Some(number)
-}
-
-fn valid_env_signal_number(number: libc::c_int) -> bool {
-    (1..=libc::SIGRTMAX()).contains(&number)
-}
-
-fn env_realtime_signal_number(signal: &str) -> Option<libc::c_int> {
-    let rtmin = libc::SIGRTMIN();
-    let rtmax = libc::SIGRTMAX();
-
-    let signal = signal.to_ascii_uppercase();
-    if signal == "RTMIN" {
-        return Some(rtmin);
-    }
-    if signal == "RTMAX" {
-        return Some(rtmax);
-    }
-    if let Some(offset) = signal
-        .strip_prefix("RTMIN+")
-        .and_then(parse_env_realtime_offset)
-    {
-        return rtmin
-            .checked_add(offset)
-            .filter(|number| (rtmin..=rtmax).contains(number));
-    }
-    if let Some(offset) = signal
-        .strip_prefix("RTMAX-")
-        .and_then(parse_env_realtime_offset)
-    {
-        return rtmax
-            .checked_sub(offset)
-            .filter(|number| (rtmin..=rtmax).contains(number));
-    }
-    None
-}
-
-fn parse_env_realtime_offset(raw: &str) -> Option<libc::c_int> {
-    parse_env_unsigned_c_int(raw)
-}
-
-fn parse_env_unsigned_c_int(raw: &str) -> Option<libc::c_int> {
-    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    raw.parse().ok()
 }
 
 const fn executable_elf_machines() -> &'static [u16] {
@@ -2038,18 +1683,24 @@ fn elf_machine_may_execute(machine: u16) -> bool {
     machines.is_empty() || machines.contains(&machine)
 }
 
-const fn elf_data_may_execute(little_endian: bool) -> bool {
-    cfg_select! {
-        target_endian = "little" => {
-            little_endian
-        }
-        target_endian = "big" => {
-            !little_endian
+enum ElfImage<'a> {
+    File(&'a File),
+    Bytes(&'a [u8]),
+}
+
+impl ElfImage<'_> {
+    fn read_exact_at(&self, buf: &mut [u8], offset: usize) -> io::Result<()> {
+        match self {
+            Self::File(file) => file.read_exact_at(buf, offset as u64),
+            Self::Bytes(bytes) => bytes
+                .get(offset..)
+                .ok_or(io::ErrorKind::UnexpectedEof)?
+                .read_exact(buf),
         }
     }
 }
 
-fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpreter> {
+fn read_elf_interpreter(image: ElfImage<'_>, header: &[u8]) -> Result<ElfInterpreter> {
     const EI_CLASS: usize = 4;
     const EI_DATA: usize = 5;
     const E_ENTRY: usize = 24;
@@ -2059,84 +1710,48 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
     const ET_DYN: u16 = 3;
     const ELFCLASS32: u8 = 1;
     const ELFCLASS64: u8 = 2;
-    const ELFDATA2LSB: u8 = 1;
-    const ELFDATA2MSB: u8 = 2;
+    const NATIVE_ELF_DATA: u8 = if cfg!(target_endian = "little") { 1 } else { 2 };
     const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
 
-    let header = read_file_prefix_from(file, 64)
-        .with_context(|| format!("read ELF header '{}'", escape_path(path)))?;
     if header.len() < 0x34 || &header[..4] != ELF_MAGIC {
         return Ok(ElfInterpreter::Invalid);
     }
 
-    let little_endian = match header[EI_DATA] {
-        ELFDATA2LSB => true,
-        ELFDATA2MSB => false,
-        _ => return Ok(ElfInterpreter::Invalid),
-    };
-    if !elf_data_may_execute(little_endian) {
+    if header[EI_DATA] != NATIVE_ELF_DATA {
         return Ok(ElfInterpreter::Invalid);
     }
 
-    let e_type = read_u16(&header, E_TYPE, little_endian)?;
+    let e_type = read_u16(header, E_TYPE)?;
     if !matches!(e_type, ET_EXEC | ET_DYN) {
         return Ok(ElfInterpreter::Invalid);
     }
-    let e_machine = read_u16(&header, E_MACHINE, little_endian)?;
+    let e_machine = read_u16(header, E_MACHINE)?;
     if !elf_machine_may_execute(e_machine) {
         return Ok(ElfInterpreter::Invalid);
     }
 
     let class = header[EI_CLASS];
-    let min_header_len = match class {
-        ELFCLASS32 => 0x34,
-        ELFCLASS64 => 0x40,
-        _ => return Ok(ElfInterpreter::Invalid),
-    };
-    if header.len() < min_header_len {
-        return Ok(ElfInterpreter::Invalid);
-    }
-
     let (phoff, phentsize, phnum, expected_phentsize, entry) = match class {
         ELFCLASS32 => (
-            match read_u32(&header, 28, little_endian) {
-                Ok(value) => value as usize,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-            match read_u16(&header, 42, little_endian) {
-                Ok(value) => value as usize,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-            match read_u16(&header, 44, little_endian) {
-                Ok(value) => value as usize,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-            32usize,
-            match read_u32(&header, E_ENTRY, little_endian) {
-                Ok(value) => u64::from(value),
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
+            read_u32(header, 28)? as usize,
+            usize::from(read_u16(header, 42)?),
+            usize::from(read_u16(header, 44)?),
+            32,
+            u64::from(read_u32(header, E_ENTRY)?),
         ),
-        ELFCLASS64 => (
-            match read_u64_usize(&header, 32, little_endian, "ELF program header offset") {
-                Ok(value) => value,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-            match read_u16(&header, 54, little_endian) {
-                Ok(value) => value as usize,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-            match read_u16(&header, 56, little_endian) {
-                Ok(value) => value as usize,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-            56usize,
-            match read_u64(&header, E_ENTRY, little_endian) {
-                Ok(value) => value,
-                Err(_) => return Ok(ElfInterpreter::Invalid),
-            },
-        ),
+        ELFCLASS64 if header.len() >= 0x40 => {
+            let Ok(phoff) = usize::try_from(read_u64(header, 32)?) else {
+                return Ok(ElfInterpreter::Invalid);
+            };
+            (
+                phoff,
+                usize::from(read_u16(header, 54)?),
+                usize::from(read_u16(header, 56)?),
+                56,
+                read_u64(header, E_ENTRY)?,
+            )
+        }
         _ => return Ok(ElfInterpreter::Invalid),
     };
     // Linux requires the native ELF program-header size, not an extensible
@@ -2145,35 +1760,25 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
         return Ok(ElfInterpreter::Invalid);
     }
 
-    let Some(phdr_len) = phentsize.checked_mul(phnum) else {
-        return Ok(ElfInterpreter::Invalid);
-    };
+    // At most u16::MAX entries of 32 or 56 bytes each.
+    let phdr_len = phentsize * phnum;
     if phdr_len > ELF_PROGRAM_HEADER_TABLE_MAX_LEN {
         return Ok(ElfInterpreter::Invalid);
     }
     let mut phdrs = vec![0u8; phdr_len];
-    if let Err(err) = read_exact_file_at(file, &mut phdrs, phoff as u64) {
+    if let Err(err) = image.read_exact_at(&mut phdrs, phoff) {
         return if elf_read_error_is_invalid(&err) {
             Ok(ElfInterpreter::Invalid)
         } else {
-            Err(err).with_context(|| format!("read ELF program headers '{}'", escape_path(path)))
+            Err(err).context("read ELF program headers")
         };
     }
 
-    let file_len = file
-        .metadata()
-        .with_context(|| format!("inspect ELF file '{}'", escape_path(path)))?
-        .len();
     let mut has_load_segment = false;
     let mut has_executable_entry_load_segment = false;
     let mut detected_interpreter = None;
-    for idx in 0..phnum {
-        let Some(start) = idx.checked_mul(phentsize) else {
-            return Ok(ElfInterpreter::Invalid);
-        };
-        let Ok(p_type) = read_u32(&phdrs, start, little_endian) else {
-            return Ok(ElfInterpreter::Invalid);
-        };
+    for phdr in phdrs.chunks_exact(phentsize) {
+        let p_type = read_u32(phdr, 0)?;
         if p_type != PT_LOAD && p_type != PT_INTERP {
             continue;
         }
@@ -2185,49 +1790,24 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
 
         let (offset, filesz, vaddr, memsz, flags) = if class == ELFCLASS32 {
             (
-                match read_u32(&phdrs, start + 4, little_endian) {
-                    Ok(value) => value as usize,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u32(&phdrs, start + 16, little_endian) {
-                    Ok(value) => value as usize,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u32(&phdrs, start + 8, little_endian) {
-                    Ok(value) => u64::from(value),
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u32(&phdrs, start + 20, little_endian) {
-                    Ok(value) => u64::from(value),
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u32(&phdrs, start + 24, little_endian) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
+                read_u32(phdr, 4)? as usize,
+                read_u32(phdr, 16)? as usize,
+                u64::from(read_u32(phdr, 8)?),
+                u64::from(read_u32(phdr, 20)?),
+                read_u32(phdr, 24)?,
             )
         } else {
+            let offset = usize::try_from(read_u64(phdr, 8)?);
+            let filesz = usize::try_from(read_u64(phdr, 32)?);
+            let (Ok(offset), Ok(filesz)) = (offset, filesz) else {
+                return Ok(ElfInterpreter::Invalid);
+            };
             (
-                match read_u64_usize(&phdrs, start + 8, little_endian, "ELF segment offset") {
-                    Ok(value) => value,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u64_usize(&phdrs, start + 32, little_endian, "ELF segment size") {
-                    Ok(value) => value,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u64(&phdrs, start + 16, little_endian) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u64(&phdrs, start + 40, little_endian) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
-                match read_u32(&phdrs, start + 4, little_endian) {
-                    Ok(value) => value,
-                    Err(_) => return Ok(ElfInterpreter::Invalid),
-                },
+                offset,
+                filesz,
+                read_u64(phdr, 16)?,
+                read_u64(phdr, 40)?,
+                read_u32(phdr, 4)?,
             )
         };
         if p_type == PT_LOAD {
@@ -2243,18 +1823,15 @@ fn read_elf_interpreter_from_file(file: &File, path: &Path) -> Result<ElfInterpr
             }
             continue;
         }
-        if filesz == 0
-            || filesz > ELF_INTERPRETER_MAX_LEN
-            || !elf_file_range_is_valid(offset, filesz, file_len)
-        {
+        if filesz == 0 || filesz > ELF_INTERPRETER_MAX_LEN {
             return Ok(ElfInterpreter::Invalid);
         }
         let mut interp = vec![0u8; filesz];
-        if let Err(err) = read_exact_file_at(file, &mut interp, offset as u64) {
+        if let Err(err) = image.read_exact_at(&mut interp, offset) {
             return if elf_read_error_is_invalid(&err) {
                 Ok(ElfInterpreter::Invalid)
             } else {
-                Err(err).with_context(|| format!("read ELF interpreter '{}'", escape_path(path)))
+                Err(err).context("read ELF interpreter")
             };
         }
         let Some(interpreter_path) = elf_interpreter_path(&interp) else {
@@ -2293,207 +1870,51 @@ fn elf_read_error_is_invalid(err: &io::Error) -> bool {
     )
 }
 
-fn elf_file_range_is_valid(offset: usize, filesz: usize, file_len: u64) -> bool {
-    let Ok(offset) = u64::try_from(offset) else {
-        return false;
-    };
-    let Ok(filesz) = u64::try_from(filesz) else {
-        return false;
-    };
-    offset
-        .checked_add(filesz)
-        .is_some_and(|end| end <= file_len)
-}
-
-fn read_exact_file_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
-    let mut len = 0usize;
-    while len < buf.len() {
-        let read_offset = offset
-            .checked_add(len as u64)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow"))?;
-        match file.read_at(&mut buf[len..], read_offset) {
-            Ok(0) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "unexpected EOF",
-                ));
-            }
-            Ok(read) => len += read,
-            Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
-}
-
-fn parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
-    const EI_CLASS: usize = 4;
-    const EI_DATA: usize = 5;
-    const ELFCLASS32: u8 = 1;
-    const ELFCLASS64: u8 = 2;
-    const ELFDATA2LSB: u8 = 1;
-    const ELFDATA2MSB: u8 = 2;
-    const PT_INTERP: u32 = 3;
-
-    if bytes.len() < 0x34 || &bytes[..4] != ELF_MAGIC {
+pub(crate) fn bench_parse_elf_interpreter(bytes: &[u8]) -> Result<Option<String>> {
+    if !bytes.starts_with(ELF_MAGIC) {
         return Ok(None);
     }
-
-    let little_endian = match bytes[EI_DATA] {
-        ELFDATA2LSB => true,
-        ELFDATA2MSB => false,
-        _ => return Ok(None),
-    };
-
-    let (phoff, phentsize, phnum, min_phentsize) = match bytes[EI_CLASS] {
-        ELFCLASS32 => (
-            read_u32(bytes, 28, little_endian)? as usize,
-            read_u16(bytes, 42, little_endian)? as usize,
-            read_u16(bytes, 44, little_endian)? as usize,
-            32usize,
-        ),
-        ELFCLASS64 => (
-            read_u64_usize(bytes, 32, little_endian, "ELF program header offset")?,
-            read_u16(bytes, 54, little_endian)? as usize,
-            read_u16(bytes, 56, little_endian)? as usize,
-            56usize,
-        ),
-        _ => return Ok(None),
-    };
-    if phentsize < min_phentsize {
-        bail!("ELF program header entry too small");
+    match read_elf_interpreter(ElfImage::Bytes(bytes), bytes)? {
+        ElfInterpreter::Invalid => bail!("invalid ELF executable"),
+        ElfInterpreter::NoInterpreter => Ok(None),
+        ElfInterpreter::Interpreter(path) => path
+            .into_os_string()
+            .into_string()
+            .ok()
+            .map(Some)
+            .context("ELF interpreter path is not valid UTF-8"),
     }
-
-    for idx in 0..phnum {
-        let start = idx
-            .checked_mul(phentsize)
-            .and_then(|offset| phoff.checked_add(offset))
-            .context("ELF program header offset overflow")?;
-        let end = start
-            .checked_add(phentsize)
-            .context("ELF program header offset overflow")?;
-        if end > bytes.len() {
-            bail!("ELF program header exceeds file size");
-        }
-        let p_type = read_u32(bytes, start, little_endian)?;
-        if p_type != PT_INTERP {
-            continue;
-        }
-
-        let (offset, filesz) = if bytes[EI_CLASS] == ELFCLASS32 {
-            (
-                read_u32(bytes, start + 4, little_endian)? as usize,
-                read_u32(bytes, start + 16, little_endian)? as usize,
-            )
-        } else {
-            (
-                read_u64_usize(
-                    bytes,
-                    start + 8,
-                    little_endian,
-                    "ELF interpreter segment offset",
-                )?,
-                read_u64_usize(
-                    bytes,
-                    start + 32,
-                    little_endian,
-                    "ELF interpreter segment size",
-                )?,
-            )
-        };
-        let end = offset
-            .checked_add(filesz)
-            .context("ELF interpreter segment offset overflow")?;
-        if end > bytes.len() {
-            bail!("ELF interpreter segment exceeds file size");
-        }
-        let interp = &bytes[offset..end];
-        let interpreter_path =
-            elf_interpreter_path(interp).context("ELF interpreter path is not NUL-terminated")?;
-        let interpreter = std::str::from_utf8(interpreter_path)
-            .context("ELF interpreter path is not valid UTF-8")?
-            .to_string();
-        if interpreter.is_empty() {
-            return Ok(None);
-        }
-        return Ok(Some(interpreter));
-    }
-
-    Ok(None)
 }
 
 fn elf_interpreter_path(interp: &[u8]) -> Option<&[u8]> {
-    let nul = interp.iter().position(|byte| *byte == 0)?;
-    Some(&interp[..nul])
+    // Linux checks the segment's last byte before using it as a C pathname.
+    interp.strip_suffix(b"\0")?.split(|&byte| byte == 0).next()
 }
 
-fn read_u16(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u16> {
-    let slice = read_elf_bytes(bytes, offset, 2, "ELF header")?;
-    let mut raw = [0u8; 2];
-    raw.copy_from_slice(slice);
-    Ok(if little_endian {
-        u16::from_le_bytes(raw)
-    } else {
-        u16::from_be_bytes(raw)
-    })
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
+    read_elf_bytes(bytes, offset).map(u16::from_ne_bytes)
 }
 
-fn read_u32(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u32> {
-    let slice = read_elf_bytes(bytes, offset, 4, "ELF header")?;
-    let mut raw = [0u8; 4];
-    raw.copy_from_slice(slice);
-    Ok(if little_endian {
-        u32::from_le_bytes(raw)
-    } else {
-        u32::from_be_bytes(raw)
-    })
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
+    read_elf_bytes(bytes, offset).map(u32::from_ne_bytes)
 }
 
-fn read_u64(bytes: &[u8], offset: usize, little_endian: bool) -> Result<u64> {
-    let slice = read_elf_bytes(bytes, offset, 8, "ELF header")?;
-    let mut raw = [0u8; 8];
-    raw.copy_from_slice(slice);
-    Ok(if little_endian {
-        u64::from_le_bytes(raw)
-    } else {
-        u64::from_be_bytes(raw)
-    })
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64> {
+    read_elf_bytes(bytes, offset).map(u64::from_ne_bytes)
 }
 
-fn read_u64_usize(
-    bytes: &[u8],
-    offset: usize,
-    little_endian: bool,
-    context: &str,
-) -> Result<usize> {
-    usize::try_from(read_u64(bytes, offset, little_endian)?)
-        .with_context(|| format!("{context} exceeds addressable size"))
-}
-
-fn read_elf_bytes<'a>(
-    bytes: &'a [u8],
-    offset: usize,
-    len: usize,
-    context: &str,
-) -> Result<&'a [u8]> {
-    let end = offset
-        .checked_add(len)
-        .with_context(|| format!("{context} offset overflow"))?;
+fn read_elf_bytes<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N]> {
     bytes
-        .get(offset..end)
-        .with_context(|| format!("{context} read out of bounds"))
+        .get(offset..)
+        .and_then(|rest| rest.first_chunk())
+        .copied()
+        .context("ELF header read out of bounds")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShutdownDeadline {
     At(Instant),
     Never,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WaitLoop {
-    Continue,
-    Break,
 }
 
 impl ShutdownDeadline {
@@ -2510,7 +1931,7 @@ impl ShutdownDeadline {
     }
 
     fn poll_timeout(self) -> PollTimeout {
-        PollTimeout::try_from(self.remaining(Instant::now())).unwrap_or(PollTimeout::MAX)
+        PollTimeout::from_duration(self.remaining(Instant::now()))
     }
 
     fn expired(self) -> bool {
@@ -2519,19 +1940,43 @@ impl ShutdownDeadline {
 }
 
 const SIGNAL_BATCH_LIMIT: usize = 64;
+const CLEANUP_TIMEOUT_MS: u64 = 500;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Shutdown {
+    Running,
+    External,
+    Timed(ShutdownDeadline),
+    KillSent,
+}
+
+impl Shutdown {
+    fn on_termination_signal(self, grace_ms: Option<u64>) -> Self {
+        match self {
+            Self::Running => match grace_ms {
+                None => Self::External,
+                Some(ms) => Self::Timed(ShutdownDeadline::after(Instant::now(), ms)),
+            },
+            Self::Timed(_) => Self::Timed(ShutdownDeadline::At(Instant::now())),
+            Self::External | Self::KillSent => self,
+        }
+    }
+
+    fn expired(self) -> bool {
+        matches!(self, Self::Timed(deadline) if deadline.expired())
+    }
+}
 
 fn supervise_child(
     cli: &Cli,
-    expect_zero: &ExitCodeRemap,
     child_pid: Pid,
     use_pgroup: bool,
     signal_fd: &mut SignalFd,
-    terminal_job: Option<&TerminalJob>,
+    terminal_job: Option<&mut TerminalJob>,
 ) -> Result<i32> {
     let mut main_exit: Option<i32> = None;
     let result = supervise_child_inner(
         cli,
-        expect_zero,
         child_pid,
         use_pgroup,
         signal_fd,
@@ -2544,7 +1989,7 @@ fn supervise_child(
             cleanup_failed_supervision(child_pid, use_pgroup);
         }
         if use_pgroup {
-            cleanup_failed_process_group(child_pid, cli.grace_ms);
+            cleanup_failed_process_group(child_pid);
         }
     }
     result
@@ -2577,8 +2022,8 @@ fn cleanup_failed_supervision(child_pid: Pid, use_pgroup: bool) {
     }
 }
 
-fn cleanup_failed_process_group(child_pgid: Pid, grace_ms: u64) {
-    let deadline = ShutdownDeadline::after(Instant::now(), grace_ms);
+fn cleanup_failed_process_group(child_pgid: Pid) {
+    let deadline = ShutdownDeadline::after(Instant::now(), CLEANUP_TIMEOUT_MS);
     let mut killed = false;
     loop {
         match waitpid_group_nohang(child_pgid) {
@@ -2620,37 +2065,32 @@ fn cleanup_failed_process_group(child_pgid: Pid, grace_ms: u64) {
 
 fn supervise_child_inner(
     cli: &Cli,
-    expect_zero: &ExitCodeRemap,
     child_pid: Pid,
     use_pgroup: bool,
     signal_fd: &mut SignalFd,
     main_exit: &mut Option<i32>,
-    terminal_job: Option<&TerminalJob>,
+    mut terminal_job: Option<&mut TerminalJob>,
 ) -> Result<i32> {
-    let mut shutdown_deadline: Option<ShutdownDeadline> = None;
-    let mut sigkill_sent = false;
-    let mut fds = [PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN)];
-
-    loop {
-        let poll_timeout = match (shutdown_deadline, sigkill_sent, main_exit.is_some()) {
-            (Some(deadline), false, false) => deadline.poll_timeout(),
+    let mut shutdown = Shutdown::Running;
+    let exit_code = loop {
+        if let Some(tty) = terminal_job.as_deref_mut() {
+            tty.release_child_when_ready(signal_fd)?;
+        }
+        let terminal_job = terminal_job.as_deref();
+        let poll_timeout = match shutdown {
+            Shutdown::Timed(deadline) => deadline.poll_timeout(),
             _ => PollTimeout::BLOCK,
         };
-        match poll_fds(&mut fds, poll_timeout) {
-            Ok(()) => {}
-            Err(err) => {
-                if err == Errno::EINTR {
-                    continue;
-                }
-                return Err(err).context("poll");
-            }
-        }
-        let events = fds[0].revents().unwrap_or_else(PollFlags::empty);
-        if signal_fd_poll_failed(events) {
+        let events = match signal_fd.poll(poll_timeout) {
+            Ok(events) => events,
+            Err(Errno::EINTR) => continue,
+            Err(err) => return Err(err).context("poll"),
+        };
+        if events.failed() {
             bail!("signal fd poll failed with events {:?}", events);
         }
         let mut job_status = None;
-        if events.contains(PollFlags::POLLIN) {
+        if events.readable() {
             let mut budget = SIGNAL_BATCH_LIMIT;
             while let Some(info) = read_forwardable_signal(signal_fd, &mut budget)? {
                 let sig = info.ssi_signo.cast_signed();
@@ -2663,112 +2103,158 @@ fn supervise_child_inner(
                 } else {
                     if sig == libc::SIGCONT {
                         job_status = None;
-                        if let Some(tty) = terminal_job {
-                            tty.give_terminal_to_child();
-                        }
                     }
-                    forward_to_main_child(use_pgroup, child_pid, sig);
-                    if is_termination_signal(sig) && main_exit.is_none() && !sigkill_sent {
-                        let now = Instant::now();
-                        shutdown_deadline = Some(match shutdown_deadline {
-                            None => ShutdownDeadline::after(now, cli.grace_ms),
-                            Some(_) => ShutdownDeadline::At(now),
-                        });
+                    let delivered_group =
+                        terminal_job.and_then(|tty| tty.signaled_foreground_group(&info));
+                    forward_to_main_child(use_pgroup, child_pid, sig, delivered_group);
+                    if is_termination_signal(cli, sig) {
+                        shutdown = shutdown.on_termination_signal(cli.grace_ms);
                     }
                 }
-                if main_exit.is_some()
-                    || (!sigkill_sent && shutdown_deadline.is_some_and(ShutdownDeadline::expired))
-                {
+                if main_exit.is_some() || shutdown.expired() {
                     break;
                 }
             }
         }
-        if let Some(ShutdownDeadline::At(deadline)) = shutdown_deadline
-            && !sigkill_sent
-            && main_exit.is_none()
-            && Instant::now() >= deadline
-        {
-            logging::info(format_args!("grace period expired; sending SIGKILL"));
-            forward_to_main_child(use_pgroup, child_pid, SIGKILL as libc::c_int);
-            sigkill_sent = true;
+        if let Some(code) = *main_exit {
+            break code;
         }
-        if main_exit.is_some() {
-            break;
+        if shutdown.expired() {
+            logging::info(format_args!("grace period expired; sending SIGKILL"));
+            forward_to_main_child(use_pgroup, child_pid, SIGKILL as libc::c_int, None);
+            shutdown = Shutdown::KillSent;
         }
         if let Some(WaitStatus::Stopped(_, signal)) = job_status
-            && shutdown_deadline.is_none()
+            && shutdown == Shutdown::Running
             && let Some(tty) = terminal_job
             && tty.handle_child_stop(child_pid, signal)
-            && !signal_fd.accepts(libc::SIGCONT)
         {
-            // A caller-owned pending CONT excludes this signal from the
-            // signalfd. Returning from our stop still proves continuation,
-            // so resume the job without consuming the caller's signal.
-            tty.give_terminal_to_child();
-            forward_to_main_child(use_pgroup, child_pid, libc::SIGCONT);
+            let owns_cont = signal_fd.accepts(libc::SIGCONT);
+            if !use_pgroup && sys::child_has_waitable_transition(child_pid).unwrap_or(false) {
+                // We reaped the original stop before stopping ourselves. A new
+                // transition means the shared child already resumed. Relaying
+                // this CONT again could undo a subsequent keyboard stop.
+                let mut cont = SigSet::empty();
+                cont.add_raw(libc::SIGCONT);
+                if owns_cont
+                    && matches!(cont.wait_nohang(), Ok(Some(_)))
+                    && is_termination_signal(cli, libc::SIGCONT)
+                {
+                    shutdown = shutdown.on_termination_signal(cli.grace_ms);
+                }
+            } else if !owns_cont {
+                // Resume the job without consuming the caller's pending CONT.
+                forward_to_main_child(use_pgroup, child_pid, libc::SIGCONT, None);
+            }
         }
+    };
+    // SIGCHLD can be dequeued before a stop that was already pending when the
+    // main child exited. Honor that stop before starting natural-exit cleanup.
+    if shutdown == Shutdown::Running
+        && let Some(sig) = take_pending_termination_signal(cli, signal_fd)?
+    {
+        if use_pgroup {
+            send_signal(true, child_pid, sig);
+        }
+        shutdown = shutdown.on_termination_signal(cli.grace_ms);
     }
-
-    let main_exit = main_exit.context("main child exit status was not observed")?;
-    let final_exit = compute_exit_code(main_exit, expect_zero);
-    // Descendants share the shutdown deadline started by the first termination
-    // signal. Only a natural main-child exit starts a fresh cleanup grace period.
-    let cleanup_deadline =
-        shutdown_deadline.unwrap_or_else(|| ShutdownDeadline::after(Instant::now(), cli.grace_ms));
-
-    if use_pgroup {
+    let cleanup_ms = cli.grace_ms.unwrap_or(CLEANUP_TIMEOUT_MS);
+    let now = Instant::now();
+    let cleanup_deadline = match shutdown {
+        Shutdown::Timed(deadline) => deadline,
+        Shutdown::KillSent => ShutdownDeadline::At(now),
+        // Exiting as PID 1 would kill adopted workers still draining in the namespace.
+        Shutdown::External if use_pgroup || sys::current_process_id().as_raw() == 1 => {
+            ShutdownDeadline::Never
+        }
+        Shutdown::Running | Shutdown::External => ShutdownDeadline::after(now, cleanup_ms),
+    };
+    // On natural exit the group still needs its first stop signal.
+    if use_pgroup && shutdown == Shutdown::Running {
         logging::info(format_args!("sending SIGTERM to PGID"));
         send_signal(true, child_pid, SIGTERM as libc::c_int);
-        if !wait_for_cleanup(child_pid, true, cli, signal_fd, cleanup_deadline, true)? {
-            logging::info(format_args!("process group still alive; sending SIGKILL"));
-            send_signal(true, child_pid, SIGKILL as libc::c_int);
-            // Allow reaping after SIGKILL without delaying when SIGKILL is sent.
-            let reap_deadline = ShutdownDeadline::after(Instant::now(), cli.grace_ms);
-            let group_gone =
-                wait_for_cleanup(child_pid, true, cli, signal_fd, reap_deadline, false)?;
-            if !group_gone {
-                logging::warn(format_args!(
-                    "process group still alive after SIGKILL wait of {} ms",
-                    cli.grace_ms
-                ));
-            }
+    }
+    let done = wait_for_cleanup(
+        child_pid,
+        use_pgroup,
+        cli,
+        signal_fd,
+        cleanup_deadline,
+        cli.grace_ms.is_some(),
+    )?;
+    if use_pgroup && !done {
+        logging::info(format_args!("process group still alive; sending SIGKILL"));
+        send_signal(true, child_pid, SIGKILL as libc::c_int);
+        // Sending SIGKILL and observing the worker's exit are separate events.
+        // Even with zero grace, give the kernel time to make children waitable.
+        let reap_deadline = ShutdownDeadline::after(Instant::now(), CLEANUP_TIMEOUT_MS);
+        if !wait_for_cleanup(child_pid, true, cli, signal_fd, reap_deadline, false)? {
+            logging::warn(format_args!(
+                "process group still alive after SIGKILL wait of {CLEANUP_TIMEOUT_MS} ms"
+            ));
         }
-    } else {
-        let _ = wait_for_cleanup(child_pid, false, cli, signal_fd, cleanup_deadline, true)?;
     }
 
-    logging::info(format_args!("exiting with {}", final_exit));
-    Ok(final_exit)
+    Ok(exit_code)
 }
 
-fn forward_to_main_child(use_pgroup: bool, child_pid: Pid, sig: libc::c_int) {
-    // The main command can join another group after startup. Keep forwarding
-    // to the original workload group, and also reach the moved main command.
-    // This helper is only used before reaping, while its PID is still reserved.
-    send_signal(use_pgroup, child_pid, sig);
-    if use_pgroup {
+fn forward_to_main_child(
+    use_pgroup: bool,
+    child_pid: Pid,
+    sig: libc::c_int,
+    delivered_group: Option<Pid>,
+) {
+    let group_signaled =
+        use_pgroup && delivered_group != Some(child_pid) && send_signal(true, child_pid, sig);
+    // A main command may have moved groups since launch. Send directly
+    // only if neither the terminal nor our group signal already targeted it.
+    if group_signaled || delivered_group.is_some() {
         match process_group_of(child_pid) {
-            Ok(group) if group == child_pid => {}
-            Err(Errno::ESRCH) => {}
-            Ok(_) => send_signal(false, child_pid, sig),
-            Err(err) => {
-                logging::warn(format_args!(
-                    "query main child process group before direct forwarding: {err}"
-                ));
-                send_signal(false, child_pid, sig);
+            Ok(group)
+                if Some(group) == delivered_group || (group_signaled && group == child_pid) =>
+            {
+                return;
             }
+            Err(Errno::ESRCH) => return,
+            Err(err) => logging::warn(format_args!(
+                "query main child process group before direct forwarding: {err}"
+            )),
+            Ok(_) => {}
         }
     }
+    send_signal(false, child_pid, sig);
 }
 
-const fn signal_fd_poll_failed(events: PollFlags) -> bool {
-    events.intersects(PollFlags::POLLERR)
-        || events.intersects(PollFlags::POLLHUP)
-        || events.intersects(PollFlags::POLLNVAL)
+fn termination_signals(cli: &Cli) -> impl Iterator<Item = libc::c_int> {
+    [SIGTERM, SIGINT, SIGQUIT]
+        .into_iter()
+        .map(|sig| sig as libc::c_int)
+        .chain(cli.stop_signal.map(crate::StopSignal::number))
 }
 
-const fn is_termination_signal(sig: libc::c_int) -> bool {
-    sig == SIGTERM as libc::c_int || sig == SIGINT as libc::c_int || sig == SIGQUIT as libc::c_int
+fn is_termination_signal(cli: &Cli, sig: libc::c_int) -> bool {
+    termination_signals(cli).any(|candidate| candidate == sig)
+}
+
+fn take_pending_termination_signal(cli: &Cli, signal_fd: &mut SignalFd) -> Result<Option<i32>> {
+    let pending = SigSet::pending().context("query pending shutdown signals")?;
+    let mut candidates = termination_signals(cli)
+        .filter(|&sig| signal_fd.accepts(sig) && pending.contains_raw(sig))
+        .peekable();
+    if candidates.peek().is_none() {
+        return Ok(None);
+    }
+    let mut filter = SigSet::empty();
+    for sig in candidates {
+        filter.add_raw(sig);
+    }
+    // Select just the stop signals so a queue of unrelated lower-numbered
+    // signals cannot hide shutdown. Leave that queue for ordinary cleanup.
+    let mut budget = SIGNAL_BATCH_LIMIT;
+    let info = signal_fd
+        .with_filter(&filter, |fd| read_forwardable_signal(fd, &mut budget))
+        .context("read pending shutdown signal")?;
+    Ok(info.map(|info| info.ssi_signo.cast_signed()))
 }
 
 fn log_reaped_secondary(pid: Pid, warn_on_reap: bool) {
@@ -2776,14 +2262,6 @@ fn log_reaped_secondary(pid: Pid, warn_on_reap: bool) {
         logging::warn(format_args!("reaped secondary PID {}", pid));
     } else {
         logging::debug(format_args!("reaped secondary PID {}", pid));
-    }
-}
-
-fn log_stopped_child(pid: Pid, sig: i32, warn_on_reap: bool) {
-    if warn_on_reap {
-        logging::warn(format_args!("child PID {} stopped by signal {}", pid, sig));
-    } else {
-        logging::debug(format_args!("child PID {} stopped by signal {}", pid, sig));
     }
 }
 
@@ -2795,15 +2273,17 @@ fn handle_sigchld(
     let mut job_status = None;
     loop {
         match waitpid_any_nohang() {
+            Ok(WaitStatus::StillAlive) => break,
+            Ok(WaitStatus::Exited(pid, code)) if pid == child_pid => *main_exit = Some(code),
+            Ok(WaitStatus::Signaled(pid, sig)) if pid == child_pid => {
+                *main_exit = Some(128 + sig);
+            }
             Ok(status) => {
                 if matches!(status, WaitStatus::Stopped(pid, _) | WaitStatus::Continued(pid) if pid == child_pid)
                 {
                     job_status = Some(status);
                 }
-                match handle_wait_status(status, cli, child_pid, main_exit) {
-                    WaitLoop::Continue => continue,
-                    WaitLoop::Break => break,
-                }
+                log_wait_status(status, cli.warn_on_reap);
             }
             Err(Errno::ECHILD) if main_exit.is_some() => break,
             Err(Errno::ECHILD) => {
@@ -2816,49 +2296,20 @@ fn handle_sigchld(
     Ok(job_status)
 }
 
-fn handle_wait_status(
-    status: WaitStatus,
-    cli: &Cli,
-    child_pid: Pid,
-    main_exit: &mut Option<i32>,
-) -> WaitLoop {
-    let action = wait_status_drain_action(status);
-    match status {
-        WaitStatus::Exited(pid, code) if pid == child_pid => {
-            *main_exit = Some(code);
-        }
-        WaitStatus::Signaled(pid, sig, _) if pid == child_pid => {
-            *main_exit = Some(128 + sig);
-        }
-        status => log_wait_status(status, cli.warn_on_reap),
-    }
-    action
-}
-
 fn log_wait_status(status: WaitStatus, warn_on_reap: bool) {
     match status {
-        WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _, _) => {
+        WaitStatus::Exited(pid, _) | WaitStatus::Signaled(pid, _) => {
             log_reaped_secondary(pid, warn_on_reap);
         }
         WaitStatus::Stopped(pid, sig) => {
-            log_stopped_child(pid, sig, warn_on_reap);
+            logging::debug(format_args!("child PID {pid} stopped by signal {sig}"));
         }
         WaitStatus::Continued(_) | WaitStatus::StillAlive => {}
     }
 }
 
-const fn wait_status_drain_action(status: WaitStatus) -> WaitLoop {
-    match status {
-        WaitStatus::StillAlive => WaitLoop::Break,
-        WaitStatus::Exited(..)
-        | WaitStatus::Signaled(..)
-        | WaitStatus::Stopped(..)
-        | WaitStatus::Continued(..) => WaitLoop::Continue,
-    }
-}
-
-fn compute_exit_code(code: i32, expect_zero: &ExitCodeRemap) -> i32 {
-    if u8::try_from(code).is_ok_and(|candidate| expect_zero[candidate as usize]) {
+fn compute_exit_code(code: i32, remap_exit: &[u8]) -> i32 {
+    if u8::try_from(code).is_ok_and(|candidate| remap_exit.contains(&candidate)) {
         0
     } else {
         code
@@ -2888,7 +2339,7 @@ fn wait_for_cleanup(
             if use_pgroup {
                 send_signal(true, child_pid, sig);
             }
-            terminate |= is_termination_signal(sig);
+            terminate |= is_termination_signal(cli, sig);
             if (interruptible && terminate) || deadline.expired() {
                 break;
             }
@@ -2907,17 +2358,19 @@ fn wait_for_cleanup(
         if (interruptible && terminate) || remaining.is_zero() {
             return Ok(false);
         }
-        // A group can contain processes we cannot waitpid, so periodically
-        // check its existence even when no SIGCHLD arrives.
-        let poll_timeout = PollTimeout::try_from(remaining.min(Duration::from_millis(10)))
-            .unwrap_or(PollTimeout::MAX);
-        let mut fds = [PollFd::new(signal_fd.as_fd(), PollFlags::POLLIN)];
-        match poll_fds(&mut fds, poll_timeout) {
-            Ok(()) => {}
+        // Only a group can contain processes whose exit won't wake our signalfd.
+        let wait = if use_pgroup {
+            remaining.min(Duration::from_millis(10))
+        } else {
+            remaining
+        };
+        let poll_timeout = PollTimeout::from_duration(wait);
+        let events = match signal_fd.poll(poll_timeout) {
+            Ok(events) => events,
             Err(Errno::EINTR) => continue,
             Err(err) => return Err(err).context("poll during child cleanup"),
-        }
-        if signal_fd_poll_failed(fds[0].revents().unwrap_or_else(PollFlags::empty)) {
+        };
+        if events.failed() {
             bail!("signal fd poll failed during child cleanup");
         }
     }
@@ -2926,13 +2379,8 @@ fn wait_for_cleanup(
 fn reap_available_children(warn_on_reap: bool) -> Result<bool> {
     loop {
         match waitpid_any_nohang() {
-            Ok(status) => {
-                log_wait_status(status, warn_on_reap);
-                match wait_status_drain_action(status) {
-                    WaitLoop::Continue => continue,
-                    WaitLoop::Break => return Ok(false),
-                }
-            }
+            Ok(WaitStatus::StillAlive) => return Ok(false),
+            Ok(status) => log_wait_status(status, warn_on_reap),
             Err(Errno::ECHILD) => return Ok(true),
             Err(Errno::EINTR) => continue,
             Err(e) => bail!("waitpid: {e}"),
@@ -2943,7 +2391,6 @@ fn reap_available_children(warn_on_reap: bool) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform;
     use std::sync::{
         Mutex, MutexGuard, OnceLock,
         atomic::{AtomicU64, Ordering},
@@ -3038,32 +2485,20 @@ mod tests {
 
     #[test]
     fn signal_lookup_accepts_variants_with_or_without_prefix() {
-        assert_eq!(
-            super::signals::signal_by_name("TERM"),
-            Some(Signal::SIGTERM)
-        );
-        assert_eq!(
-            super::signals::signal_by_name("SIGTERM"),
-            Some(Signal::SIGTERM)
-        );
-        assert_eq!(
-            super::signals::signal_by_name("TSTP"),
-            Some(Signal::SIGTSTP)
-        );
+        use crate::signals::ParentDeathSignal;
+
+        for (name, number) in [
+            ("TERM", Signal::SIGTERM),
+            ("SIGTERM", Signal::SIGTERM),
+            ("TSTP", Signal::SIGTSTP),
+        ] {
+            assert_eq!(ParentDeathSignal::parse(name).unwrap().number, number);
+        }
     }
 
     #[test]
     fn signal_lookup_rejects_unknown_signal() {
-        assert!(super::signals::signal_by_name("NOPE").is_none());
-    }
-
-    #[test]
-    fn init_logging_is_idempotent() {
-        let _lock = crate::logging::test_lock();
-
-        platform::init_logging(0);
-        platform::init_logging(1);
-        crate::logging::reset_for_test();
+        assert!(crate::signals::ParentDeathSignal::parse("NOPE").is_err());
     }
 
     #[test]
@@ -3107,7 +2542,7 @@ mod tests {
             .unwrap()
             .expect("write restriction config");
         assert!(config.write_requested);
-        assert!(config.no_dev);
+        assert!(config.dev_dir.is_none());
     }
 
     #[test]
@@ -3142,7 +2577,7 @@ mod tests {
                     write_allow: vec![" /tmp".into()],
                     ..Cli::default()
                 },
-                "--write-allow PATH cannot have surrounding whitespace",
+                "--write-allow DIR cannot have surrounding whitespace",
             ),
             (
                 Cli {
@@ -3181,7 +2616,7 @@ mod tests {
                     write_allow: vec!["logs".into()],
                     ..Cli::default()
                 },
-                "--write-allow PATH must be absolute",
+                "--write-allow DIR must be absolute",
             ),
             (
                 Cli {
@@ -3276,9 +2711,7 @@ mod tests {
             write_allow: vec![link.to_str().expect("link path is UTF-8").into()],
             ..Cli::default()
         };
-        let explain = explain_landlock_config(&cli, &[])
-            .expect("explain landlock config")
-            .expect("landlock config");
+        let (_, explain) = explain_config(&cli).expect("explain landlock config");
 
         assert_eq!(explain.writable_dirs.len(), 1);
         assert!(
@@ -3334,7 +2767,12 @@ mod tests {
     fn main_exec_auto_allow_skips_missing_program() {
         let mut unique = PinnedPaths::new();
 
-        insert_landlock_main_exec_path(&mut unique, "/definitely/missing/tino-test-binary")
+        ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Auto,
+                "/definitely/missing/tino-test-binary",
+            )
             .expect("missing main program should be left to execvp");
 
         assert!(unique.is_empty());
@@ -3370,7 +2808,8 @@ mod tests {
 
         for path in [&directory, &file, &fifo] {
             let mut unique = PinnedPaths::new();
-            insert_landlock_main_exec_path(&mut unique, &path.to_string_lossy())
+            ExecContext::inherited()
+                .insert_exec_path(&mut unique, ExecAllowMode::Auto, &path.to_string_lossy())
                 .expect("non-executable main path should be left to execvp");
 
             assert!(
@@ -3497,7 +2936,8 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod env shebang script");
 
         let mut unique = PinnedPaths::new();
-        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+        ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
             .expect("missing shebang command should be left to child execution");
         let allowed = unique
             .keys()
@@ -3540,7 +2980,8 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod invalid env shebang script");
 
         let mut unique = PinnedPaths::new();
-        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+        ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
             .expect("invalid env shebang argument should be left to child execution");
         let allowed = unique
             .keys()
@@ -3596,7 +3037,8 @@ mod tests {
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
         let mut unique = PinnedPaths::new();
-        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+        ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
             .expect("missing shebang PATH command should not fall back to parent PATH");
         let allowed = unique
             .keys()
@@ -3657,7 +3099,8 @@ mod tests {
             std::fs::set_permissions(&script, perms).expect("chmod env unset PATH shebang script");
 
             let mut unique = PinnedPaths::new();
-            insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+            ExecContext::inherited()
+                .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
                 .expect("unset PATH shebang should not use parent PATH");
             let allowed = unique
                 .keys()
@@ -3713,7 +3156,8 @@ mod tests {
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
         let mut unique = PinnedPaths::new();
-        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+        ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
             .expect("env -iS shebang should not use parent PATH");
         let allowed = unique
             .keys()
@@ -3771,7 +3215,8 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod chdir shebang script");
 
         let mut unique = PinnedPaths::new();
-        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+        ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
             .expect("relative shebang PATH should resolve after env --chdir");
         let allowed = unique
             .keys()
@@ -3817,7 +3262,8 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
 
         let mut unique = PinnedPaths::new();
-        insert_landlock_main_exec_path(&mut unique, &script.to_string_lossy())
+        ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Auto, &script.to_string_lossy())
             .expect("directory shebang interpreter should be left to child execution");
         let allowed = unique
             .keys()
@@ -3875,10 +3321,13 @@ mod tests {
         let path = std::env::join_paths([&first_dir, &second_dir]).expect("join PATH");
 
         let _path = PathEnvGuard::set(path);
-        let resolved =
-            resolve_main_exec_allow_path_candidate("tool").expect("resolve main exec candidate");
+        let mut allowed = PinnedPaths::new();
+        ExecContext::inherited()
+            .insert_exec_path(&mut allowed, ExecAllowMode::Auto, "tool")
+            .expect("resolve main exec candidate");
 
-        assert_eq!(resolved, Some(second_tool));
+        assert!(!allowed.contains_key(first_tool.canonicalize().unwrap().as_os_str().as_bytes()));
+        assert!(allowed.contains_key(second_tool.canonicalize().unwrap().as_os_str().as_bytes()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3907,19 +3356,16 @@ mod tests {
         std::fs::set_permissions(&tool, perms).expect("chmod thread-local PATH tool");
 
         let _path = PathEnvGuard::set(bin_dir.as_os_str().to_os_string());
-        let resolved = resolve_main_exec_allow_path_candidate(&command)
-            .expect("resolve command from thread-local PATH");
-        let other_thread_resolved = std::thread::spawn({
-            move || {
-                resolve_main_exec_allow_path_candidate(&command)
-                    .expect("resolve command outside thread-local PATH")
-            }
-        })
-        .join()
-        .expect("join thread-local PATH test thread");
-
-        assert_eq!(resolved, Some(tool));
-        assert_eq!(other_thread_resolved, None);
+        let lookup = || {
+            let mut allowed = PinnedPaths::new();
+            ExecContext::inherited()
+                .insert_exec_path(&mut allowed, ExecAllowMode::Auto, &command)
+                .unwrap();
+            allowed
+        };
+        let allowed = lookup();
+        assert!(allowed.contains_key(tool.canonicalize().unwrap().as_os_str().as_bytes()));
+        std::thread::scope(|scope| assert!(scope.spawn(lookup).join().unwrap().is_empty()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3927,24 +3373,30 @@ mod tests {
     fn exec_path_resolution_uses_default_path_when_path_unset() {
         let _path = PathEnvGuard::unset();
 
-        let auto = resolve_main_exec_allow_path_candidate("sh")
-            .expect("resolve main exec candidate")
-            .expect("default exec path should find sh");
-        let explicit =
-            resolve_exec_allow_path_candidate("sh").expect("resolve explicit exec allow");
+        let shell = Path::new("/bin/sh").canonicalize().unwrap();
+        let mut auto = PinnedPaths::new();
+        ExecContext::inherited()
+            .insert_exec_path(&mut auto, ExecAllowMode::Auto, "sh")
+            .expect("resolve main exec candidate");
+        let mut explicit = PinnedPaths::new();
+        ExecContext::inherited()
+            .insert_exec_path(&mut explicit, ExecAllowMode::Strict, "sh")
+            .expect("resolve explicit exec allow");
 
-        assert_eq!(auto.file_name().and_then(|name| name.to_str()), Some("sh"));
-        assert_eq!(
-            explicit.file_name().and_then(|name| name.to_str()),
-            Some("sh")
-        );
+        assert!(auto.contains_key(shell.as_os_str().as_bytes()));
+        assert!(explicit.contains_key(shell.as_os_str().as_bytes()));
     }
 
     #[test]
     fn explicit_exec_allow_still_rejects_missing_program() {
         let mut unique = PinnedPaths::new();
 
-        let err = insert_landlock_exec_path(&mut unique, "/definitely/missing/tino-test-binary")
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                "/definitely/missing/tino-test-binary",
+            )
             .expect_err("explicit missing exec allow path must fail");
 
         assert!(
@@ -3957,7 +3409,12 @@ mod tests {
     fn explicit_exec_allow_missing_path_escapes_control_bytes() {
         let mut unique = PinnedPaths::new();
 
-        let err = insert_landlock_exec_path(&mut unique, "/definitely/missing/tino-\u{1b}[31m")
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                "/definitely/missing/tino-\u{1b}[31m",
+            )
             .expect_err("explicit missing exec allow path must fail");
         let message = format!("{err:#}");
 
@@ -4001,7 +3458,8 @@ mod tests {
     fn explicit_exec_allow_missing_path_command_escapes_control_bytes() {
         let mut unique = PinnedPaths::new();
 
-        let err = insert_landlock_exec_path(&mut unique, "missing-\u{1b}[31m")
+        let err = ExecContext::inherited()
+            .insert_exec_path(&mut unique, ExecAllowMode::Strict, "missing-\u{1b}[31m")
             .expect_err("explicit missing exec allow command must fail");
         let message = format!("{err:#}");
 
@@ -4038,7 +3496,12 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod explicit env shebang script");
 
         let mut unique = PinnedPaths::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                &script.to_string_lossy(),
+            )
             .expect_err("explicit exec allow should strictly validate shebang dependencies");
 
         assert!(
@@ -4074,7 +3537,12 @@ mod tests {
             .expect("chmod explicit invalid env shebang script");
 
         let mut unique = PinnedPaths::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                &script.to_string_lossy(),
+            )
             .expect_err("explicit exec allow should reject unresolved shebang dependency");
 
         assert!(
@@ -4111,7 +3579,12 @@ mod tests {
             .expect("chmod explicit env shebang escaping script");
 
         let mut unique = PinnedPaths::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                &script.to_string_lossy(),
+            )
             .expect_err("explicit exec allow should reject missing shebang dependency");
         let message = format!("{err:#}");
 
@@ -4157,7 +3630,12 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod explicit env PATH shebang script");
 
         let mut unique = PinnedPaths::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                &script.to_string_lossy(),
+            )
             .expect_err("explicit exec allow should reject missing shebang PATH command");
 
         assert!(
@@ -4202,7 +3680,12 @@ mod tests {
 
         let _path = PathEnvGuard::set(parent_path_dir.as_os_str().to_os_string());
         let mut unique = PinnedPaths::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                &script.to_string_lossy(),
+            )
             .expect_err("explicit env -iS shebang must not use parent PATH");
 
         assert!(
@@ -4240,7 +3723,12 @@ mod tests {
         std::fs::set_permissions(&script, perms).expect("chmod directory shebang script");
 
         let mut unique = PinnedPaths::new();
-        let err = insert_landlock_exec_path(&mut unique, &script.to_string_lossy())
+        let err = ExecContext::inherited()
+            .insert_exec_path(
+                &mut unique,
+                ExecAllowMode::Strict,
+                &script.to_string_lossy(),
+            )
             .expect_err("explicit exec allow should reject directory shebang dependency");
         let message = format!("{err:#}");
 
@@ -4253,35 +3741,8 @@ mod tests {
 
     #[test]
     fn compute_exit_code_remaps_expected_values() {
-        let mut expect_zero = [false; 256];
-        expect_zero[3] = true;
-        assert_eq!(compute_exit_code(3, &expect_zero), 0);
-        assert_eq!(compute_exit_code(5, &expect_zero), 5);
-    }
-
-    #[test]
-    fn signal_fd_poll_failed_rejects_error_states() {
-        assert!(!signal_fd_poll_failed(PollFlags::empty()));
-        assert!(!signal_fd_poll_failed(PollFlags::POLLIN));
-        assert!(signal_fd_poll_failed(PollFlags::POLLERR));
-        assert!(signal_fd_poll_failed(PollFlags::POLLHUP));
-        assert!(signal_fd_poll_failed(PollFlags::POLLNVAL));
-    }
-
-    #[test]
-    fn wait_status_drain_continues_after_non_terminal_child_statuses() {
-        assert_eq!(
-            wait_status_drain_action(WaitStatus::Stopped(Pid::from_raw(11), SIGTERM as i32)),
-            WaitLoop::Continue
-        );
-        assert_eq!(
-            wait_status_drain_action(WaitStatus::Continued(Pid::from_raw(11))),
-            WaitLoop::Continue
-        );
-        assert_eq!(
-            wait_status_drain_action(WaitStatus::StillAlive),
-            WaitLoop::Break
-        );
+        assert_eq!(compute_exit_code(3, &[3]), 0);
+        assert_eq!(compute_exit_code(5, &[3]), 5);
     }
 
     #[test]
@@ -4295,62 +3756,46 @@ mod tests {
     }
 
     #[test]
-    fn parse_elf_interpreter_rejects_overflowing_program_header_offset() {
-        let mut bytes = minimal_elf64();
-        bytes[32..40].copy_from_slice(&u64::MAX.to_le_bytes());
-
-        let err = parse_elf_interpreter(&bytes).expect_err("overflowing program header offset");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("ELF program header offset overflow"),
-            "unexpected error: {message}"
-        );
+    fn elf_interpreter_field_requires_a_final_nul_and_accepts_padding() {
+        let name = b"/lib/ld.so";
+        assert_eq!(elf_interpreter_path(b"/lib/ld.so\0"), Some(&name[..]));
+        assert_eq!(elf_interpreter_path(b"/lib/ld.so\0\0"), Some(&name[..]));
+        assert_eq!(elf_interpreter_path(b"/lib/ld.so\0x"), None);
     }
 
     #[test]
-    fn parse_elf_interpreter_rejects_tiny_program_header_entries() {
-        let mut bytes = minimal_elf64();
-        bytes[54..56].copy_from_slice(&1u16.to_le_bytes());
-
-        let err = parse_elf_interpreter(&bytes).expect_err("tiny program header entry");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("ELF program header entry too small"),
-            "unexpected error: {message}"
-        );
+    fn benchmark_elf_parser_rejects_an_interpreter_without_a_load_segment() {
+        let mut bytes = minimal_elf64_with_interpreter(256, b"/lib/ld.so");
+        bytes[64..68].fill(0);
+        assert!(crate::bench_support::parse_elf_interpreter(&bytes).is_err());
     }
 
+    #[cfg(target_endian = "little")]
     #[test]
-    fn parse_elf_interpreter_rejects_overflowing_interpreter_segment() {
-        let mut bytes = minimal_elf64();
-        let ph = 64;
-        bytes[ph..ph + 4].copy_from_slice(&3u32.to_le_bytes());
-        bytes[ph + 8..ph + 16].copy_from_slice(&u64::MAX.to_le_bytes());
-        bytes[ph + 32..ph + 40].copy_from_slice(&16u64.to_le_bytes());
-
-        let err = parse_elf_interpreter(&bytes).expect_err("overflowing interpreter segment");
-        let message = format!("{err:#}");
-        assert!(
-            message.contains("ELF interpreter segment offset overflow"),
-            "unexpected error: {message}"
+    fn benchmark_elf_parser_checks_program_headers_and_interpreter_ranges() {
+        let interpreter = b"/lib/ld.so";
+        let original = minimal_elf64_with_interpreter(256, interpreter);
+        assert_eq!(
+            bench_parse_elf_interpreter(&original).unwrap().as_deref(),
+            Some("/lib/ld.so")
         );
-    }
-
-    #[test]
-    fn parse_elf_interpreter_rejects_unterminated_interpreter_path() {
-        let interpreter = b"/lib64/ld-linux-x86-64.so.2";
-        let mut bytes = minimal_elf64_with_interpreter(256, interpreter);
         let interp_ph = 64 + 56;
-        bytes[interp_ph + 32..interp_ph + 40]
-            .copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
-
-        let err = parse_elf_interpreter(&bytes).expect_err("unterminated interpreter must fail");
-        let message = format!("{err:#}");
-
-        assert!(
-            message.contains("ELF interpreter path is not NUL-terminated"),
-            "unexpected error: {message}"
-        );
+        for (offset, replacement) in [
+            (32, &u64::MAX.to_le_bytes()[..]),
+            (54, &1u16.to_le_bytes()[..]),
+            (interp_ph + 8, &u64::MAX.to_le_bytes()[..]),
+            (
+                interp_ph + 32,
+                &(interpreter.len() as u64).to_le_bytes()[..],
+            ),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + replacement.len()].copy_from_slice(replacement);
+            assert!(
+                bench_parse_elf_interpreter(&bytes).is_err(),
+                "field at {offset}"
+            );
+        }
     }
 
     #[test]
@@ -4370,8 +3815,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create ELF interpreter test dir");
         let path = root.join("program");
         let interpreter = "/lib64/ld-linux-x86-64.so.2";
-        let bytes =
-            minimal_elf64_with_interpreter(EXEC_PROBE_PREFIX_LEN * 2, interpreter.as_bytes());
+        let bytes = minimal_elf64_with_interpreter(8192, interpreter.as_bytes());
         std::fs::write(&path, bytes).expect("write ELF interpreter fixture");
         let mut perms = std::fs::metadata(&path)
             .expect("stat ELF interpreter fixture")
@@ -4379,12 +3823,11 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod ELF interpreter fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect ELF interpreter directly");
+        let detected = detect_exec_interpreter(&path).expect("detect ELF interpreter directly");
 
         assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(interpreter.into())]
+            detected,
+            Some(ExecInterpreter::ElfLoader(interpreter.into()))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4407,7 +3850,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create non-UTF-8 ELF interpreter test dir");
         let path = root.join("program");
         let interpreter = b"/tmp/tino-ld-\xff";
-        let bytes = minimal_elf64_with_interpreter(EXEC_PROBE_PREFIX_LEN * 2, interpreter);
+        let bytes = minimal_elf64_with_interpreter(8192, interpreter);
         std::fs::write(&path, bytes).expect("write non-UTF-8 ELF interpreter fixture");
         let mut perms = std::fs::metadata(&path)
             .expect("stat non-UTF-8 ELF interpreter fixture")
@@ -4415,14 +3858,14 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod non-UTF-8 ELF interpreter fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect non-UTF-8 ELF interpreter directly");
+        let detected =
+            detect_exec_interpreter(&path).expect("detect non-UTF-8 ELF interpreter directly");
 
         assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
+            detected,
+            Some(ExecInterpreter::ElfLoader(PathBuf::from(
                 OsString::from_vec(interpreter.to_vec())
-            ))]
+            )))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4444,7 +3887,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create unterminated ELF interpreter test dir");
         let path = root.join("program");
         let interpreter = b"/lib64/ld-linux-x86-64.so.2";
-        let mut bytes = minimal_elf64_with_interpreter(EXEC_PROBE_PREFIX_LEN * 2, interpreter);
+        let mut bytes = minimal_elf64_with_interpreter(8192, interpreter);
         let interp_ph = 64 + 56;
         bytes[interp_ph + 32..interp_ph + 40]
             .copy_from_slice(&(interpreter.len() as u64).to_le_bytes());
@@ -4455,15 +3898,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod unterminated ELF interpreter fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect unterminated ELF fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect unterminated ELF fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4490,14 +3927,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod malformed ELF fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect malformed ELF fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect malformed ELF fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4518,8 +3950,8 @@ mod tests {
             bytes[ph + 32..ph + 40].copy_from_slice(&filesz.to_le_bytes());
             std::fs::write(&path, &bytes).expect("write ELF fixture");
             assert_eq!(
-                detect_exec_interpreters(&path).expect("inspect load segment past EOF"),
-                vec![ExecInterpreter::Candidate(PathBuf::from("/lib/ld-test.so"))],
+                detect_exec_interpreter(&path).expect("inspect load segment past EOF"),
+                Some(ExecInterpreter::ElfLoader(PathBuf::from("/lib/ld-test.so"))),
                 "filesz={filesz}"
             );
         }
@@ -4545,14 +3977,9 @@ mod tests {
             std::process::id()
         ));
         std::fs::write(&path, bytes).expect("write oversized ELF entry fixture");
-        let interpreters = detect_exec_interpreters(&path).expect("inspect oversized ELF entries");
+        let interpreter = detect_exec_interpreter(&path).expect("inspect oversized ELF entries");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
     }
 
     #[test]
@@ -4578,14 +4005,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod no-load ELF fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect no-load ELF fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect no-load ELF fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4614,15 +4036,10 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod invalid static ELF fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect invalid static ELF fallback");
+        let interpreter =
+            detect_exec_interpreter(&path).expect("detect invalid static ELF fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4651,15 +4068,10 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod overflowing load ELF fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect overflowing load ELF fallback");
+        let interpreter =
+            detect_exec_interpreter(&path).expect("detect overflowing load ELF fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4688,9 +4100,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod valid-looking static ELF fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect static ELF");
+        let interpreter = detect_exec_interpreter(&path).expect("detect static ELF");
 
-        assert_eq!(interpreters, Vec::<ExecInterpreter>::new());
+        assert_eq!(interpreter, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4733,14 +4145,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod non-native ELF fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect non-native ELF fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect non-native ELF fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4769,14 +4176,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod invalid phoff ELF fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect invalid phoff fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect invalid phoff fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4803,14 +4205,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod text executable fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect execvp shell fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect execvp shell fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4837,14 +4234,9 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod empty shebang fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect empty shebang fallback");
+        let interpreter = detect_exec_interpreter(&path).expect("detect empty shebang fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4874,15 +4266,10 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod long shebang fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect unterminated long shebang fallback");
+        let interpreter =
+            detect_exec_interpreter(&path).expect("detect unterminated long shebang fallback");
 
-        assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from(
-                EXECVP_FALLBACK_SHELL
-            ))]
-        );
+        assert_eq!(interpreter, Some(ExecInterpreter::ShellFallback));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -4912,15 +4299,15 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod kernel buffer shebang fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect kernel-buffer-limited shebang");
+        let interpreter =
+            detect_exec_interpreter(&path).expect("detect kernel-buffer-limited shebang");
 
         assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::ShebangCandidate {
+            interpreter,
+            Some(ExecInterpreter::ShebangCandidate {
                 path: "/bin/sh".into(),
-                argument: OwnedShebangArgument::Utf8("x".repeat(245)),
-            }]
+                argument: "x".repeat(245).into(),
+            })
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4936,16 +4323,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_shebang_exec_paths_falls_back_after_kernel_buffer() {
+    fn parse_shebang_exec_paths_rejects_a_truncated_interpreter() {
         let path = format!("/{}", "x".repeat(253));
         let mut bytes = format!("#!{path} ").into_bytes();
         bytes.extend_from_slice(b"ignored\n");
 
         assert_eq!(bytes[LINUX_BINPRM_BUF_SIZE], b' ');
-        assert_eq!(
-            parse_shebang_exec_paths(&bytes),
-            vec![EXECVP_FALLBACK_SHELL]
-        );
+        assert!(parse_shebang_exec_paths(&bytes).is_empty());
     }
 
     #[test]
@@ -4972,12 +4356,12 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod relative shebang fixture");
 
-        let interpreters =
-            detect_exec_interpreters(&path).expect("detect relative shebang interpreter");
+        let interpreter =
+            detect_exec_interpreter(&path).expect("detect relative shebang interpreter");
 
         assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from("./bad"))],
+            interpreter,
+            Some(ExecInterpreter::Candidate(PathBuf::from("./bad"))),
             "relative shebang must not imply /bin/sh fallback"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -5005,38 +4389,13 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).expect("chmod CRLF shebang fixture");
 
-        let interpreters = detect_exec_interpreters(&path).expect("detect CRLF shebang");
+        let interpreter = detect_exec_interpreter(&path).expect("detect CRLF shebang");
 
         assert_eq!(
-            interpreters,
-            vec![ExecInterpreter::Candidate(PathBuf::from("/bin/sh\r"))],
+            interpreter,
+            Some(ExecInterpreter::Candidate(PathBuf::from("/bin/sh\r"))),
             "CR must remain part of the kernel interpreter path"
         );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn read_exact_file_at_rejects_offset_overflow() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "tino-read-offset-overflow-{}-{nanos}",
-            std::process::id(),
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create offset overflow test dir");
-        let path = root.join("file");
-        std::fs::write(&path, b"abc").expect("write offset overflow fixture");
-        let file = File::open(&path).expect("open offset overflow fixture");
-        let mut buf = [0u8; 2];
-
-        let err = read_exact_file_at(&file, &mut buf, u64::MAX).expect_err("offset must not wrap");
-
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -5119,7 +4478,7 @@ mod tests {
     }
 
     #[test]
-    fn env_alias_discovery_does_not_grant_multicall_applet_arguments() {
+    fn env_alias_discovery_respects_multicall_applet_names() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
         struct IdentityGuard;
@@ -5158,33 +4517,45 @@ mod tests {
                 }
                 symlink(&multicall, &alias).unwrap();
             }
+            let bin = dir.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let named_alias = bin.join("env");
+            symlink(&env, &named_alias).unwrap();
             TEST_ENV_IDENTITY_PATHS.with(|paths| paths.replace(Some((env, shell))));
-            std::fs::write(
-                &main,
-                format!("#!{} {}\n", alias.display(), helper.display()),
-            )
-            .unwrap();
-            std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let config = build_landlock_config(&Cli {
-                exec_allow: vec![main.to_str().unwrap().into()],
-                ..Cli::default()
-            })
-            .unwrap()
-            .unwrap();
-            assert_eq!(
-                config
-                    .exec_allow_paths
-                    .iter()
-                    .any(|path| path.path() == helper),
-                layout == "standalone",
-                "unexpected executable grant for {layout} env layout"
-            );
+            for (interpreter, discovers_helper) in
+                [(&alias, layout == "standalone"), (&named_alias, true)]
+            {
+                std::fs::write(
+                    &main,
+                    format!("#!{} {}\n", interpreter.display(), helper.display()),
+                )
+                .unwrap();
+                std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let config = build_landlock_config(&Cli {
+                    exec_allow: vec![main.to_str().unwrap().into()],
+                    ..Cli::default()
+                })
+                .unwrap()
+                .unwrap();
+                assert_eq!(
+                    config
+                        .exec_allow_paths
+                        .iter()
+                        .any(|path| path.path() == helper),
+                    discovers_helper,
+                    "env layout {layout}, shebang {interpreter:?}"
+                );
+            }
         }
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn parse_shebang_exec_paths_detects_env_split_command() {
+        assert_eq!(
+            parse_shebang_exec_paths(b"#!/usr/bin/env -S python3\x0b-u\n"),
+            vec!["/usr/bin/env", "python3"]
+        );
         assert_eq!(
             parse_shebang_exec_paths(b"#!/usr/bin/env -S python3 -u\nprint('ok')\n"),
             vec!["/usr/bin/env", "python3"]
@@ -5210,9 +4581,7 @@ mod tests {
     #[test]
     fn env_shebang_dash_ends_options_and_clears_environment() {
         let mut context = ExecContext::inherited();
-        context
-            .environment
-            .insert("TINO_INHERITED".into(), "present".into());
+        Rc::make_mut(&mut context.environment).insert("TINO_INHERITED".into(), "present".into());
         for (argument, expected, assigned) in [
             ("-S -- - NAME=value /bin/sh", "/bin/sh", true),
             ("-S - NAME=value /bin/sh", "/bin/sh", true),
@@ -5220,7 +4589,7 @@ mod tests {
             ("-S - -- /bin/true", "--", false),
             ("-S -- - - /bin/true", "-", false),
         ] {
-            let command = env_shebang_command(argument, &context)
+            let command = env_shebang_command(argument, &context, None)
                 .expect("parse env arguments")
                 .expect("find command after env dash");
             assert_eq!(command.command, expected, "{argument}");
@@ -5230,7 +4599,7 @@ mod tests {
                 BTreeMap::new()
             };
             assert_eq!(
-                command.context.environment, expected_environment,
+                *command.context.environment, expected_environment,
                 "{argument}"
             );
         }
@@ -5626,14 +4995,33 @@ mod tests {
     }
 
     #[test]
+    fn env_split_string_limit_counts_the_initial_split() {
+        let context = ExecContext {
+            environment: Rc::default(),
+            cwd: None,
+            shell_fallback: true,
+        };
+        let argument = |count| format!("{}/bin/sh", "-S ".repeat(count));
+        assert_eq!(
+            env_shebang_command(&argument(32), &context, None)
+                .unwrap()
+                .unwrap()
+                .command,
+            "/bin/sh"
+        );
+        assert_eq!(
+            env_shebang_command(&argument(33), &context, None),
+            Err("env split-string expansion exceeds 32 steps")
+        );
+    }
+
+    #[test]
     fn env_split_string_cycles_are_bounded() {
         let mut context = ExecContext::inherited();
         for value in ["-S ${TINO_SPLIT_LOOP}", "--split-string=${TINO_SPLIT_LOOP}"] {
-            context
-                .environment
-                .insert("TINO_SPLIT_LOOP".into(), value.into());
+            Rc::make_mut(&mut context.environment).insert("TINO_SPLIT_LOOP".into(), value.into());
             assert_eq!(
-                env_shebang_command("-S ${TINO_SPLIT_LOOP}", &context),
+                env_shebang_command("-S ${TINO_SPLIT_LOOP}", &context, None),
                 Err("env split-string expansion exceeds 32 steps")
             );
         }
@@ -5642,13 +5030,10 @@ mod tests {
     #[test]
     fn nested_env_split_strings_keep_options_and_inherited_expansion_context() {
         let mut context = ExecContext::inherited();
-        context
-            .environment
+        Rc::make_mut(&mut context.environment)
             .insert("TINO_SPLIT_FIRST".into(), "-S ${TINO_SPLIT_SECOND}".into());
-        context
-            .environment
-            .insert("TINO_SPLIT_SECOND".into(), "/bin/sh".into());
-        let command = env_shebang_command("-S -i -C /tmp ${TINO_SPLIT_FIRST} -e", &context)
+        Rc::make_mut(&mut context.environment).insert("TINO_SPLIT_SECOND".into(), "/bin/sh".into());
+        let command = env_shebang_command("-S -i -C /tmp ${TINO_SPLIT_FIRST} -e", &context, None)
             .expect("bounded split expansion")
             .expect("resolved command");
         assert_eq!(command.command, "/bin/sh");
@@ -5659,15 +5044,16 @@ mod tests {
     #[test]
     fn env_chdir_applies_final_option_relative_to_inherited_directory() {
         let context = ExecContext {
-            environment: BTreeMap::new(),
+            environment: Rc::default(),
             cwd: Some(PathBuf::from("/")),
+            shell_fallback: true,
         };
-        let command = env_shebang_command("-S -C missing -C tmp /bin/sh", &context)
+        let command = env_shebang_command("-S -C missing -C tmp /bin/sh", &context, None)
             .unwrap()
             .unwrap();
         assert_eq!(command.context.cwd, Some(PathBuf::from("/tmp")));
         assert!(
-            env_shebang_command("-S -C tmp -C '' /bin/sh", &context)
+            env_shebang_command("-S -C tmp -C '' /bin/sh", &context, None)
                 .unwrap()
                 .is_none()
         );

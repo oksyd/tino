@@ -39,13 +39,17 @@ mod signals;
 /// This type mirrors the `tino` binary CLI and is intended to be constructed
 /// through [`Cli::parse`], [`Cli::parse_from`], or [`Cli::try_parse_from`],
 /// rather than by manually filling every field.
-pub use cli::{Cli, CliParseError, CliParseErrorKind, DEFAULT_CONFIG_PATH, WritePreset};
+pub use cli::{
+    Cli, CliParseError, CliParseErrorKind, DEFAULT_CONFIG_PATH, StopSignal, WritePreset,
+};
 
 pub use error::{Context, Error, Result};
 
 /// Execute `tino` with a parsed [`Cli`] configuration.
 ///
 /// Returns the final process exit code that should be used by the caller.
+/// A matching service exit status maps to zero with `--remap-exit`. Child
+/// setup and exec errors retain their status of 1, 126, or 127.
 /// Errors are reserved for configuration, setup, or runtime failures that
 /// prevent normal supervision from completing.
 ///

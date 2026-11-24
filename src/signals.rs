@@ -1,76 +1,59 @@
-macro_rules! signal_spec {
-    ($macro:ident) => {
-        $macro![
-            (HUP, SIGHUP),
-            (INT, SIGINT),
-            (QUIT, SIGQUIT),
-            (ILL, SIGILL),
-            (TRAP, SIGTRAP),
-            (ABRT, SIGABRT),
-            (BUS, SIGBUS),
-            (FPE, SIGFPE),
-            (KILL, SIGKILL),
-            (USR1, SIGUSR1),
-            (SEGV, SIGSEGV),
-            (USR2, SIGUSR2),
-            (PIPE, SIGPIPE),
-            (ALRM, SIGALRM),
-            (TERM, SIGTERM),
-            (CONT, SIGCONT),
-            (WINCH, SIGWINCH),
-            (TSTP, SIGTSTP),
-            (TTIN, SIGTTIN),
-            (TTOU, SIGTTOU),
-        ]
+use crate::diagnostic::escape_str;
+#[cfg(target_os = "linux")]
+use crate::platform::unix::sys::Signal;
+
+pub(crate) struct ParentDeathSignal {
+    pub(crate) name: &'static str,
+    #[cfg(target_os = "linux")]
+    pub(crate) number: Signal,
+}
+
+macro_rules! parent_death_signals {
+    ($($signal:ident),+ $(,)?) => {
+        &[$(ParentDeathSignal {
+            name: stringify!($signal),
+            #[cfg(target_os = "linux")]
+            number: Signal::$signal,
+        }),+]
     };
 }
 
-macro_rules! generate_name_array {
-    ($(($name:ident, $sig:ident)),+ $(,)?) => {
-        [$(stringify!($name)),+]
-    };
-}
+const PARENT_DEATH_SIGNALS: &[ParentDeathSignal] = parent_death_signals![
+    SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGKILL, SIGUSR1, SIGSEGV,
+    SIGUSR2, SIGPIPE, SIGALRM, SIGTERM, SIGCONT, SIGWINCH, SIGTSTP, SIGTTIN, SIGTTOU,
+];
 
-const SIGNAL_NAMES_ARRAY: [&str; 20] = signal_spec!(generate_name_array);
-
-pub(crate) const SIGNAL_NAMES: &[&str] = &SIGNAL_NAMES_ARRAY;
-
-pub(crate) fn canonical_signal_name(raw: &str) -> Option<&'static str> {
-    let trimmed = raw.trim();
-    let candidate = match trimmed.get(..3) {
-        Some(prefix) if prefix.eq_ignore_ascii_case("SIG") => &trimmed[3..],
-        _ if !trimmed.is_empty() => trimmed,
-        _ => return None,
-    };
-
-    SIGNAL_NAMES
-        .iter()
-        .copied()
-        .find(|name| name.eq_ignore_ascii_case(candidate))
-}
-
-cfg_select! {
-    target_os = "linux" => {
-        use crate::platform::unix::sys::Signal;
-
-        macro_rules! generate_signal_array {
-            ($(($name:ident, $sig:ident)),+ $(,)?) => {
-                [$(Signal::$sig),+]
-            };
-        }
-
-        const SIGNAL_VALUES_ARRAY: [Signal; 20] = signal_spec!(generate_signal_array);
-
-        pub(crate) fn signal_from_canonical(name: &str) -> Option<Signal> {
-            SIGNAL_NAMES
-                .iter()
-                .position(|candidate| *candidate == name)
-                .map(|idx| SIGNAL_VALUES_ARRAY[idx])
-        }
-
-        pub(crate) fn signal_from_str(raw: &str) -> Option<Signal> {
-            canonical_signal_name(raw).and_then(signal_from_canonical)
-        }
+pub(crate) fn strip_sig_prefix(raw: &str) -> &str {
+    match raw.split_at_checked(3) {
+        Some((prefix, name)) if prefix.eq_ignore_ascii_case("SIG") => name,
+        _ => raw,
     }
-    _ => {}
+}
+
+impl ParentDeathSignal {
+    fn short_name(&self) -> &'static str {
+        &self.name[3..]
+    }
+
+    pub(crate) fn parse(raw: &str) -> Result<&'static Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("signal name cannot be empty".into());
+        }
+        let name = strip_sig_prefix(trimmed);
+        PARENT_DEATH_SIGNALS
+            .iter()
+            .find(|signal| signal.short_name().eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                let supported = PARENT_DEATH_SIGNALS
+                    .iter()
+                    .map(Self::short_name)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "invalid signal '{}'; supported values: {supported}",
+                    escape_str(raw)
+                )
+            })
+    }
 }

@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+mod common;
+
 use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
@@ -14,107 +16,33 @@ fn tino_bin() -> &'static str {
 
 fn tino_command() -> Command {
     let mut command = Command::new(tino_bin());
+    for name in common::RUNTIME_ENV {
+        command.env_remove(name);
+    }
     command.arg("--no-config");
     command
 }
 
-fn landlock_available() -> bool {
+const EXEC_POLICY: &[&str] = &["--exec-allow", "/bin/true"];
+
+fn landlock_available(policy: &[&str]) -> bool {
     let output = tino_command()
-        .args([
-            "--restrict-warn-only",
-            "--write-preset",
-            "tmp",
-            "--",
-            "sh",
-            "-c",
-            "exit 0",
-        ])
+        .arg("--restrict-warn-only")
+        .args(policy)
+        .args(["--", "/bin/true"])
         .output()
-        .expect("failed to probe landlock availability");
-
-    let require = std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_some();
-    if !output.status.success() {
-        if require {
-            panic!(
-                "landlock probe failed with exit status {:?}\nstderr:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        return false;
-    }
+        .expect("run Landlock probe");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "Landlock probe {policy:?} exited with {}: {stderr}",
+        output.status
+    );
     let available = !stderr.contains("access restriction unavailable; continuing");
-    if require && !available {
-        panic!("landlock required for CI but unavailable:\n{stderr}");
-    }
-    available
-}
-
-fn landlock_tcp_available() -> bool {
-    let output = tino_command()
-        .args([
-            "--restrict-warn-only",
-            "--bind-tcp-allow",
-            "1",
-            "--",
-            "sh",
-            "-c",
-            "exit 0",
-        ])
-        .output()
-        .expect("failed to probe landlock TCP availability");
-
-    let require = std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_some();
-    if !output.status.success() {
-        if require {
-            panic!(
-                "landlock TCP probe failed with exit status {:?}\nstderr:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        return false;
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let available = !stderr.contains("access restriction unavailable; continuing");
-    if require && !available {
-        panic!("landlock TCP restrictions required for CI but unavailable:\n{stderr}");
-    }
-    available
-}
-
-fn landlock_scope_available() -> bool {
-    let output = tino_command()
-        .args([
-            "--restrict-warn-only",
-            "--scope-signals",
-            "--",
-            "sh",
-            "-c",
-            "exit 0",
-        ])
-        .output()
-        .expect("failed to probe landlock scope availability");
-
-    let require = std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_some();
-    if !output.status.success() {
-        if require {
-            panic!(
-                "landlock scope probe failed with exit status {:?}\nstderr:\n{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        return false;
-    }
-
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let available = !stderr.contains("access restriction unavailable; continuing");
-    if require && !available {
-        panic!("landlock IPC scopes required for CI but unavailable:\n{stderr}");
-    }
+    assert!(
+        available || std::env::var_os("TINO_TEST_REQUIRE_LANDLOCK").is_none(),
+        "Landlock policy {policy:?} unavailable: {stderr}"
+    );
     available
 }
 
@@ -125,24 +53,6 @@ fn python3_available() -> bool {
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
-}
-
-fn next_free_tcp_port() -> u16 {
-    TcpListener::bind(("127.0.0.1", 0))
-        .expect("bind ephemeral TCP port")
-        .local_addr()
-        .expect("query listener address")
-        .port()
-}
-
-fn distinct_free_tcp_ports() -> (u16, u16) {
-    let first = next_free_tcp_port();
-    loop {
-        let second = next_free_tcp_port();
-        if second != first {
-            return (first, second);
-        }
-    }
 }
 
 fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
@@ -181,8 +91,122 @@ fn without_capabilities(command: &mut Command) {
 }
 
 #[test]
+fn exec_diagnostic_reaches_datagram_stderr_in_one_record() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixDatagram;
+
+    let (reader, writer) = UnixDatagram::pair().unwrap();
+    reader.set_nonblocking(true).unwrap();
+    let missing = format!("/tino-missing-{}", "\t".repeat(100));
+    let status = tino_command()
+        .arg("--")
+        .arg(&missing)
+        .stderr(OwnedFd::from(writer))
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(127));
+    let expected = format!(
+        "tino: execvp failed for '{}': file not found; check the path or PATH lookup (errno 2)\n",
+        missing.as_bytes().escape_ascii()
+    );
+    let mut record = [0; 1024];
+    let len = reader.recv(&mut record).unwrap();
+    assert_eq!(&record[..len], expected.as_bytes());
+}
+
+#[test]
+fn long_exec_diagnostic_reaches_regular_stderr_in_full() {
+    let program = format!("/{}", "\x1b".repeat(80_000));
+    let path = unique_temp_dir("tino-long-stderr");
+    let status = tino_command()
+        .arg("--")
+        .arg(&program)
+        .stderr(std::fs::File::create_new(&path).unwrap())
+        .status()
+        .unwrap();
+    let diagnostic = std::fs::read_to_string(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
+    assert_eq!(status.code(), Some(126));
+    assert_eq!(diagnostic.matches(r"\x1b").count(), program.len() - 1);
+    assert!(diagnostic.ends_with(&format!("(errno {})\n", libc::ENAMETOOLONG)));
+}
+
+#[test]
+fn diagnostics_reach_inherited_pipe_without_reopen_permission() {
+    use std::os::fd::AsRawFd;
+
+    let missing = format!("/tino-missing-{}\t", "a".repeat(150));
+    for (args, code, tail) in [
+        (vec!["--", missing.as_str()], 127, "(errno 2)\n"),
+        (
+            vec!["--unknown-option"],
+            2,
+            "Try 'tino --help' for more information.\n",
+        ),
+        (vec![], 2, "Try 'tino --help' for usage.\n"),
+    ] {
+        let expected = tino_command()
+            .args(&args)
+            .output()
+            .expect("capture diagnostic");
+        assert_eq!(expected.status.code(), Some(code));
+        assert!(expected.stderr.ends_with(tail.as_bytes()));
+        let (reader, writer) = std::io::pipe().expect("create stderr pipe");
+        assert_eq!(unsafe { libc::fchmod(writer.as_raw_fd(), 0o400) }, 0);
+        // One pipe buffer has room for an earlier message and the diagnostic.
+        assert!(unsafe { libc::fcntl(writer.as_raw_fd(), libc::F_SETPIPE_SZ, 1) } > 0);
+        let prefix = "previous log\n";
+        let iov = libc::iovec {
+            iov_base: prefix.as_ptr().cast_mut().cast(),
+            iov_len: prefix.len(),
+        };
+        let written = unsafe {
+            libc::syscall(
+                libc::SYS_pwritev2,
+                writer.as_raw_fd(),
+                &raw const iov,
+                1,
+                -1 as libc::c_long,
+                -1 as libc::c_long,
+                libc::RWF_NOWAIT,
+            )
+        };
+        let prefix = if written < 0 {
+            // Older kernels and restricted runtimes can only relay into an empty slot.
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            assert!(
+                matches!(
+                    errno,
+                    Some(libc::EOPNOTSUPP | libc::ENOSYS | libc::EPERM | libc::EACCES)
+                ),
+                "{errno:?}"
+            );
+            ""
+        } else {
+            assert_eq!(written as usize, prefix.len());
+            prefix
+        };
+        let status = {
+            let mut command = tino_command();
+            without_capabilities(&mut command);
+            command
+                .args(args)
+                .stderr(writer)
+                .status()
+                .expect("run tino")
+        };
+        assert_eq!(status.code(), Some(code));
+        let stderr = std::io::read_to_string(reader).expect("read diagnostic");
+        assert_eq!(
+            stderr,
+            format!("{prefix}{}", String::from_utf8(expected.stderr).unwrap())
+        );
+    }
+}
+
+#[test]
 fn landlock_exec_allows_execute_only_main_by_absolute_path_and_path_search() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-execute-only-main");
@@ -210,8 +234,100 @@ fn landlock_exec_allows_execute_only_main_by_absolute_path_and_path_search() {
 }
 
 #[test]
+fn exec_path_search_keeps_commands_when_the_access_probe_is_unavailable() {
+    use std::os::unix::process::CommandExt;
+
+    let root = unique_temp_dir("tino-filtered-exec-access");
+    std::fs::create_dir(&root).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
+    let denied = root.join("pwd");
+    let interpreter = root.join("interpreter");
+    write_exec_fixture(&interpreter, "#!/bin/sh\n");
+    std::fs::write(&denied, format!("#!{}\n", interpreter.display())).unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o641)).unwrap();
+
+    let mut command = tino_command();
+    command
+        .env(
+            "PATH",
+            std::env::join_paths([root.as_path(), "/bin".as_ref()]).unwrap(),
+        )
+        .args(["--explain", "--exec-allow", "true", "--", "pwd"]);
+    without_capabilities(&mut command);
+    // Model a container which permits exec but filters the optional access probe.
+    unsafe {
+        command.pre_exec(|| {
+            let op = |code, jf, k| libc::sock_filter { code, jt: 0, jf, k };
+            let mut filter = [
+                op(0x20, 0, 0), // load syscall number
+                op(0x15, 1, libc::SYS_faccessat2 as u32),
+                op(0x06, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+                op(0x06, 0, libc::SECCOMP_RET_ALLOW),
+            ];
+            let program = libc::sock_fprog {
+                len: filter.len() as u16,
+                filter: filter.as_mut_ptr(),
+            };
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
+                || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let paths = stdout
+        .lines()
+        .find(|line| line.starts_with("exec_restrict.allow_paths:"))
+        .unwrap();
+    for program in ["/bin/true", "/bin/pwd"] {
+        let canonical = std::fs::canonicalize(program).unwrap();
+        assert!(paths.contains(canonical.to_str().unwrap()), "{paths}");
+    }
+    assert!(!paths.contains(denied.to_str().unwrap()), "{paths}");
+    assert!(!paths.contains(interpreter.to_str().unwrap()), "{paths}");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_skips_main_without_effective_execute_permission() {
+    let root = unique_temp_dir("tino-main-exec-access");
+    std::fs::create_dir(&root).unwrap();
+    let program = root.join("probe");
+    std::fs::write(&program, "#!/bin/sh\n").unwrap();
+    // The current user owns the file. Only other users have execute permission.
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o641)).unwrap();
+
+    let allow_paths = |main: Option<&std::ffi::OsStr>| {
+        let mut command = tino_command();
+        command
+            .env("PATH", &root)
+            .args(["--explain", "--exec-allow", "/bin/true", "--"])
+            .args(main);
+        without_capabilities(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .find(|line| line.starts_with("exec_restrict.allow_paths:"))
+            .unwrap()
+            .to_owned()
+    };
+    // Neither the inaccessible script nor its shell should add a grant.
+    let explicit_only = allow_paths(None);
+    for main in [std::ffi::OsStr::new("probe"), program.as_os_str()] {
+        assert_eq!(allow_paths(Some(main)), explicit_only, "{main:?}");
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn landlock_exec_preserves_inaccessible_main_command_status() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-inaccessible-main");
@@ -261,7 +377,7 @@ fn landlock_exec_preserves_inaccessible_main_command_status() {
 fn landlock_exec_preserves_unexecutable_main_errors() {
     use std::os::unix::ffi::OsStrExt;
 
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-unexecutable-main");
@@ -345,7 +461,7 @@ fn native_elf_interpreter_range(bytes: &[u8]) -> Option<std::ops::Range<usize>> 
 
 #[test]
 fn landlock_exec_uses_first_elf_interpreter() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let original = std::fs::read("/bin/true").expect("read native executable");
@@ -408,7 +524,7 @@ fn landlock_exec_uses_first_elf_interpreter() {
 fn landlock_exec_allows_file_backed_load_segments_past_eof() {
     use std::os::unix::ffi::OsStrExt;
 
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let original = std::fs::read("/bin/true").expect("read native executable");
@@ -495,7 +611,7 @@ fn landlock_exec_allows_file_backed_load_segments_past_eof() {
 fn landlock_exec_resolves_bare_elf_loader_from_cwd() {
     use std::os::unix::ffi::OsStrExt;
 
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let original = std::fs::read("/bin/true").expect("read native executable");
@@ -548,7 +664,7 @@ fn landlock_exec_resolves_bare_elf_loader_from_cwd() {
 
 #[test]
 fn landlock_exec_ignores_unreadable_later_path_candidate() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-unreadable-path");
@@ -632,7 +748,7 @@ fn recursive_env_split_string_reports_an_error_without_aborting() {
 
 #[test]
 fn landlock_exec_matches_kernel_shebang_argument_truncation() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-shebang-truncate");
@@ -671,7 +787,7 @@ fn landlock_exec_matches_kernel_shebang_argument_truncation() {
 
 #[test]
 fn landlock_exec_preserves_env_dash_after_option_terminator() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-env-dash");
@@ -705,7 +821,7 @@ fn landlock_exec_preserves_env_dash_after_option_terminator() {
 
 #[test]
 fn landlock_exec_preserves_env_single_quote_escapes() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-env-quote");
@@ -743,7 +859,7 @@ fn landlock_exec_preserves_env_single_quote_escapes() {
 
 #[test]
 fn landlock_exec_discovers_env_aliases_with_nested_context() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-env-alias");
@@ -797,7 +913,7 @@ fn landlock_exec_discovers_env_aliases_with_nested_context() {
 
 #[test]
 fn landlock_exec_does_not_treat_an_unrelated_env_name_as_env() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-unrelated-env");
@@ -842,7 +958,7 @@ fn native_env_fixture_status(command: &mut Command) -> ExitStatus {
 
 #[test]
 fn landlock_exec_preserves_env_chdir_behavior() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-env-final-chdir");
@@ -889,13 +1005,34 @@ fn landlock_exec_preserves_env_chdir_behavior() {
             }
         }
     }
+    let runner = work.join("runner").canonicalize().unwrap();
+    for (dir, allowed) in [("work", true), ("blocked", false)] {
+        write_exec_fixture(
+            &main,
+            &format!("#!/usr/bin/env -S -C {dir} {}\n", runner.display()),
+        );
+        let mut command = tino_command();
+        command
+            .current_dir(&root)
+            .args(["--explain", "--exec-allow"])
+            .arg(&main);
+        without_capabilities(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let paths = stdout
+            .lines()
+            .find(|line| line.starts_with("exec_restrict.allow_paths:"))
+            .unwrap();
+        assert_eq!(paths.contains(runner.to_str().unwrap()), allowed, "{paths}");
+    }
     std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
 fn landlock_exec_preserves_env_unset_behavior() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-env-ignore-unset");
@@ -954,7 +1091,7 @@ fn landlock_exec_preserves_env_unset_behavior() {
 
 #[test]
 fn landlock_exec_preserves_env_signal_disposition_behavior() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-env-signal-options");
@@ -976,6 +1113,8 @@ fn landlock_exec_preserves_env_signal_disposition_behavior() {
         "--ignore-signal=0 --default-signal".to_owned(),
         "--ignore-signal=NOPE --default-signal".to_owned(),
         "--ignore-signal=999 --default-signal".to_owned(),
+        "--block-signal=34".to_owned(),
+        "--ignore-signal=RTMIN+30".to_owned(),
     ];
     for signal in [32, 33] {
         cases.extend([
@@ -1014,7 +1153,7 @@ fn landlock_exec_preserves_env_signal_disposition_behavior() {
 
 #[test]
 fn landlock_exec_preserves_nested_env_context() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-nested-env");
@@ -1085,7 +1224,7 @@ fn landlock_exec_preserves_nested_env_context() {
 
 #[test]
 fn landlock_exec_discovers_shared_interpreter_in_each_environment() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-shared-interpreter");
@@ -1131,7 +1270,7 @@ fn landlock_exec_discovers_shared_interpreter_in_each_environment() {
 
 #[test]
 fn broken_stderr_logging_does_not_signal_the_managed_command() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     for verbose in [false, true] {
@@ -1196,6 +1335,239 @@ fn externally_sent_sigpipe_is_forwarded() {
         let _ = child.wait();
     }
     assert_eq!(status.and_then(|s| s.code()), Some(128 + libc::SIGPIPE));
+}
+
+#[test]
+fn default_shutdown_gives_the_service_time_to_finish() {
+    if !python3_available() {
+        return;
+    }
+    let service = r#"import os, signal, time
+signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGUSR1})
+def forwarded(sig):
+    os.kill(os.getppid(), sig)
+    if signal.sigtimedwait({sig}, 3) is None:
+        os._exit(1)
+forwarded(signal.SIGTERM)
+time.sleep(0.8)
+forwarded(signal.SIGTERM)
+forwarded(signal.SIGUSR1)
+os._exit(42)
+"#;
+    let status = tino_command()
+        .args(["--", "python3", "-c", service])
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(42));
+}
+
+fn assert_group_shutdown_waits_for_workers(options: &[&str], stop: &str) {
+    if !python3_available() {
+        return;
+    }
+    let service = r#"import os, signal, sys, time
+sig = signal.Signals[sys.argv[1]]
+stop = {sig}
+signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+supervisor, main = os.getppid(), os.getpid()
+if os.fork():
+    os.kill(supervisor, sig)
+    os._exit(42 if signal.sigtimedwait(stop, 3) else 1)
+
+signal.alarm(5)
+signal.sigwait(stop)
+# Wait for the supervisor to reap the main process before sending another stop.
+while os.path.exists(f"/proc/{main}"):
+    time.sleep(0.005)
+if os.getppid() == supervisor:
+    os.kill(supervisor, sig)
+    signal.sigwait(stop)
+    time.sleep(0.8)
+    if os.getppid() == supervisor:
+        print("worker finished", flush=True)
+"#;
+    let output = tino_command()
+        .args(["-s", "-g"])
+        .args(options)
+        .args(["--", "python3", "-c", service, stop])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42), "{output:?}");
+    assert_eq!(output.stdout, b"worker finished\n");
+}
+
+#[test]
+fn default_group_shutdown_waits_for_workers_after_main_exit() {
+    assert_group_shutdown_waits_for_workers(&[], "SIGQUIT");
+}
+
+#[test]
+fn custom_stop_signal_waits_for_workers_after_main_exit() {
+    assert_group_shutdown_waits_for_workers(&["--stop-signal=usr1"], "SIGUSR1");
+}
+
+#[test]
+fn custom_stop_signal_starts_local_escalation() {
+    if !python3_available() {
+        return;
+    }
+    let service = r#"import os, signal, sys
+sig = int(sys.argv[1])
+marker = signal.SIGUSR2
+signal.pthread_sigmask(signal.SIG_BLOCK, {sig, marker})
+os.kill(os.getppid(), sig)
+if signal.sigtimedwait({sig}, 2):
+    os.kill(os.getppid(), marker)
+    os._exit(42 if signal.sigtimedwait({marker}, 2) else 1)
+os._exit(1)
+"#;
+    let realtime = libc::SIGRTMAX().to_string();
+    for (opt, sig, code) in [
+        (None, libc::SIGUSR1, 42),
+        (Some("USR1"), libc::SIGUSR1, 137),
+        (Some(&realtime), libc::SIGRTMAX(), 137),
+        (Some("USR1"), libc::SIGTERM, 137),
+    ] {
+        let mut cmd = tino_command();
+        if let Some(stop) = opt {
+            cmd.args(["--stop-signal", stop]);
+        }
+        let output = cmd
+            .args(["-t0", "--", "python3", "-c", service, &sig.to_string()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{opt:?} {sig}: {output:?}"
+        );
+    }
+}
+
+#[test]
+fn timed_group_shutdown_preserves_the_original_signal() {
+    if !python3_available() {
+        return;
+    }
+    let service = r#"import os, signal, sys, time
+stop = signal.Signals[sys.argv[1]]
+marker = signal.SIGUSR2
+signal.pthread_sigmask(signal.SIG_BLOCK, {stop, signal.SIGTERM, marker})
+supervisor, main = os.getppid(), os.getpid()
+reader, writer = os.pipe()
+if os.fork():
+    os.close(writer)
+    os.kill(supervisor, stop)
+    if not signal.sigtimedwait({stop}, 3):
+        os._exit(1)
+    os._exit(42 if os.read(reader, 1) else 1)
+
+os.close(reader)
+signal.alarm(5)
+signal.sigwait({stop})
+os.write(writer, b'1')
+# A marker forwarded after the main process was reaped synchronizes with cleanup.
+while os.path.exists(f'/proc/{main}'):
+    time.sleep(0.005)
+os.kill(supervisor, marker)
+signal.sigwait({marker})
+if signal.sigtimedwait({stop, signal.SIGTERM}, 0) is None:
+    print('worker finished', flush=True)
+"#;
+    for stop in ["SIGTERM", "SIGQUIT"] {
+        let output = tino_command()
+            .args([
+                "-s",
+                "-g",
+                "--grace-ms=5000",
+                "--",
+                "python3",
+                "-c",
+                service,
+                stop,
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42), "{stop}: {output:?}");
+        assert_eq!(output.stdout, b"worker finished\n", "{stop}");
+    }
+}
+
+#[test]
+fn queued_stop_signal_takes_precedence_over_natural_group_cleanup() {
+    if !python3_available() {
+        return;
+    }
+    let service = r#"import os, signal, time
+supervisor, main = os.getppid(), os.getpid()
+# Python and tino may use different libcs with different SIGRTMIN values.
+traffic, stop = signal.SIGRTMAX - 1, signal.SIGRTMAX
+signal.pthread_sigmask(signal.SIG_BLOCK, {traffic, stop, signal.SIGTERM})
+def wait_state(pid, wanted):
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        with open(f'/proc/{pid}/stat') as stat:
+            if stat.read().rsplit(')', 1)[1].split()[0] == wanted:
+                return
+        time.sleep(0.001)
+    raise TimeoutError(f'process {pid} never reached {wanted}')
+if os.fork():
+    # Queue the stop while the main service is alive, then exit before tino can run.
+    os.kill(supervisor, signal.SIGSTOP)
+    wait_state(supervisor, 'T')
+    for _ in range(96):
+        os.kill(supervisor, traffic)
+    os.kill(supervisor, stop)
+    os._exit(42)
+
+try:
+    wait_state(main, 'Z')
+finally:
+    os.kill(supervisor, signal.SIGCONT)
+signal.alarm(3)
+print(signal.sigwait({stop, signal.SIGTERM}).name, flush=True)
+# Concurrent tests share the per-user real-time signal queue limit. One
+# forwarded marker suffices to prove the ordinary signal filter was restored.
+signal.sigwait({traffic})
+print('traffic delivered', flush=True)
+"#;
+    for grace in [&[][..], &["--grace-ms=2000"]] {
+        let output = tino_command()
+            .args(grace)
+            .args(["-s", "-g", "--stop-signal"])
+            .arg(libc::SIGRTMAX().to_string())
+            .args(["--", "python3", "-c", service])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(42), "{output:?}");
+        assert_eq!(
+            output.stdout, b"SIGRTMAX\ntraffic delivered\n",
+            "{output:?}"
+        );
+    }
+}
+
+#[test]
+fn natural_main_exit_bounds_default_group_cleanup() {
+    if !python3_available() {
+        return;
+    }
+    let service = r#"import os, signal, time
+stop = {signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+if os.fork():
+    os._exit(42)
+if signal.sigtimedwait(stop, 3):
+    print("stopping", flush=True)
+time.sleep(3)
+print("outlived cleanup", flush=True)
+"#;
+    let output = tino_command()
+        .args(["-s", "-g", "--", "python3", "-c", service])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(42));
+    assert_eq!(output.stdout, b"stopping\n");
 }
 
 #[test]
@@ -1280,6 +1652,7 @@ if pid == 0:
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGUSR1, lambda *_: os._exit(0))
+    signal.signal(signal.SIGUSR2, signal.SIG_IGN)
     os.write(writer, b'1')
     os.close(writer)
     while True: time.sleep(1)
@@ -1290,12 +1663,13 @@ else:
     print(pid, flush=True)
     os._exit(37)
 "#;
-    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1] {
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGUSR1, libc::SIGUSR2] {
         let mut child = tino_command()
             .args([
                 "-s",
                 "-g",
                 "-v",
+                "--stop-signal=USR2",
                 "--grace-ms",
                 "5000",
                 "--",
@@ -1339,19 +1713,29 @@ else:
     }
 }
 
-fn assert_execvp_shell_fallback_reached(label: &str, status: ExitStatus, stderr: &str) {
-    assert!(
-        !status.success(),
-        "{label} fixture should fail after reaching the shell fallback"
-    );
-    assert!(
-        !stderr.contains("ERROR tino:"),
-        "{label} must not fail in the parent process:\n{stderr}"
-    );
-    assert!(
-        !stderr.contains("tino: execvp failed"),
-        "Landlock must not deny the {label} shell fallback:\n{stderr}"
-    );
+fn assert_landlock_preserves_exec_format(path: &std::path::Path, shell_stdout: Option<&[u8]>) {
+    let native = tino_command().arg("--").arg(path).output().unwrap();
+    let restricted = tino_command()
+        .arg("--exec-allow")
+        .arg(path)
+        .arg("--")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert_eq!(restricted, native, "exec result for {path:?}");
+    if cfg!(target_env = "musl") {
+        // musl returns ENOEXEC directly for these files.
+        assert_eq!(native.status.code(), Some(126));
+        assert!(
+            String::from_utf8_lossy(&native.stderr).contains("not a recognized executable format")
+        );
+    } else if let Some(stdout) = shell_stdout {
+        assert!(native.status.success());
+        assert_eq!(native.stdout, stdout);
+    } else {
+        assert!(!native.status.success());
+        assert!(!String::from_utf8_lossy(&native.stderr).contains("tino: execvp failed"));
+    }
 }
 
 fn unique_abstract_socket_name(prefix: &str) -> String {
@@ -1432,29 +1816,6 @@ fn parse_pid_and_pgid(output: &[u8]) -> (libc::pid_t, libc::pid_t) {
         "unexpected extra process group fields: {stdout:?}"
     );
     (pid, pgid)
-}
-
-fn spawn_pty_holder() -> Option<(std::process::Child, PathBuf)> {
-    if !python3_available() {
-        return None;
-    }
-
-    let script = r#"import os, pty, time
-master, slave = pty.openpty()
-print(os.ttyname(slave), flush=True)
-time.sleep(5)
-"#;
-    let mut child = Command::new("python3")
-        .args(["-u", "-c", script])
-        .stdout(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let mut stdout = BufReader::new(child.stdout.take()?);
-    let mut line = String::new();
-    stdout.read_line(&mut line).ok()?;
-    drop(stdout);
-    let path = PathBuf::from(line.trim());
-    Some((child, path))
 }
 
 #[test]
@@ -1559,23 +1920,33 @@ fn diagnostic_file_size_limits_preserve_exit_status() {
 }
 
 #[test]
-fn help_and_version_report_stdout_write_failures() {
-    for flag in ["-h", "--help", "-V", "--version"] {
+fn control_commands_report_stdout_write_failures() {
+    for args in [
+        &["-h"][..],
+        &["--help"],
+        &["-V"],
+        &["--version"],
+        &["--explain"],
+        &["--print-config", "--subreaper"],
+    ] {
         let full = std::fs::OpenOptions::new()
             .write(true)
             .open("/dev/full")
             .expect("open full output device");
-        let output = tino_command()
-            .arg(flag)
-            .stdout(full)
-            .output()
-            .expect("run help/version with failing stdout");
-        assert_eq!(output.status.code(), Some(1), "{flag}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("write stdout"),
-            "{flag}: {:?}",
-            output.stderr
-        );
+        let read_only = std::fs::File::open("/dev/null").unwrap();
+        for stdout in [full, read_only] {
+            let output = tino_command()
+                .args(args)
+                .stdout(stdout)
+                .output()
+                .expect("run control command with failing stdout");
+            assert_eq!(output.status.code(), Some(1), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("write stdout"),
+                "{args:?}: {:?}",
+                output.stderr
+            );
+        }
     }
 }
 
@@ -1735,6 +2106,10 @@ fn check_config_rejects_inline_runtime_options() {
             "--write-allow",
         ),
         (vec!["--check-config", "--grace-ms", "500"], "--grace-ms"),
+        (
+            vec!["--check-config", "--stop-signal", "USR1"],
+            "--stop-signal",
+        ),
         (vec!["-t500", "--check-config"], "--grace-ms"),
         (vec!["--check-config", "--verbose"], "--verbose"),
         (
@@ -1794,7 +2169,8 @@ fn landlock_path_options_reject_surrounding_whitespace() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--write-allow PATH cannot have surrounding whitespace"),
+        stderr.contains("--write-allow DIR cannot have surrounding whitespace")
+            && stderr.contains("' /tmp'"),
         "unexpected stderr:\n{stderr}"
     );
 }
@@ -1812,7 +2188,7 @@ fn landlock_path_options_reject_relative_allow_paths() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--write-allow PATH must be absolute"),
+        stderr.contains("--write-allow DIR must be absolute") && stderr.contains("'logs'"),
         "unexpected stderr:\n{stderr}"
     );
 }
@@ -1910,52 +2286,66 @@ fn pgroup_kill_starts_child_as_process_group_leader() {
 
 #[test]
 fn invalid_env_default_warning_escapes_control_bytes() {
-    let output = tino_command()
-        .args(["--", "/bin/true"])
-        .env("TINO_SUBREAPER", "\u{1b}[31m")
-        .env_remove("TINI_SUBREAPER")
-        .output()
-        .expect("failed to run tino invalid env default escaping test");
+    for args in [&["--", "/bin/true"][..], &["--explain"][..]] {
+        let output = tino_command()
+            .args(args)
+            .env("TINO_SUBREAPER", "\u{1b}[31m")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let bytes = if args == ["--explain"] {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
+        let diagnostic = String::from_utf8_lossy(bytes);
+        assert!(
+            diagnostic.contains(r"invalid boolean env default: TINO_SUBREAPER=\x1b[31m"),
+            "{diagnostic}"
+        );
+        assert!(!diagnostic.contains('\u{1b}'), "{diagnostic}");
+    }
+}
 
-    assert!(
-        output.status.success(),
-        "invalid env default should not prevent child execution: {:?}",
-        output.status.code()
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(r"\x1b"),
-        "expected escaped control byte in invalid env default warning\n{stderr}"
-    );
-    assert!(
-        !stderr.contains('\u{1b}'),
-        "invalid env default warning must not emit raw terminal control bytes\n{stderr}"
-    );
+#[test]
+fn explain_validates_verbosity_environment_range() {
+    for name in ["TINO_VERBOSITY", "TINI_VERBOSITY"] {
+        for (value, valid) in [("0", true), ("3", true), ("4", false), ("255", false)] {
+            let output = tino_command()
+                .env(name, value)
+                .arg("--explain")
+                .output()
+                .expect("explain environment verbosity");
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let expected = format!("verbosity: {}", if valid { value } else { "0" });
+            assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+            assert_eq!(
+                stdout.contains(&format!("invalid {name}=")),
+                !valid,
+                "{stdout}"
+            );
+        }
+    }
 }
 
 #[test]
 fn invalid_verbosity_warning_escapes_control_bytes() {
-    let output = tino_command()
-        .args(["--", "/bin/true"])
-        .env("TINO_VERBOSITY", "\u{1b}[31m")
-        .env_remove("TINI_VERBOSITY")
-        .output()
-        .expect("failed to run tino invalid verbosity escaping test");
-
-    assert!(
-        output.status.success(),
-        "invalid verbosity env default should not prevent child execution: {:?}",
-        output.status.code()
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(r"\x1b"),
-        "expected escaped control byte in invalid verbosity warning\n{stderr}"
-    );
-    assert!(
-        !stderr.contains('\u{1b}'),
-        "invalid verbosity warning must not emit raw terminal control bytes\n{stderr}"
-    );
+    for name in ["TINO_VERBOSITY", "TINI_VERBOSITY"] {
+        let output = tino_command()
+            .env_clear()
+            .env(name, "\u{1b}[31m")
+            .args(["--", "/bin/true"])
+            .output()
+            .expect("run tino with invalid verbosity");
+        assert!(output.status.success(), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(r"invalid {name}=\x1b[31m")),
+            "{stderr}"
+        );
+        assert!(!stderr.contains('\u{1b}'), "{stderr}");
+    }
 }
 
 #[test]
@@ -1980,16 +2370,20 @@ fn verbose_successful_command_reports_exit() {
 
 #[test]
 fn remap_exit_zeroes_expected_codes() {
-    let status = tino_command()
-        .args(["-e", "3", "--", "sh", "-c", "exit 3"])
-        .status()
-        .expect("failed to run tino remap test");
-
-    assert!(
-        status.success(),
-        "expected tino to map exit code 3 to success, got {:?}",
-        status.code()
-    );
+    for (code, script) in [
+        ("1", "exit 1"),
+        ("3", "exit 3"),
+        ("126", "exit 126"),
+        ("127", "exit 127"),
+        ("143", "kill -TERM $$"),
+    ] {
+        let output = tino_command()
+            .args(["-e", code, "--", "/bin/sh", "-c", script])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(0), "{script}: {output:?}");
+        assert!(output.stderr.is_empty(), "{script}: {output:?}");
+    }
 }
 
 #[test]
@@ -2078,48 +2472,57 @@ fn expand_env_reports_invalid_syntax() {
 }
 
 #[test]
-fn expand_env_error_does_not_leak_other_command_args() {
-    let secret = "tino-secret-argument-should-not-leak";
-    let output = tino_command()
-        .args(["--expand-env", "--", "/bin/echo", "${BAD:+value}", secret])
-        .output()
-        .expect("failed to run tino expand-env secret-leak test");
-
-    assert!(
-        !output.status.success(),
-        "expected unsupported expansion syntax to fail"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("unsupported braced environment expansion"),
-        "expected unsupported-expansion error\n{stderr}"
-    );
-    assert!(
-        !stderr.contains(secret),
-        "error context must not echo unrelated command arguments\n{stderr}"
-    );
+fn expand_env_limits_only_defaults_that_are_evaluated() {
+    for (depth, value, expected_code, expected_stdout) in [
+        (32, "", 0, "fallback\n"),
+        (33, "", 2, ""),
+        (33, "set", 0, "set\n"),
+    ] {
+        let expression = format!(
+            "{}fallback{}",
+            "${TINO_NESTED:-".repeat(depth),
+            "}".repeat(depth)
+        );
+        let output = tino_command()
+            .args(["--expand-env", "--", "/bin/echo"])
+            .arg(expression)
+            .env("TINO_NESTED", value)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_code), "{output:?}");
+        assert_eq!(output.stdout, expected_stdout.as_bytes());
+        if expected_code == 2 {
+            assert!(String::from_utf8_lossy(&output.stderr).contains("nesting exceeds 32 levels"));
+        }
+    }
 }
 
 #[test]
-fn expand_env_error_escapes_control_bytes() {
-    let output = tino_command()
-        .args(["--expand-env", "--", "/bin/echo", "${BAD:\u{1b}}"])
-        .output()
-        .expect("failed to run tino expand-env escaped-error test");
-
-    assert!(
-        !output.status.success(),
-        "expected unsupported expansion syntax to fail"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains(r"\u{1b}"),
-        "expected escaped control byte in expansion error\n{stderr}"
-    );
-    assert!(
-        !stderr.contains('\u{1b}'),
-        "expansion error must not emit raw terminal control bytes\n{stderr}"
-    );
+fn expand_env_points_to_the_invalid_argument_without_echoing_its_contents() {
+    for expression in [
+        "${TOKEN:=private-marker}",
+        "${private-marker!:-value}",
+        "${BAD:\u{1b}}",
+    ] {
+        let output = tino_command()
+            .args([
+                "--expand-env",
+                "--",
+                "/bin/echo",
+                "other-marker",
+                expression,
+            ])
+            .output()
+            .expect("run invalid expansion");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains("private-marker"), "{stderr}");
+        assert!(!stderr.contains("other-marker"), "{stderr}");
+        assert!(!stderr.contains('\u{1b}'), "{stderr}");
+        assert!(stderr.contains("argv[2]"), "{stderr}");
+        assert!(stderr.contains("${VAR:-default}"), "{stderr}");
+    }
 }
 
 #[test]
@@ -2166,22 +2569,15 @@ fn explain_rejects_empty_program_name() {
 
 #[test]
 fn print_config_emits_line_based_config_without_running_child() {
-    let root = unique_temp_dir("tino-print-config");
-    let allowed_dir = root.join("logs");
-    std::fs::create_dir_all(&allowed_dir).expect("create print-config write allow dir");
-    let allowed_dir = allowed_dir
-        .to_str()
-        .expect("print-config write allow dir must be UTF-8");
-
     let output = tino_command()
         .args([
-            "--no-config",
             "--print-config",
+            "--grace-ms=500",
             "--expand-env",
             "--write-preset",
             "runtime",
             "--write-allow",
-            allowed_dir,
+            "/tmp",
             "--bind-tcp-allow",
             "8900",
             "--exec-allow",
@@ -2198,15 +2594,13 @@ fn print_config_emits_line_based_config_without_running_child() {
     );
     assert_eq!(
         String::from_utf8_lossy(&output.stdout),
-        format!(
-            concat!(
-                "write-allow {}\n",
-                "write-preset runtime\n",
-                "bind-tcp-allow 8900\n",
-                "exec-allow /bin/sh\n",
-                "expand-env\n",
-            ),
-            allowed_dir
+        concat!(
+            "grace-ms 500\n",
+            "write-allow /tmp\n",
+            "write-preset runtime\n",
+            "bind-tcp-allow 8900\n",
+            "exec-allow /bin/sh\n",
+            "expand-env\n",
         )
     );
 }
@@ -2218,7 +2612,12 @@ fn print_config_rejects_missing_write_allow_path() {
         .to_str()
         .expect("missing print-config path must be UTF-8");
     let output = tino_command()
-        .args(["--print-config", "--write-allow", missing])
+        .args([
+            "--print-config",
+            "--restrict-warn-only",
+            "--write-allow",
+            missing,
+        ])
         .output()
         .expect("failed to run tino print-config missing-path test");
 
@@ -2228,8 +2627,36 @@ fn print_config_rejects_missing_write_allow_path() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("open write allow path"),
+        stderr.contains("--write-allow directory")
+            && stderr.contains(missing)
+            && stderr.contains(&std::io::Error::from_raw_os_error(libc::ENOENT).to_string()),
         "expected write-allow validation error\n{stderr}"
+    );
+}
+
+#[test]
+fn warn_only_rejects_a_file_as_a_writable_directory_before_launch() {
+    let output = tino_command()
+        .args([
+            "--restrict-warn-only",
+            "--write-allow",
+            "/bin/sh",
+            "--",
+            "/bin/echo",
+            "started",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--write-allow directory '/bin/sh'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(&std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string()),
+        "{stderr}"
     );
 }
 
@@ -2265,6 +2692,8 @@ fn explain_reports_effective_configuration() {
     let output = tino_command()
         .args([
             "--expand-env",
+            "--stop-signal=usr1",
+            "--parent-death-signal=TERM",
             "--write-restrict",
             "--write-allow",
             allowed_dir.to_str().expect("allowed dir utf-8"),
@@ -2274,7 +2703,9 @@ fn explain_reports_effective_configuration() {
             "-port=${SERVICE_PORT:-8900}",
         ])
         .env_remove("SERVICE_PORT")
-        .env("TINI_SUBREAPER", "1")
+        .env("TINO_SUBREAPER", "1")
+        .env("TINO_KILL_PROCESS_GROUP", "1")
+        .env("TINO_VERBOSITY", "2")
         .output()
         .expect("failed to run tino explain test");
 
@@ -2286,6 +2717,12 @@ fn explain_reports_effective_configuration() {
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.lines().any(|line| line == "grace_ms: external"));
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "additional_stop_signal: SIGUSR1")
+    );
     assert!(
         stdout.contains("mode: explain"),
         "missing explain header\n{stdout}"
@@ -2294,10 +2731,17 @@ fn explain_reports_effective_configuration() {
         stdout.contains("subreaper: true"),
         "missing effective subreaper\n{stdout}"
     );
-    assert!(
-        stdout.contains("subreaper.source: env:TINI_SUBREAPER"),
-        "missing subreaper source\n{stdout}"
-    );
+    for expected in [
+        "subreaper.source: env:TINO_SUBREAPER",
+        "pgroup_kill: true",
+        "pgroup_kill.source: env:TINO_KILL_PROCESS_GROUP",
+        "verbosity: 2",
+        "verbosity.source: env:TINO_VERBOSITY",
+        "parent_death_signal: SIGTERM",
+    ] {
+        assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+    }
+    assert!(!stdout.contains("pdeath:"), "{stdout}");
     assert!(
         stdout.contains(r#"command.effective: ["/bin/echo", "-port=8900"]"#),
         "missing effective command\n{stdout}"
@@ -2311,8 +2755,10 @@ fn explain_reports_effective_configuration() {
         "missing preset list\n{stdout}"
     );
     assert!(
-        stdout.contains("write_restrict.dev_writable: true"),
-        "missing write restriction /dev behavior\n{stdout}"
+        stdout
+            .lines()
+            .any(|line| line == "write_restrict.auto_allow_dev: true"),
+        "{stdout}"
     );
     assert!(
         stdout.contains(&canonical_allowed.display().to_string()),
@@ -2323,36 +2769,55 @@ fn explain_reports_effective_configuration() {
 }
 
 #[test]
-fn explain_reports_native_env_defaults_before_tini_compatibility_defaults() {
+fn explain_reports_tini_environment_defaults() {
     let output = tino_command()
-        .args(["--explain", "--", "/bin/true"])
-        .env("TINO_SUBREAPER", "1")
-        .env("TINI_SUBREAPER", "0")
-        .env("TINO_VERBOSITY", "2")
+        .arg("--explain")
+        .env_clear()
+        .env("TINI_SUBREAPER", "")
+        .env("TINI_KILL_PROCESS_GROUP", "0")
         .env("TINI_VERBOSITY", "3")
         .output()
-        .expect("failed to run tino native env explain test");
+        .expect("run tino with only tini variables");
 
-    assert!(
-        output.status.success(),
-        "native env explain scenario failed: {:?}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
+    assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains("subreaper.source: env:TINO_SUBREAPER"),
-        "missing native subreaper source\n{stdout}"
-    );
-    assert!(
-        stdout.contains("verbosity: 2"),
-        "missing native verbosity value\n{stdout}"
-    );
-    assert!(
-        stdout.contains("verbosity.source: env:TINO_VERBOSITY"),
-        "missing native verbosity source\n{stdout}"
-    );
+    for expected in [
+        "subreaper: true",
+        "subreaper.source: env:TINI_SUBREAPER",
+        "pgroup_kill: true",
+        "pgroup_kill.source: env:TINI_KILL_PROCESS_GROUP",
+        "verbosity: 3",
+        "verbosity.source: env:TINI_VERBOSITY",
+    ] {
+        assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+    }
+}
+
+#[test]
+fn explain_prefers_tino_environment_per_setting() {
+    let output = tino_command()
+        .arg("--explain")
+        .env_clear()
+        .env("TINI_SUBREAPER", "1")
+        .env("TINI_KILL_PROCESS_GROUP", "false")
+        .env("TINI_VERBOSITY", "3")
+        .env("TINO_SUBREAPER", "false")
+        .env("TINO_VERBOSITY", "0")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for expected in [
+        "subreaper: false",
+        "subreaper.source: env:TINO_SUBREAPER",
+        "pgroup_kill: true",
+        "pgroup_kill.source: env:TINI_KILL_PROCESS_GROUP",
+        "verbosity: 0",
+        "verbosity.source: env:TINO_VERBOSITY",
+    ] {
+        assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+    }
 }
 
 #[test]
@@ -2378,6 +2843,76 @@ fn explain_reports_write_preset_expansion() {
         stdout.contains("/tmp"),
         "missing expanded tmp preset path\n{stdout}"
     );
+}
+
+fn one_policy_fd(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: change only the child's descriptor limit before exec.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: 4, // standard streams and one policy descriptor
+                rlim_max: 4,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[test]
+fn explain_requires_a_pinned_explicit_path_match() {
+    let explain = |args: &[&str]| {
+        let mut command = tino_command();
+        one_policy_fd(&mut command);
+        command
+            .env("PATH", "/bin")
+            .arg("--explain")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    let missing = explain(&["--exec-allow", "/tmp", "--exec-allow", "true"]);
+    assert_eq!(missing.status.code(), Some(1), "{missing:?}");
+
+    let existing = explain(&["--exec-allow", "true", "--", "/bin/true"]);
+    assert!(existing.status.success(), "{existing:?}");
+    let executable = std::fs::canonicalize("/bin/true").unwrap();
+    let expected = format!("exec_restrict.allow_paths: [{executable:?}]");
+    let stdout = String::from_utf8_lossy(&existing.stdout);
+    assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+}
+
+#[test]
+fn explain_opens_repeated_allow_directory_once() {
+    for (option, expected) in [
+        ("--write-allow", r#"write_restrict.allow_dirs: ["/"]"#),
+        ("--exec-allow", r#"exec_restrict.allow_paths: ["/"]"#),
+        (
+            "--device-ioctl-allow",
+            r#"device_ioctl_restrict.allow_paths: ["/"]"#,
+        ),
+    ] {
+        let mut command = tino_command();
+        if option == "--write-allow" {
+            command.arg("--write-no-dev");
+        }
+        command.args(["--explain", option, "/", option, "/"]);
+        one_policy_fd(&mut command);
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{option} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+    }
 }
 
 #[test]
@@ -2415,6 +2950,62 @@ fn explain_reports_tcp_restrictions() {
         stdout.contains("tcp_restrict.connect_allow_ports: [443]"),
         "missing connect TCP allowlist\n{stdout}"
     );
+}
+
+#[test]
+fn explain_distinguishes_each_tcp_direction() {
+    for (options, bind, connect) in [
+        (&[][..], "unrestricted", "unrestricted"),
+        (&["--bind-tcp-allow=8080"][..], "allowlist", "unrestricted"),
+        (
+            &["--connect-tcp-allow=443"][..],
+            "unrestricted",
+            "allowlist",
+        ),
+        (
+            &["--bind-tcp-allow=8080", "--connect-tcp-allow=443"][..],
+            "allowlist",
+            "allowlist",
+        ),
+    ] {
+        let output = tino_command()
+            .arg("--explain")
+            .args(options)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for (direction, mode) in [("bind", bind), ("connect", connect)] {
+            let expected = format!("tcp_restrict.{direction}_mode: {mode}");
+            assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+        }
+    }
+}
+
+#[test]
+fn explain_distinguishes_an_explicit_dev_rule_from_the_default() {
+    let alias = unique_temp_dir("tino-dev-alias");
+    std::os::unix::fs::symlink("/dev", &alias).unwrap();
+    let _cleanup = std::mem::DropGuard::new(&alias, |path| std::fs::remove_file(path).unwrap());
+    let dev = std::path::Path::new("/dev");
+    for (path, disable_default) in [(dev, false), (dev, true), (alias.as_path(), false)] {
+        let mut command = tino_command();
+        command.arg("--write-allow").arg(path).arg("--explain");
+        if disable_default {
+            command.arg("--write-no-dev");
+        }
+        one_policy_fd(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for expected in [
+            "write_restrict.auto_allow_dev: false",
+            r#"write_restrict.allow_dirs: ["/dev"]"#,
+        ] {
+            assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+        }
+        assert!(!stdout.contains("write_restrict.dev_writable:"), "{stdout}");
+    }
 }
 
 #[test]
@@ -2546,9 +3137,24 @@ fn explain_does_not_execute_child() {
 }
 
 #[test]
+fn explain_can_preview_a_missing_command() {
+    let missing = unique_temp_dir("tino-preview-command");
+    let output = tino_command()
+        .args(["--explain", "--"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected = format!("command.effective: [{missing:?}]");
+    assert!(stdout.lines().any(|line| line == expected), "{stdout}");
+    assert!(!stdout.contains("command.present:"), "{stdout}");
+}
+
+#[test]
 fn exec_failure_reports_missing_binary_reason() {
     let output = tino_command()
-        .args(["--", "/definitely/missing/tino-test-binary"])
+        .args(["-e", "127", "--", "/definitely/missing/tino-test-binary"])
         .output()
         .expect("failed to run tino missing-binary test");
 
@@ -2674,7 +3280,7 @@ fn exec_failure_reports_non_executable_reason() {
     std::fs::set_permissions(&script, perms).expect("chmod non executable file");
 
     let output = tino_command()
-        .arg("--")
+        .args(["-e", "126", "--"])
         .arg(&script)
         .output()
         .expect("failed to run tino non-executable test");
@@ -2975,7 +3581,7 @@ fn pgroup_kill_escalates_unwaitable_group_members_after_main_exit() {
 
 #[test]
 fn landlock_allows_writes_within_allowlist() {
-    if !landlock_available() {
+    if !landlock_available(&["--write-restrict"]) {
         return;
     }
 
@@ -3011,7 +3617,7 @@ fn landlock_allows_writes_within_allowlist() {
 
 #[test]
 fn write_allow_enables_write_restriction() {
-    if !landlock_available() {
+    if !landlock_available(&["--write-restrict"]) {
         return;
     }
 
@@ -3035,9 +3641,10 @@ fn write_allow_enables_write_restriction() {
         .status()
         .expect("run tino write-allow auto restriction test");
 
-    assert!(
-        !status.success(),
-        "expected --write-allow alone to restrict other writes, got {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "expected --write-allow alone to restrict other writes"
     );
     assert!(
         allowed_dir.join("ok").exists(),
@@ -3053,7 +3660,7 @@ fn write_allow_enables_write_restriction() {
 
 #[test]
 fn write_preset_tmp_allows_writes_in_tmp() {
-    if !landlock_available() {
+    if !landlock_available(&["--write-restrict"]) {
         return;
     }
 
@@ -3087,65 +3694,48 @@ fn write_preset_tmp_allows_writes_in_tmp() {
 
 #[test]
 fn landlock_allows_bind_only_on_allowlisted_tcp_ports() {
-    if !landlock_available() || !landlock_tcp_available() || !python3_available() {
+    if !landlock_available(&["--bind-tcp-allow", "1"]) || !python3_available() {
         return;
     }
 
-    let (allowed_port, denied_port) = distinct_free_tcp_ports();
     let bind_script = r#"import socket, sys
-s = socket.socket()
-s.bind(("127.0.0.1", int(sys.argv[1])))
-s.close()
+with socket.socket() as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    try:
+        sock.bind(("127.0.0.1", int(sys.argv[1])))
+    except PermissionError:
+        sys.exit(13)
 "#;
-    let bind_denied_script = r#"import socket, sys
-s = socket.socket()
-try:
-    s.bind(("127.0.0.1", int(sys.argv[1])))
-except PermissionError:
-    sys.exit(13)
-else:
-    s.close()
-    sys.exit(0)
+    // Hold the listener across both probes. SO_REUSEPORT lets the permitted
+    // child bind the same address while ordinary competing binds are excluded.
+    let run_probes = r#"import socket, subprocess, sys
+tino, probe = sys.argv[1:]
+with socket.socket() as reservation:
+    reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    reservation.bind(("127.0.0.1", 0))
+    reservation.listen()
+    port = reservation.getsockname()[1]
+    other_port = 1 if port != 1 else 2
+    for allowed, expected in ((port, 0), (other_port, 13)):
+        result = subprocess.run([tino, "--no-config", "--bind-tcp-allow", str(allowed),
+                                 "--", sys.executable, "-c", probe, str(port)])
+        if result.returncode != expected:
+            sys.exit(f"bind {port} with allowlist [{allowed}]: expected {expected}, got {result.returncode}")
 "#;
-
-    let allowed = tino_command()
-        .args([
-            "--bind-tcp-allow",
-            &allowed_port.to_string(),
-            "--",
-            "python3",
-            "-c",
-            bind_script,
-            &allowed_port.to_string(),
-        ])
+    let mut command = Command::new("python3");
+    for name in common::RUNTIME_ENV {
+        command.env_remove(name);
+    }
+    let status = command
+        .args(["-c", run_probes, tino_bin(), bind_script])
         .status()
-        .expect("run tino bind TCP allow test");
-    assert!(
-        allowed.success(),
-        "expected allowlisted TCP bind to succeed, got {allowed:?}"
-    );
-
-    let denied = tino_command()
-        .args([
-            "--bind-tcp-allow",
-            &allowed_port.to_string(),
-            "--",
-            "python3",
-            "-c",
-            bind_denied_script,
-            &denied_port.to_string(),
-        ])
-        .status()
-        .expect("run tino bind TCP deny test");
-    assert!(
-        !denied.success(),
-        "expected non-allowlisted TCP bind to fail, got {denied:?}"
-    );
+        .expect("run TCP bind probes");
+    assert!(status.success(), "TCP bind probes failed: {status}");
 }
 
 #[test]
 fn landlock_allows_connect_only_on_allowlisted_tcp_ports() {
-    if !landlock_available() || !landlock_tcp_available() || !python3_available() {
+    if !landlock_available(&["--connect-tcp-allow", "1"]) || !python3_available() {
         return;
     }
 
@@ -3161,17 +3751,10 @@ fn landlock_allows_connect_only_on_allowlisted_tcp_ports() {
         .expect("query denied TCP listener addr")
         .port();
     let connect_script = r#"import socket, sys
-s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
-s.close()
-"#;
-    let connect_denied_script = r#"import socket, sys
 try:
-    s = socket.create_connection(("127.0.0.1", int(sys.argv[1])))
+    socket.create_connection(("127.0.0.1", int(sys.argv[1]))).close()
 except PermissionError:
     sys.exit(13)
-else:
-    s.close()
-    sys.exit(0)
 "#;
 
     let allowed = tino_command()
@@ -3198,14 +3781,15 @@ else:
             "--",
             "python3",
             "-c",
-            connect_denied_script,
+            connect_script,
             &denied_port.to_string(),
         ])
         .status()
         .expect("run tino connect TCP deny test");
-    assert!(
-        !denied.success(),
-        "expected non-allowlisted TCP connect to fail, got {denied:?}"
+    assert_eq!(
+        denied.code(),
+        Some(13),
+        "expected non-allowlisted TCP connect to fail"
     );
 
     drop(allowed_listener);
@@ -3214,7 +3798,7 @@ else:
 
 #[test]
 fn landlock_exec_restrict_auto_allows_main_command() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3231,7 +3815,7 @@ fn landlock_exec_restrict_auto_allows_main_command() {
 
 #[test]
 fn landlock_exec_restrict_auto_allows_env_shebang_command() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3275,7 +3859,7 @@ fn landlock_exec_restrict_auto_allows_env_shebang_command() {
 
 #[test]
 fn landlock_exec_restrict_preserves_path_fallbacks() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
     let root = unique_temp_dir("tino-exec-path-fallback");
@@ -3384,7 +3968,7 @@ fn landlock_exec_restrict_preserves_path_fallbacks() {
 
 #[test]
 fn landlock_exec_restrict_auto_allows_relative_shebang_interpreter_from_cwd() {
-    if !landlock_available() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3430,45 +4014,75 @@ fn landlock_exec_restrict_auto_allows_relative_shebang_interpreter_from_cwd() {
 }
 
 #[test]
-fn landlock_exec_restrict_auto_allows_execvp_shell_fallback() {
-    if !landlock_available() {
+fn exec_shell_grant_matches_the_launcher_for_plain_and_shebang_scripts() {
+    let root = unique_temp_dir("tino-launcher-shell");
+    let empty = root.join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let program = root.join("probe");
+    let shell = std::fs::canonicalize("/bin/sh").unwrap();
+    for (body, declares_shell) in [
+        ("exit 0\n", false),
+        ("#!\n", false),
+        ("\x7fELF", false),
+        ("#!/bin/sh\n", true),
+    ] {
+        write_exec_fixture(&program, body);
+        for main in [program.as_os_str(), std::ffi::OsStr::new("probe")] {
+            for explicit in [false, true] {
+                let output = tino_command()
+                    .env("PATH", &root)
+                    .args(["--explain", "--exec-allow"])
+                    .arg(if explicit { main } else { empty.as_os_str() })
+                    .arg("--")
+                    .arg(main)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{output:?}");
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let paths = stdout
+                    .lines()
+                    .find(|s| s.starts_with("exec_restrict.allow_paths:"))
+                    .unwrap();
+                assert_eq!(
+                    paths.contains(shell.to_str().unwrap()),
+                    explicit || declares_shell || !cfg!(target_env = "musl"),
+                    "{main:?}, {body:?}, explicit={explicit}: {paths}"
+                );
+            }
+        }
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn landlock_exec_restrict_preserves_no_shebang_behavior() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
     let root = unique_temp_dir("tino-execvp-shell-fallback");
     std::fs::create_dir_all(&root).expect("create execvp fallback dir");
     let script = root.join("script");
-    std::fs::write(&script, b"echo no-shebang-ok\n").expect("write no-shebang script");
-    let mut perms = std::fs::metadata(&script)
-        .expect("stat no-shebang script")
-        .permissions();
-    perms.set_mode(perms.mode() | 0o755);
-    std::fs::set_permissions(&script, perms).expect("chmod no-shebang script");
+    write_exec_fixture(&script, "echo no-shebang-ok\n");
 
-    let output = tino_command()
-        .args([
-            "--exec-allow",
-            script.to_str().expect("script path utf-8"),
-            "--",
-            script.to_str().expect("script path utf-8"),
-        ])
+    assert_landlock_preserves_exec_format(&script, Some(b"no-shebang-ok\n"));
+    // A static tino can launch an env linked against another libc.
+    let launcher = root.join("launcher");
+    write_exec_fixture(&launcher, &format!("#!/usr/bin/env {}\n", script.display()));
+    let native = Command::new(&launcher).output().unwrap();
+    let restricted = tino_command()
+        .args(EXEC_POLICY)
+        .arg("--")
+        .arg(&launcher)
         .output()
-        .expect("run tino execvp fallback exec test");
-
-    assert!(
-        output.status.success(),
-        "expected no-shebang script to succeed under exec restriction: {:?}\nstderr:\n{}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "no-shebang-ok\n");
-
+        .unwrap();
+    assert_eq!(restricted, native);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn landlock_exec_restrict_auto_allows_execvp_shell_for_malformed_elf() {
-    if !landlock_available() {
+fn landlock_exec_restrict_preserves_exec_failure_for_malformed_elf() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3482,25 +4096,13 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_malformed_elf() {
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(&program, perms).expect("chmod malformed ELF");
 
-    let output = tino_command()
-        .args([
-            "--exec-allow",
-            program.to_str().expect("malformed ELF path utf-8"),
-            "--",
-            program.to_str().expect("malformed ELF path utf-8"),
-        ])
-        .output()
-        .expect("run tino malformed ELF fallback exec test");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_execvp_shell_fallback_reached("malformed ELF", output.status, &stderr);
-
+    assert_landlock_preserves_exec_format(&program, None);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_static_elf() {
-    if !landlock_available() {
+fn landlock_exec_restrict_preserves_exec_failure_for_invalid_static_elf() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3522,25 +4124,13 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_static_elf() {
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(&program, perms).expect("chmod invalid static ELF");
 
-    let output = tino_command()
-        .args([
-            "--exec-allow",
-            program.to_str().expect("invalid static ELF path utf-8"),
-            "--",
-            program.to_str().expect("invalid static ELF path utf-8"),
-        ])
-        .output()
-        .expect("run tino invalid static ELF fallback exec test");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_execvp_shell_fallback_reached("invalid static ELF", output.status, &stderr);
-
+    assert_landlock_preserves_exec_format(&program, None);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn landlock_exec_restrict_auto_allows_execvp_shell_for_non_native_elf() {
-    if !landlock_available() {
+fn landlock_exec_restrict_preserves_exec_failure_for_non_native_elf() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3565,25 +4155,13 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_non_native_elf() {
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(&program, perms).expect("chmod non-native ELF");
 
-    let output = tino_command()
-        .args([
-            "--exec-allow",
-            program.to_str().expect("non-native ELF path utf-8"),
-            "--",
-            program.to_str().expect("non-native ELF path utf-8"),
-        ])
-        .output()
-        .expect("run tino non-native ELF fallback exec test");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_execvp_shell_fallback_reached("non-native ELF", output.status, &stderr);
-
+    assert_landlock_preserves_exec_format(&program, None);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_elf_program_headers() {
-    if !landlock_available() {
+fn landlock_exec_restrict_preserves_exec_failure_for_invalid_elf_program_headers() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
@@ -3605,170 +4183,87 @@ fn landlock_exec_restrict_auto_allows_execvp_shell_for_invalid_elf_program_heade
     perms.set_mode(perms.mode() | 0o755);
     std::fs::set_permissions(&program, perms).expect("chmod invalid phoff ELF");
 
-    let output = tino_command()
-        .args([
-            "--exec-allow",
-            program.to_str().expect("invalid phoff ELF path utf-8"),
-            "--",
-            program.to_str().expect("invalid phoff ELF path utf-8"),
-        ])
-        .output()
-        .expect("run tino invalid phoff ELF fallback exec test");
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    assert_execvp_shell_fallback_reached("invalid ELF program headers", output.status, &stderr);
-
+    assert_landlock_preserves_exec_format(&program, None);
     let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
-fn landlock_exec_restrict_blocks_non_allowlisted_execs() {
-    if !landlock_available() {
+fn landlock_exec_restrict_only_allows_configured_execs() {
+    if !landlock_available(EXEC_POLICY) {
         return;
     }
 
-    let sh = executable_path("sh");
-    let uname = executable_path("uname");
-    let (Some(sh), Some(uname)) = (sh, uname) else {
-        return;
-    };
+    let root = unique_temp_dir("tino-exec-allow");
+    std::fs::create_dir(&root).expect("create executable fixture directory");
+    // Give the command a distinct inode even when sh and true are BusyBox applets.
+    let program = root.join("true");
+    std::fs::copy("/bin/true", &program).expect("copy executable fixture");
 
-    let status = tino_command()
-        .args([
-            "--exec-allow",
-            sh.to_str().expect("sh path utf-8"),
-            "--",
-            sh.to_str().expect("sh path utf-8"),
-            "-c",
-            r#""$UNAME" >/dev/null 2>/dev/null"#,
-        ])
-        .env("UNAME", &uname)
-        .status()
-        .expect("run tino exec deny test");
-
-    assert!(
-        !status.success(),
-        "expected non-allowlisted exec to fail, got {status:?}"
-    );
+    for (allow, expected) in [(false, "126"), (true, "0")] {
+        let mut command = tino_command();
+        command.args(["--exec-allow", "/bin/sh"]);
+        if allow {
+            command.arg("--exec-allow").arg(&program);
+        }
+        let status = command
+            .args([
+                "--",
+                "/bin/sh",
+                "-c",
+                r#""$1"; test "$?" = "$2" && exit 42"#,
+                "sh",
+            ])
+            .arg(&program)
+            .arg(expected)
+            .status()
+            .expect("run exec allowlist probe");
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "allow={allow}, expected nested command to exit {expected}"
+        );
+    }
+    std::fs::remove_dir_all(root).expect("remove executable fixture directory");
 }
 
-#[test]
-fn landlock_exec_restrict_allows_configured_execs() {
-    if !landlock_available() {
-        return;
-    }
-
-    let sh = executable_path("sh");
-    let uname = executable_path("uname");
-    let (Some(sh), Some(uname)) = (sh, uname) else {
-        return;
-    };
-
-    let status = tino_command()
+fn tty_ioctl_status(allow_path: &str) -> ExitStatus {
+    let script = r#"import fcntl, os, sys, termios
+fd = os.open("/dev/ptmx", os.O_RDWR | os.O_NOCTTY)
+try:
+    fcntl.ioctl(fd, termios.TIOCGWINSZ, bytes(8))
+except PermissionError:
+    sys.exit(13)
+"#;
+    tino_command()
         .args([
-            "--exec-allow",
-            sh.to_str().expect("sh path utf-8"),
-            "--exec-allow",
-            uname.to_str().expect("uname path utf-8"),
+            "--device-ioctl-allow",
+            allow_path,
             "--",
-            sh.to_str().expect("sh path utf-8"),
+            "python3",
             "-c",
-            r#""$UNAME" >/dev/null"#,
+            script,
         ])
-        .env("UNAME", &uname)
         .status()
-        .expect("run tino exec allow test");
-
-    assert!(
-        status.success(),
-        "expected configured exec to succeed, got {status:?}"
-    );
+        .expect("run device ioctl probe")
 }
 
 #[test]
 fn landlock_device_ioctl_restrict_allows_configured_paths() {
-    if !landlock_available() || !python3_available() {
-        return;
+    if landlock_available(&["--device-ioctl-allow", "/dev/ptmx"]) && python3_available() {
+        assert_eq!(tty_ioctl_status("/dev/ptmx").code(), Some(0));
     }
-
-    let Some((mut holder, tty_path)) = spawn_pty_holder() else {
-        return;
-    };
-    let script = r#"import fcntl, os, sys, termios
-fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
-fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-os.close(fd)
-"#;
-
-    let status = tino_command()
-        .args([
-            "--device-ioctl-allow",
-            tty_path.to_str().expect("tty path utf-8"),
-            "--",
-            "python3",
-            "-c",
-            script,
-            tty_path.to_str().expect("tty path utf-8"),
-        ])
-        .status()
-        .expect("run tino device ioctl allow test");
-
-    let _ = holder.kill();
-    let _ = holder.wait();
-
-    assert!(
-        status.success(),
-        "expected configured device ioctl path to succeed, got {status:?}"
-    );
 }
 
 #[test]
 fn landlock_device_ioctl_restrict_blocks_non_allowlisted_paths() {
-    if !landlock_available() || !python3_available() {
-        return;
+    if landlock_available(&["--device-ioctl-allow", "/dev/null"]) && python3_available() {
+        assert_eq!(tty_ioctl_status("/dev/null").code(), Some(13));
     }
-
-    let Some((mut holder, tty_path)) = spawn_pty_holder() else {
-        return;
-    };
-    let script = r#"import fcntl, os, sys, termios
-try:
-    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOCTTY)
-    try:
-        fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-    finally:
-        os.close(fd)
-except PermissionError:
-    sys.exit(13)
-else:
-    sys.exit(0)
-"#;
-
-    let status = tino_command()
-        .args([
-            "--device-ioctl-allow",
-            "/dev/null",
-            "--",
-            "python3",
-            "-c",
-            script,
-            tty_path.to_str().expect("tty path utf-8"),
-        ])
-        .status()
-        .expect("run tino device ioctl deny test");
-
-    let _ = holder.kill();
-    let _ = holder.wait();
-
-    assert!(
-        !status.success(),
-        "expected non-allowlisted device ioctl to fail, got {status:?}"
-    );
 }
 
 #[test]
 fn landlock_signal_scope_allows_same_domain_signals() {
-    if !landlock_available() || !landlock_scope_available() {
+    if !landlock_available(&["--scope-signals"]) {
         return;
     }
 
@@ -3791,7 +4286,7 @@ fn landlock_signal_scope_allows_same_domain_signals() {
 
 #[test]
 fn landlock_signal_scope_blocks_out_of_domain_signals() {
-    if !landlock_available() || !landlock_scope_available() {
+    if !landlock_available(&["--scope-signals"]) {
         return;
     }
 
@@ -3826,9 +4321,10 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
         .status()
         .expect("run tino out-of-domain signal scope test");
 
-    assert!(
-        !status.success(),
-        "expected out-of-domain signal delivery to fail, got {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "expected out-of-domain signal delivery to fail"
     );
     assert!(
         target
@@ -3855,30 +4351,17 @@ fn landlock_signal_scope_blocks_out_of_domain_signals() {
 
 #[test]
 fn landlock_abstract_unix_scope_allows_same_domain_connects() {
-    if !landlock_available() || !landlock_scope_available() || !python3_available() {
+    if !landlock_available(&["--scope-abstract-unix"]) || !python3_available() {
         return;
     }
 
-    let script = r#"import socket, threading, uuid
-name = "\0" + "tino-scope-" + uuid.uuid4().hex
-server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-server.bind(name)
-server.listen(1)
-accepted = []
-
-def accept_once():
-    conn, _ = server.accept()
-    conn.close()
-    accepted.append(True)
-
-thread = threading.Thread(target=accept_once)
-thread.start()
-client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-client.connect(name)
-client.close()
-thread.join(timeout=2)
-assert accepted, "same-domain abstract UNIX socket connect should succeed"
-server.close()
+    let script = r#"import socket, uuid
+name = "\0tino-scope-" + uuid.uuid4().hex
+with socket.socket(socket.AF_UNIX) as server, socket.socket(socket.AF_UNIX) as client:
+    server.bind(name)
+    server.listen(1)
+    client.connect(name)
+    server.accept()[0].close()
 "#;
 
     let status = tino_command()
@@ -3894,20 +4377,18 @@ server.close()
 
 #[test]
 fn landlock_abstract_unix_scope_blocks_out_of_domain_connects() {
-    if !landlock_available() || !landlock_scope_available() || !python3_available() {
+    if !landlock_available(&["--scope-abstract-unix"]) || !python3_available() {
         return;
     }
 
+    use std::os::{
+        linux::net::SocketAddrExt,
+        unix::net::{SocketAddr, UnixListener},
+    };
+
     let socket_name = unique_abstract_socket_name("tino-abstract-scope");
-    let server_script = r#"import socket, sys, time
-name = "\0" + sys.argv[1]
-sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-sock.bind(name)
-sock.listen(1)
-print("ready", flush=True)
-time.sleep(5)
-sock.close()
-"#;
+    let address = SocketAddr::from_abstract_name(&socket_name).expect("abstract socket address");
+    let _server = UnixListener::bind_addr(&address).expect("bind out-of-domain listener");
     let connect_script = r#"import socket, sys
 sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 try:
@@ -3918,24 +4399,6 @@ else:
     sock.close()
     sys.exit(0)
 "#;
-
-    let mut server = Command::new("python3")
-        .args(["-u", "-c", server_script, &socket_name])
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn abstract UNIX scope server");
-    let mut stdout = BufReader::new(
-        server
-            .stdout
-            .take()
-            .expect("abstract UNIX scope server stdout"),
-    );
-    let mut ready = String::new();
-    stdout
-        .read_line(&mut ready)
-        .expect("read readiness marker for abstract UNIX scope server");
-    assert_eq!(ready.trim_end(), "ready", "unexpected readiness marker");
-    drop(stdout);
 
     let status = tino_command()
         .args([
@@ -3949,18 +4412,16 @@ else:
         .status()
         .expect("run tino out-of-domain abstract UNIX scope test");
 
-    assert!(
-        !status.success(),
-        "expected out-of-domain abstract UNIX connect to fail, got {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "expected out-of-domain abstract UNIX connect to fail"
     );
-
-    let _ = server.kill();
-    let _ = server.wait();
 }
 
 #[test]
 fn landlock_denies_writes_outside_allowlist() {
-    if !landlock_available() {
+    if !landlock_available(&["--write-restrict"]) {
         return;
     }
 
@@ -3985,9 +4446,10 @@ fn landlock_denies_writes_outside_allowlist() {
         .status()
         .expect("run tino landlock deny test");
 
-    assert!(
-        !status.success(),
-        "expected write outside allowlist to fail, got {status:?}"
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "expected write outside allowlist to fail"
     );
     assert!(
         allowed_dir.join("ok").exists(),

@@ -40,9 +40,29 @@ impl Error {
             if err.downcast_ref::<Self>().is_some_and(|err| err.usage) {
                 return 2;
             }
+            if let Some(err) = err.downcast_ref::<crate::CliParseError>() {
+                return err.failure_exit_code();
+            }
             source = err.source();
         }
         1
+    }
+
+    /// Print the command-line diagnostic and exit with this error's status.
+    pub fn exit(&self) -> ! {
+        let code = self.exit_code();
+        // Linux's diagnostic writer handles write-generated signals itself.
+        #[cfg(all(unix, not(target_os = "linux")))]
+        unsafe {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+        }
+        let hint = if code == 2 {
+            "\nTry 'tino --help' for usage."
+        } else {
+            ""
+        };
+        crate::logging::stderr_line(format_args!("ERROR tino: {self:#}{hint}"));
+        std::process::exit(code)
     }
 
     #[must_use]
@@ -64,6 +84,10 @@ impl fmt::Display for Error {
         if f.alternate() {
             let mut source = self.source();
             while let Some(err) = source {
+                // The CLI error also renders its cause inline for plain Display.
+                if let Some(parse) = err.downcast_ref::<crate::CliParseError>() {
+                    return write!(f, "\ncaused by: {parse:#}");
+                }
                 write!(f, "\ncaused by: {err}")?;
                 source = err.source();
             }
@@ -172,5 +196,11 @@ mod tests {
         }
         let result: std::io::Result<()> = Err(std::io::Error::from_raw_os_error(13));
         assert_eq!(result.context("open file").unwrap_err().exit_code(), 1);
+        let error = crate::Cli::try_parse_from(["tino", "--unknown-option"])
+            .context("parse options")
+            .context("start service")
+            .unwrap_err();
+        assert_eq!(error.exit_code(), 2);
+        assert_eq!(format!("{error:#}").matches("unknown-option").count(), 1);
     }
 }

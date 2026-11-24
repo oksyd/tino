@@ -3,9 +3,6 @@ FROM rust:1.100.0-slim-trixie AS builder
 ARG TARGETARCH
 
 RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates musl-tools; \
-    rm -rf /var/lib/apt/lists/*; \
     case "${TARGETARCH:-$(uname -m)}" in \
         amd64|x86_64) rust_target="x86_64-unknown-linux-musl" ;; \
         arm64|aarch64) rust_target="aarch64-unknown-linux-musl" ;; \
@@ -16,26 +13,21 @@ RUN set -eux; \
 
 WORKDIR /opt/app
 
-COPY LICENSE /opt/app/LICENSE
-COPY Cargo.toml /opt/app/Cargo.toml
-COPY Cargo.lock /opt/app/Cargo.lock
-
-COPY src/ /opt/app/src/
-COPY benches/ /opt/app/benches/
-COPY tests/ /opt/app/tests/
+COPY Cargo.toml Cargo.lock ./
+COPY src/ src/
 
 RUN --mount=type=cache,id=tino-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=tino-cargo-target-$TARGETARCH,target=/opt/app/target \
+    --mount=type=tmpfs,target=/opt/app/target \
     set -eux; \
     rust_target="$(cat /tmp/rust-target)"; \
     export RUSTFLAGS="-C linker=rust-lld"; \
-    cargo build --locked --release --target "$rust_target"; \
+    cargo build --locked --release --bin tino --target "$rust_target"; \
     cp "/opt/app/target/$rust_target/release/tino" /opt/app/tino
 
 
 FROM scratch AS runtime
 
 COPY --from=builder /opt/app/tino /sbin/tino
-COPY --from=builder /opt/app/LICENSE /LICENSE
+COPY LICENSE /LICENSE
 
 ENTRYPOINT ["/sbin/tino"]

@@ -1,5 +1,8 @@
 // A custom harness keeps the library probes single-threaded. libtest would
 // create a worker thread before the probe can exercise the public run API.
+#[cfg(target_os = "linux")]
+mod common;
+
 fn main() {
     #[cfg(target_os = "linux")]
     linux::run();
@@ -12,7 +15,7 @@ mod linux {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, ExitStatus, Stdio};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     fn wait_with_timeout(child: &mut Child) -> ExitStatus {
@@ -32,7 +35,10 @@ mod linux {
 
     fn inherited_sigchld_ignore_does_not_lose_exit_status() {
         let mut command = Command::new(env!("CARGO_BIN_EXE_tino"));
-        command.args(["--no-config", "--", "/bin/sh", "-c", "exit 23"]);
+        command
+            .args(["--no-config", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .arg("auto-reap-workload");
         // SAFETY: this changes only the forked launcher, using async-signal-safe calls.
         unsafe {
             command.pre_exec(|| {
@@ -77,7 +83,7 @@ mod linux {
             let writer = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
             drop(reader);
             let mut child = Command::new(env!("CARGO_BIN_EXE_tino"))
-                .args(["--no-config", "--", program])
+                .args(["--no-config", "-e", &expected.to_string(), "--", program])
                 .stderr(Stdio::from(writer))
                 .spawn()
                 .expect("launch tino with closed stderr reader");
@@ -89,9 +95,23 @@ mod linux {
         }
     }
 
-    fn full_stderr_pipe(socket: bool) -> (OwnedFd, OwnedFd, libc::c_int) {
+    #[derive(Clone, Copy, Debug)]
+    enum StderrSink {
+        Pipe,
+        Socket,
+        PausedTerminal,
+    }
+
+    fn blocked_stderr(sink: StderrSink) -> (OwnedFd, OwnedFd, libc::c_int) {
+        if let StderrSink::PausedTerminal = sink {
+            let (master, slave) = open_pty();
+            assert_eq!(unsafe { libc::tcflow(slave.as_raw_fd(), libc::TCOOFF) }, 0);
+            let flags = unsafe { libc::fcntl(slave.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0 && flags & libc::O_NONBLOCK == 0);
+            return (master.into(), slave.into(), flags);
+        }
         let mut fds = [0; 2];
-        let result = if socket {
+        let result = if matches!(sink, StderrSink::Socket) {
             unsafe {
                 libc::socketpair(
                     libc::AF_UNIX,
@@ -135,8 +155,8 @@ mod linux {
         (reader, writer, flags)
     }
 
-    fn run_with_full_stderr(args: &[&str], expected: i32, send_term: bool, socket: bool) {
-        let (reader, writer, original_flags) = full_stderr_pipe(socket);
+    fn run_with_full_stderr(args: &[&str], expected: i32, send_term: bool, sink: StderrSink) {
+        let (reader, writer, original_flags) = blocked_stderr(sink);
         let mut supervisor = Command::new(env!("CARGO_BIN_EXE_tino"))
             .arg("--no-config")
             .args(args)
@@ -183,7 +203,7 @@ mod linux {
             assert_eq!(
                 status.and_then(|status| status.code()),
                 Some(expected),
-                "{args:?}, socket={socket}"
+                "{args:?}, sink={sink:?}"
             );
             if let Some(pid) = main_pid {
                 assert_eq!(
@@ -223,7 +243,11 @@ mod linux {
 
     fn full_stderr_does_not_postpone_shutdown() {
         let exe = std::env::current_exe().unwrap();
-        for socket in [false, true] {
+        for sink in [
+            StderrSink::Pipe,
+            StderrSink::Socket,
+            StderrSink::PausedTerminal,
+        ] {
             for verbosity in ["-v", "-vv"] {
                 run_with_full_stderr(
                     &[
@@ -236,16 +260,35 @@ mod linux {
                     ],
                     137,
                     true,
-                    socket,
+                    sink,
                 );
             }
         }
     }
 
-    fn exec_failure_preserves_status_with_full_stderr() {
-        for socket in [false, true] {
-            for (program, expected) in [("/tino-command-that-does-not-exist", 127), ("/", 126)] {
-                run_with_full_stderr(&["--", program], expected, false, socket);
+    fn failures_preserve_status_with_full_stderr() {
+        for sink in [
+            StderrSink::Pipe,
+            StderrSink::Socket,
+            StderrSink::PausedTerminal,
+        ] {
+            let cases: &[(&[&str], i32)] = &[
+                (&["--unknown-option"], 2),
+                (&[], 2),
+                (
+                    &[
+                        "--write-allow",
+                        "/tino-missing-write-dir",
+                        "--",
+                        "/bin/true",
+                    ],
+                    1,
+                ),
+                (&["--", "/tino-command-that-does-not-exist"], 127),
+                (&["--", "/"], 126),
+            ];
+            for &(args, expected) in cases {
+                run_with_full_stderr(args, expected, false, sink);
             }
         }
     }
@@ -298,8 +341,10 @@ mod linux {
                 };
                 let flags = unsafe { libc::fcntl(stderr.as_raw_fd(), libc::F_GETFL) };
                 assert!(flags >= 0);
-                assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
                 assert_eq!(flags & libc::O_PATH != 0, opath);
+                if !opath {
+                    assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+                }
                 let mut child = Command::new(env!("CARGO_BIN_EXE_tino"))
                     .args(["--no-config", "-v", "--", program])
                     .stderr(Stdio::from(stderr.try_clone().unwrap()))
@@ -577,7 +622,7 @@ mod linux {
     }
 
     fn library_reports_subreaper_restore_failure() {
-        for mode in ["restore", "supervision"] {
+        for mode in ["restore", "supervision", "already-enabled"] {
             let mut probe = Command::new(std::env::current_exe().unwrap())
                 .args(["subreaper-restore-failure-probe", mode])
                 .spawn()
@@ -586,11 +631,13 @@ mod linux {
         }
     }
 
-    fn subreaper_restore_failure_probe(fail_poll: bool) {
+    fn subreaper_restore_failure_probe(mode: &str) {
+        let initial = i32::from(mode == "already-enabled");
+        let fail_poll = mode == "supervision";
         let mut before_mask = unsafe { std::mem::zeroed() };
         let mut before_action: libc::sigaction = unsafe { std::mem::zeroed() };
         unsafe {
-            assert_eq!(libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 0), 0);
+            assert_eq!(libc::prctl(libc::PR_SET_CHILD_SUBREAPER, initial), 0);
             libc::sigemptyset(&raw mut before_mask);
             libc::sigaddset(&raw mut before_mask, libc::SIGUSR1);
             assert_eq!(
@@ -637,9 +684,9 @@ mod linux {
         )))]
         let poll_number = libc::SYS_poll;
         let low_word = if cfg!(target_endian = "big") { 4 } else { 0 };
-        let denied = libc::SECCOMP_RET_ERRNO | libc::EPERM as u32;
-        // Permit subreaper activation and queries, but deny restoring zero.
-        // A second mode also fails supervision so its original error must win.
+        let denied = libc::SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // Deny writing the initial value. Restoring zero must report an error;
+        // a host already acting as subreaper needs no write to supervise.
         let mut filter = [
             libc::sock_filter {
                 code: 0x20,
@@ -675,7 +722,7 @@ mod linux {
                 code: 0x15,
                 jt: 0,
                 jf: 4,
-                k: 0,
+                k: initial as u32,
             },
             libc::sock_filter {
                 code: 0x06,
@@ -768,6 +815,11 @@ mod linux {
         }
         assert_eq!(before_action.sa_sigaction, after_action.sa_sigaction);
         assert_eq!(before_action.sa_flags, after_action.sa_flags);
+        if initial == 1 {
+            assert_eq!(subreaper, 1);
+            assert_eq!(result.unwrap(), 37);
+            return;
+        }
         assert_eq!(
             subreaper, 1,
             "seccomp makes the restoration failure irreversible"
@@ -1011,6 +1063,7 @@ mod linux {
                 0
             );
         }
+        let signal_exit = (128 + signal).to_string();
         let args: &[&str] = if mode == "ignored" {
             &[
                 "tino",
@@ -1021,7 +1074,7 @@ mod linux {
                 "kill -USR1 $$; exit 0",
             ]
         } else {
-            &["tino", "--no-config", "--", "/bin/true"]
+            &["tino", "--no-config", "-e", &signal_exit, "--", "/bin/true"]
         };
         let cli = tino::Cli::try_parse_from(args.iter().copied()).unwrap();
         assert_eq!(
@@ -1278,6 +1331,104 @@ mod linux {
         assert!(wait_with_timeout(&mut child).success());
     }
 
+    fn foreground_interrupt_is_delivered_once() {
+        let mut probe = Command::new(std::env::current_exe().unwrap())
+            .arg("tty-interrupt-probe")
+            .spawn()
+            .unwrap();
+        assert!(wait_with_timeout(&mut probe).success());
+    }
+
+    static INTERRUPT_PTY: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn interrupt_before_fork() {
+        // Deliver the foreground group interrupt synchronously before the child exists.
+        if unsafe {
+            libc::ioctl(
+                INTERRUPT_PTY.load(Ordering::Relaxed),
+                libc::TIOCSIG,
+                libc::SIGINT,
+            )
+        } == -1
+        {
+            unsafe { libc::_exit(1) }
+        }
+    }
+
+    extern "C" fn hold_terminal_relay(_: libc::c_int) {
+        // The workload releases the supervisor with a newline. Using SIGCONT
+        // for synchronization would discard its pending SIGTSTP.
+        let mut byte = 0u8;
+        if unsafe { libc::read(0, (&raw mut byte).cast(), 1) } != 1 {
+            unsafe { libc::_exit(1) }
+        }
+    }
+
+    fn tty_interrupt_workload(master: libc::c_int, source: &str) {
+        // Consume the terminal's copy before letting the supervisor process its
+        // copy. Otherwise two ordinary signals could coalesce and hide a duplicate.
+        unsafe {
+            let mut mask = std::mem::zeroed();
+            libc::sigemptyset(&raw mut mask);
+            let (terminal_signal, key) = match source {
+                "quit" => (libc::SIGQUIT, Some(b'\x1c')),
+                "suspend" => (libc::SIGTSTP, Some(b'\x1a')),
+                "resize" | "direct-resize" => (libc::SIGWINCH, None),
+                _ => (libc::SIGINT, Some(b'\x03')),
+            };
+            let marker = libc::SIGRTMIN();
+            for signal in [terminal_signal, marker] {
+                libc::sigaddset(&raw mut mask, signal);
+            }
+            assert_eq!(
+                libc::pthread_sigmask(libc::SIG_BLOCK, &raw const mask, std::ptr::null_mut()),
+                0
+            );
+            let wait = || {
+                let timeout = libc::timespec {
+                    tv_sec: 1,
+                    tv_nsec: 0,
+                };
+                libc::sigtimedwait(&raw const mask, std::ptr::null_mut(), &raw const timeout)
+            };
+            let supervisor = libc::getppid();
+            if matches!(source, "direct" | "direct-resize" | "moved") {
+                if source != "moved" {
+                    assert_eq!(libc::kill(supervisor, terminal_signal), 0);
+                } else {
+                    // The supervisor still owns the foreground group, but the
+                    // workload left it and needs the supervisor's forwarded copy.
+                    assert_eq!(libc::setpgid(0, 0), 0);
+                    assert_eq!(libc::write(master, b"\x03".as_ptr().cast(), 1), 1);
+                }
+                assert_eq!(wait(), terminal_signal);
+            } else {
+                assert_eq!(libc::kill(supervisor, libc::SIGTRAP), 0);
+                if let Some(key) = key {
+                    assert_eq!(libc::write(master, (&raw const key).cast(), 1), 1);
+                } else {
+                    let size = libc::winsize {
+                        ws_row: 24,
+                        ws_col: 80,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    };
+                    assert_eq!(libc::ioctl(master, libc::TIOCSWINSZ, &raw const size), 0);
+                }
+                let first = wait();
+                // The realtime marker is forwarded after any pending terminal signal.
+                assert_eq!(libc::kill(supervisor, marker), 0);
+                assert_eq!(libc::write(master, b"\n".as_ptr().cast(), 1), 1);
+                assert_eq!(first, terminal_signal);
+                assert_eq!(
+                    wait(),
+                    marker,
+                    "terminal signal {terminal_signal} was forwarded twice"
+                );
+            }
+        }
+    }
+
     fn terminal_stop_keeps_orphan_supervisor_responsive() {
         let mut supervisor = Command::new(std::env::current_exe().unwrap())
             .arg("tty-orphan-supervisor-probe")
@@ -1323,6 +1474,7 @@ mod linux {
             .any(|line| line.starts_with("State:\tT") || line.starts_with("State:\tt"))
     }
 
+    #[track_caller]
     fn wait_for_job_stop(pid: libc::pid_t) {
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
@@ -1369,8 +1521,14 @@ mod linux {
     #[derive(Clone, Copy, Debug)]
     enum TtyJobStart {
         Foreground,
+        RedirectedStdin,
         Background,
         ForegroundBeforeRead,
+    }
+
+    extern "C" fn report_continue_or_marker(signal: libc::c_int) {
+        let byte = if signal == libc::SIGCONT { b'c' } else { b'm' };
+        unsafe { libc::write(libc::STDOUT_FILENO, (&raw const byte).cast(), 1) };
     }
 
     fn exercise_terminal_job_control(
@@ -1380,6 +1538,10 @@ mod linux {
         start: TtyJobStart,
     ) {
         unsafe { libc::signal(libc::SIGTTOU, libc::SIG_IGN) };
+        let check_continue = matches!(
+            (mode, start),
+            (TtyJobMode::SharedGroup, TtyJobStart::Background)
+        );
         let mut command = if matches!(mode, TtyJobMode::PendingContinue) {
             let mut command = Command::new(std::env::current_exe().unwrap());
             command.arg("tty-pending-cont-supervisor");
@@ -1389,6 +1551,9 @@ mod linux {
             command.arg("--no-config");
             if matches!(mode, TtyJobMode::SeparateGroup) {
                 command.arg("-g");
+                if matches!(start, TtyJobStart::Foreground) {
+                    command.args(["-w", "-vv"]).stderr(Stdio::piped());
+                }
             }
             command
                 .arg("--")
@@ -1396,6 +1561,10 @@ mod linux {
                 .arg("tty-read-workload");
             if matches!(start, TtyJobStart::ForegroundBeforeRead) {
                 command.arg("wait-for-fg");
+            } else if matches!(start, TtyJobStart::RedirectedStdin) {
+                command.stdin(Stdio::null()).arg("read-dev-tty");
+            } else if check_continue {
+                command.arg("report-continue");
             }
             command
         };
@@ -1403,11 +1572,15 @@ mod linux {
         // job it also waits here until the shell has foregrounded the job.
         let (mut control, workload) = std::os::unix::net::UnixStream::pair().unwrap();
         command.stdout(OwnedFd::from(workload));
+        let foreground = matches!(
+            start,
+            TtyJobStart::Foreground | TtyJobStart::RedirectedStdin
+        );
+        let shell_tty = std::fs::File::open("/dev/tty").unwrap();
         unsafe {
             command.pre_exec(move || {
                 if libc::setpgid(0, 0) == -1
-                    || (matches!(start, TtyJobStart::Foreground)
-                        && libc::tcsetpgrp(0, libc::getpgrp()) == -1)
+                    || (foreground && libc::tcsetpgrp(shell_tty.as_raw_fd(), libc::getpgrp()) == -1)
                 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1437,14 +1610,32 @@ mod linux {
         }
         let mut peer = peer.spawn().unwrap();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            if !matches!(start, TtyJobStart::Foreground) {
+            if !foreground {
                 if matches!(start, TtyJobStart::Background) {
                     wait_for_job_stop(supervisor_pid);
                 }
                 assert_eq!(unsafe { libc::tcgetpgrp(0) }, parent_group);
                 assert_eq!(unsafe { libc::tcsetpgrp(0, supervisor_pid) }, 0);
                 // A shell sends CONT only when the job was stopped.
-                if matches!(start, TtyJobStart::Background) {
+                if check_continue {
+                    // Resume the group members individually so the workload has
+                    // consumed CONT before tino can process its own copy.
+                    control
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    assert_eq!(unsafe { libc::kill(main_pid, libc::SIGCONT) }, 0);
+                    let mut byte = [0];
+                    control.read_exact(&mut byte).unwrap();
+                    assert_eq!(byte, *b"c");
+                    assert_eq!(
+                        unsafe { libc::kill(peer.id().cast_signed(), libc::SIGCONT) },
+                        0
+                    );
+                    assert_eq!(unsafe { libc::kill(supervisor_pid, libc::SIGCONT) }, 0);
+                    assert_eq!(unsafe { libc::kill(supervisor_pid, libc::SIGRTMIN()) }, 0);
+                    control.read_exact(&mut byte).unwrap();
+                    assert_eq!(byte, *b"m", "supervisor repeated the job's CONT");
+                } else if matches!(start, TtyJobStart::Background) {
                     assert_eq!(unsafe { libc::kill(-supervisor_pid, libc::SIGCONT) }, 0);
                 } else {
                     control.write_all(b"r").unwrap();
@@ -1463,7 +1654,16 @@ mod linux {
             // `fg`: the shell assigns the original job group before CONT.
             assert_eq!(unsafe { libc::tcsetpgrp(0, parent_group) }, 0);
             assert_eq!(unsafe { libc::tcsetpgrp(0, supervisor_pid) }, 0);
-            assert_eq!(unsafe { libc::kill(-supervisor_pid, libc::SIGCONT) }, 0);
+            if check_continue {
+                // This time only tino can relay CONT to the stopped workload.
+                assert_eq!(
+                    unsafe { libc::kill(peer.id().cast_signed(), libc::SIGCONT) },
+                    0
+                );
+                assert_eq!(unsafe { libc::kill(supervisor_pid, libc::SIGCONT) }, 0);
+            } else {
+                assert_eq!(unsafe { libc::kill(-supervisor_pid, libc::SIGCONT) }, 0);
+            }
             wait_for_resumed_foreground(main_pid, work_group);
             assert_eq!(unsafe { libc::kill(-work_group, libc::SIGTSTP) }, 0);
             wait_for_job_stop(supervisor_pid);
@@ -1498,6 +1698,12 @@ mod linux {
         assert_eq!(unsafe { libc::tcsetpgrp(0, parent_group) }, 0);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
+        }
+        if let Some(stderr) = supervisor.stderr.take() {
+            let log = std::io::read_to_string(stderr).unwrap();
+            let stopped = format!("tino: child PID {main_pid} stopped by signal ");
+            assert!(log.contains(&format!("DEBUG {stopped}")), "{log}");
+            assert!(!log.contains(&format!("WARN {stopped}")), "{log}");
         }
     }
 
@@ -1616,6 +1822,52 @@ mod linux {
         }
     }
 
+    fn main_child_receives_stop_when_group_delivery_fails() {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tino"));
+        command.args([
+            "--no-config",
+            "-g",
+            "--grace-ms",
+            "2000",
+            "--",
+            "/bin/sh",
+            "-c",
+            "kill -TERM \"$PPID\"; exec /bin/sleep 5",
+        ]);
+        // Limit the test process to direct SIGTERM delivery. Group SIGKILL
+        // remains available to clean up and distinguish a missed stop by status.
+        unsafe {
+            command.pre_exec(|| {
+                let op = |code, jf, k| libc::sock_filter { code, jt: 0, jf, k };
+                let low_word = if cfg!(target_endian = "little") { 0 } else { 4 };
+                let mut filter = [
+                    op(0x20, 0, 0), // load syscall number
+                    op(0x15, 5, libc::SYS_kill as u32),
+                    op(0x20, 0, 24 + low_word), // signal
+                    op(0x15, 3, libc::SIGTERM as u32),
+                    op(0x20, 0, 16 + low_word), // pid
+                    op(0x45, 1, 1 << 31),       // negative PID selects a group
+                    op(0x06, 0, libc::SECCOMP_RET_ERRNO | libc::EPERM as u32),
+                    op(0x06, 0, libc::SECCOMP_RET_ALLOW),
+                ];
+                let program = libc::sock_fprog {
+                    len: filter.len() as u16,
+                    filter: filter.as_mut_ptr(),
+                };
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1
+                    || libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) == -1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert_eq!(
+            wait_with_timeout(&mut command.spawn().unwrap()).code(),
+            Some(128 + libc::SIGTERM)
+        );
+    }
+
     fn moved_main_workload(ignore_term: bool) -> ! {
         unsafe {
             let parent_group = libc::getpgid(libc::getppid());
@@ -1639,6 +1891,40 @@ mod linux {
 
     fn supervision_failure_reaps_adopted_descendants() {
         run_descendant_failure_probe("shutdown");
+    }
+
+    fn immediate_group_cleanup_reaps_adopted_worker() {
+        let (reader, writer) = std::io::pipe().unwrap();
+        let fd = writer.as_raw_fd();
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, 0);
+        let cli = tino::Cli::try_parse_from([
+            "tino",
+            "--no-config",
+            "-s",
+            "-g",
+            "-t0",
+            "--",
+            "/bin/sh",
+            "-ec",
+            r#"trap '' TERM; sleep 3 & echo "$!" > "/proc/self/fd/$1"; exit 42"#,
+            "sh",
+            &fd.to_string(),
+        ])
+        .unwrap();
+        assert_eq!(tino::run(cli).unwrap(), 42);
+        drop(writer);
+        let mut pid = String::new();
+        BufReader::new(reader).read_line(&mut pid).unwrap();
+        let worker: libc::pid_t = pid.trim().parse().unwrap();
+        assert!(worker > 0);
+        // A positive result means the library left its killed worker for the
+        // caller to reap. Waiting here also cleans it up on regression.
+        let reaped = unsafe { libc::waitpid(worker, std::ptr::null_mut(), 0) };
+        assert_eq!(reaped, -1, "tino returned before reaping worker {worker}");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     fn cleanup_failure_terminates_adopted_descendants() {
@@ -1903,13 +2189,96 @@ mod linux {
         assert_eq!(tino::run(cli).expect("supervise terminal probe"), 0);
     }
 
-    fn tty_library_probe(mode: &str) {
+    fn terminal_pipelines_keep_input_and_keyboard_signals() {
+        // Bash reads commands and prints its terminal echo on the PTY. Only
+        // actual command output and our prompt marker go to the control socket.
+        let (mut master, slave) = open_pty();
+        let (output, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        output
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        // Bash can emit an empty line after an interrupt.
+        let mut lines = BufReader::new(output).lines();
+        let mut expect = |expected: &str| {
+            let next = lines
+                .by_ref()
+                .map(|line| line.unwrap_or_else(|err| panic!("waiting for {expected:?}: {err}")))
+                .find(|line| !line.is_empty());
+            assert_eq!(next.as_deref(), Some(expected));
+        };
+        let mut command = Command::new("bash");
+        command
+            .args(["--noprofile", "--norc", "--noediting", "-i"])
+            .env("TINO", env!("CARGO_BIN_EXE_tino"))
+            .env("HISTFILE", "/dev/null")
+            .env("PS1", "")
+            .env("PROMPT_COMMAND", "echo prompt")
+            .stdin(slave.try_clone().unwrap())
+            .stdout(OwnedFd::from(writer))
+            .stderr(slave);
+        // Bash owns the session, so closing the master also hangs up its jobs
+        // if a failed assertion interrupts the conversation.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut shell = command.spawn().unwrap();
+        expect("prompt");
+        let pipeline = r#"cat | "$TINO" --no-config -g -- sh -c 'echo ready; exec cat'"#;
+        writeln!(master, "{pipeline}").unwrap();
+        expect("ready");
+        for line in ["first", "second"] {
+            writeln!(master, "{line}").unwrap();
+            expect(line);
+        }
+        master.write_all(b"\x1a").unwrap();
+        expect("prompt");
+        writeln!(master, "echo continuing; fg >/dev/null").unwrap();
+        expect("continuing");
+        writeln!(master, "resumed").unwrap();
+        expect("resumed");
+        master.write_all(b"\x03").unwrap();
+        expect("prompt");
+
+        writeln!(
+            master,
+            "sleep 30 | \"$TINO\" --no-config -g -- sh -c 'echo ready; exec cat </dev/tty'"
+        )
+        .unwrap();
+        expect("ready");
+        writeln!(master, "from-tty").unwrap();
+        expect("from-tty");
+        master.write_all(b"\x1a").unwrap();
+        expect("prompt");
+        writeln!(master, "kill -TERM %+; fg >/dev/null").unwrap();
+        expect("prompt");
+
+        // Neither sleeper reads the terminal or exits when its peer closes the pipe.
+        let sleeper = "sh -c 'echo ready >&3; exec sleep 30'";
+        for pipeline in [
+            format!(r#""$TINO" --no-config -g -- {sleeper} | {sleeper}"#),
+            format!(r#"{sleeper} | "$TINO" --no-config -g -- {sleeper}"#),
+        ] {
+            writeln!(master, "{{ {pipeline}; }} 3>&1").unwrap();
+            expect("ready");
+            expect("ready");
+            master.write_all(b"\x03").unwrap();
+            expect("prompt");
+        }
+        writeln!(master, "jobs -p; echo done; exit 0").unwrap();
+        expect("done");
+        assert!(wait_with_timeout(&mut shell).success());
+    }
+
+    fn open_pty() -> (std::fs::File, std::fs::File) {
         let mut master = -1;
         let mut slave = -1;
-        // SAFETY: this is an isolated single-threaded probe; all output pointers
-        // are valid and the newly allocated tty descriptors are owned below.
+        // SAFETY: openpty initializes both descriptors on success.
         unsafe {
-            assert_ne!(libc::setsid(), -1);
             assert_eq!(
                 libc::openpty(
                     &raw mut master,
@@ -1922,20 +2291,75 @@ mod linux {
             );
             assert_eq!(libc::fcntl(master, libc::F_SETFD, libc::FD_CLOEXEC), 0);
             assert_eq!(libc::fcntl(slave, libc::F_SETFD, libc::FD_CLOEXEC), 0);
-            assert_eq!(libc::ioctl(slave, libc::TIOCSCTTY, 0), 0);
-            assert_eq!(libc::dup2(slave, libc::STDIN_FILENO), libc::STDIN_FILENO);
+            (
+                std::fs::File::from_raw_fd(master),
+                std::fs::File::from_raw_fd(slave),
+            )
+        }
+    }
+
+    fn tty_library_probe(mode: &str) {
+        assert_ne!(unsafe { libc::setsid() }, -1);
+        let (master_fd, slave) = open_pty();
+        let master = master_fd.as_raw_fd();
+        unsafe {
+            assert_eq!(libc::ioctl(slave.as_raw_fd(), libc::TIOCSCTTY, 0), 0);
+            assert_eq!(
+                libc::dup2(slave.as_raw_fd(), libc::STDIN_FILENO),
+                libc::STDIN_FILENO
+            );
             // Closing the master at the end of this isolated probe sends HUP.
             libc::signal(libc::SIGHUP, libc::SIG_IGN);
         }
-        let _master = unsafe { OwnedFd::from_raw_fd(master) };
-        let _slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let own_group = unsafe { libc::getpgrp() };
         assert_eq!(unsafe { libc::tcgetpgrp(0) }, own_group);
 
+        if mode == "tty-interrupt-probe" {
+            // The workload generates keyboard and resize events on this isolated PTY.
+            assert_eq!(unsafe { libc::fcntl(master, libc::F_SETFD, 0) }, 0);
+            assert_ne!(
+                unsafe { libc::signal(libc::SIGTRAP, hold_terminal_relay as *const () as usize) },
+                libc::SIG_ERR
+            );
+            let exe = std::env::current_exe().unwrap();
+            for source in [
+                "direct",
+                "direct-resize",
+                "terminal",
+                "quit",
+                "suspend",
+                "resize",
+                "moved",
+            ] {
+                let cli = tino::Cli::try_parse_from([
+                    "tino",
+                    "--no-config",
+                    "--grace-ms",
+                    "3000",
+                    "--",
+                    exe.to_str().unwrap(),
+                    "tty-interrupt-workload",
+                    &master.to_string(),
+                    source,
+                ])
+                .unwrap();
+                assert_eq!(tino::run(cli).unwrap(), 0);
+            }
+            INTERRUPT_PTY.store(master, Ordering::Relaxed);
+            assert_eq!(
+                unsafe { libc::pthread_atfork(Some(interrupt_before_fork), None, None) },
+                0
+            );
+            let cli = tino::Cli::try_parse_from(["tino", "--no-config", "--", "/bin/sleep", "5"])
+                .unwrap();
+            assert_eq!(tino::run(cli).unwrap(), 128 + libc::SIGINT);
+            return;
+        }
         if mode == "tty-job-control-probe" {
             for mode in [TtyJobMode::SharedGroup, TtyJobMode::SeparateGroup] {
                 for start in [
                     TtyJobStart::Foreground,
+                    TtyJobStart::RedirectedStdin,
                     TtyJobStart::Background,
                     TtyJobStart::ForegroundBeforeRead,
                 ] {
@@ -2460,12 +2884,20 @@ mod linux {
             );
 
             for fail_before_spawn in [false, true] {
+                let exe = std::env::current_exe().unwrap();
+                let workload = if fail_before_spawn {
+                    "\0"
+                } else if handler == libc::SIG_IGN {
+                    "auto-reap-workload"
+                } else {
+                    "waitable-workload"
+                };
                 let cli = tino::Cli::try_parse_from([
                     "tino",
+                    "--no-config",
                     "--",
-                    "/bin/sh",
-                    "-c",
-                    if fail_before_spawn { "\0" } else { "exit 23" },
+                    exe.to_str().unwrap(),
+                    workload,
                 ])
                 .expect("parse probe command");
                 let result = tino::run(cli);
@@ -2576,6 +3008,20 @@ mod linux {
                     "output={output}, errno={errno}"
                 );
             }
+        }
+    }
+
+    fn library_help_reports_stdout_errors() {
+        for mode in ["broken-pipe", "closed"] {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["help-output-probe", mode])
+                .stdout(writer)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(1), "{mode}: {output:?}");
+            assert!(String::from_utf8_lossy(&output.stderr).contains("write stdout"));
         }
     }
 
@@ -2719,7 +3165,11 @@ mod linux {
     }
 
     pub(super) fn run() {
-        let tests: [(&str, fn()); 29] = [
+        let tests: [(&str, fn()); 34] = [
+            (
+                "main_child_receives_stop_when_group_delivery_fails",
+                main_child_receives_stop_when_group_delivery_fails,
+            ),
             (
                 "readonly_stderr_does_not_gain_write_access",
                 readonly_stderr_does_not_gain_write_access,
@@ -2729,8 +3179,8 @@ mod linux {
                 full_stderr_does_not_postpone_shutdown,
             ),
             (
-                "exec_failure_preserves_status_with_full_stderr",
-                exec_failure_preserves_status_with_full_stderr,
+                "failures_preserve_status_with_full_stderr",
+                failures_preserve_status_with_full_stderr,
             ),
             (
                 "child_resets_inherited_caught_signal_handlers",
@@ -2755,6 +3205,10 @@ mod linux {
             (
                 "diagnostics_preserve_status_with_file_size_limit",
                 diagnostics_preserve_status_with_file_size_limit,
+            ),
+            (
+                "library_help_reports_stdout_errors",
+                library_help_reports_stdout_errors,
             ),
             (
                 "external_sigxfsz_is_forwarded",
@@ -2785,6 +3239,14 @@ mod linux {
                 terminal_job_control_supports_foreground_and_background_resume,
             ),
             (
+                "terminal_pipelines_keep_input_and_keyboard_signals",
+                terminal_pipelines_keep_input_and_keyboard_signals,
+            ),
+            (
+                "foreground_interrupt_is_delivered_once",
+                foreground_interrupt_is_delivered_once,
+            ),
+            (
                 "terminal_stop_keeps_orphan_supervisor_responsive",
                 terminal_stop_keeps_orphan_supervisor_responsive,
             ),
@@ -2799,6 +3261,10 @@ mod linux {
             (
                 "supervision_failure_reaps_adopted_descendants",
                 supervision_failure_reaps_adopted_descendants,
+            ),
+            (
+                "immediate_group_cleanup_reaps_adopted_worker",
+                immediate_group_cleanup_reaps_adopted_worker,
             ),
             (
                 "cleanup_failure_terminates_adopted_descendants",
@@ -2839,13 +3305,39 @@ mod linux {
         ];
         let args: Vec<_> = std::env::args().skip(1).collect();
         match args.first().map(String::as_str) {
+            Some(mode @ ("auto-reap-workload" | "waitable-workload")) => {
+                let mut worker = Command::new("/bin/true").spawn().unwrap();
+                if mode == "auto-reap-workload" {
+                    assert_eq!(
+                        worker
+                            .wait()
+                            .expect_err("worker should be automatically reaped")
+                            .raw_os_error(),
+                        Some(libc::ECHILD)
+                    );
+                } else {
+                    assert!(worker.wait().expect("worker should be waitable").success());
+                }
+                std::process::exit(23);
+            }
             Some("full-stderr-workload") => full_stderr_workload(),
+            Some("help-output-probe") => {
+                assert_ne!(
+                    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) },
+                    libc::SIG_ERR
+                );
+                if args[1] == "closed" {
+                    assert_eq!(unsafe { libc::close(libc::STDOUT_FILENO) }, 0);
+                }
+                let _ = tino::Cli::parse_from(["tino", "--help"]);
+                unreachable!("help terminates the process");
+            }
             Some("sigchld-restore-failure-probe") => {
                 sigchld_restore_failure_probe();
                 return;
             }
             Some("subreaper-restore-failure-probe") => {
-                subreaper_restore_failure_probe(args[1] == "supervision");
+                subreaper_restore_failure_probe(&args[1]);
                 return;
             }
             Some("child-signal-handler-probe") => {
@@ -2895,6 +3387,7 @@ mod linux {
             }
             Some(
                 mode @ ("tty-library-probe"
+                | "tty-interrupt-probe"
                 | "tty-job-control-probe"
                 | "tty-orphan-supervisor-probe"),
             ) => {
@@ -2905,6 +3398,10 @@ mod linux {
                 tty_pending_cont_supervisor();
                 return;
             }
+            Some("tty-interrupt-workload") => {
+                tty_interrupt_workload(args[1].parse().unwrap(), &args[2]);
+                return;
+            }
             Some("tty-read-workload") => {
                 // A job-control shell gives the workload ordinary stop signals.
                 unsafe {
@@ -2913,6 +3410,19 @@ mod linux {
                     for signal in [libc::SIGTTIN, libc::SIGTSTP] {
                         libc::signal(signal, libc::SIG_DFL);
                         libc::sigaddset(&raw mut mask, signal);
+                    }
+                    if args.get(1).is_some_and(|arg| arg == "report-continue") {
+                        let mut action: libc::sigaction = std::mem::zeroed();
+                        action.sa_sigaction = report_continue_or_marker as *const () as usize;
+                        action.sa_flags = libc::SA_RESTART;
+                        libc::sigfillset(&raw mut action.sa_mask);
+                        for signal in [libc::SIGCONT, libc::SIGRTMIN()] {
+                            assert_eq!(
+                                libc::sigaction(signal, &raw const action, std::ptr::null_mut()),
+                                0
+                            );
+                            libc::sigaddset(&raw mut mask, signal);
+                        }
                     }
                     assert_eq!(
                         libc::pthread_sigmask(
@@ -2933,8 +3443,15 @@ mod linux {
                     );
                     assert_eq!(byte[0], b'r');
                 }
-                std::io::stdin().read_exact(&mut byte).unwrap();
-                assert_eq!(byte[0], b'x');
+                let mut input = String::new();
+                if args.get(1).is_some_and(|arg| arg == "read-dev-tty") {
+                    BufReader::new(std::fs::File::open("/dev/tty").unwrap())
+                        .read_line(&mut input)
+                        .unwrap();
+                } else {
+                    std::io::stdin().read_line(&mut input).unwrap();
+                }
+                assert_eq!(input, "x\n");
                 std::process::exit(23);
             }
             Some("tty-background-library-probe") => {
@@ -2977,6 +3494,11 @@ mod linux {
         }
         // Implement nextest's custom-harness protocol while running each probe on
         // this process's main thread. There are no ignored tests in this harness.
+        for name in crate::common::RUNTIME_ENV {
+            // SAFETY: the custom harness is single-threaded here. Nested probes
+            // have already been dispatched with their test-specific environment.
+            unsafe { std::env::remove_var(name) };
+        }
         if args.iter().any(|arg| arg == "--ignored") {
             return;
         }

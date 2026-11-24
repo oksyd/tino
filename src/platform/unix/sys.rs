@@ -1,7 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::mem::{size_of, zeroed};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 pub(super) type Result<T> = std::result::Result<T, Errno>;
@@ -103,85 +103,28 @@ pub(crate) enum Signal {
     SIGSYS = libc::SIGSYS,
 }
 
-impl TryFrom<i32> for Signal {
-    type Error = i32;
-
-    fn try_from(value: i32) -> std::result::Result<Self, Self::Error> {
-        match value {
-            libc::SIGHUP => Ok(Self::SIGHUP),
-            libc::SIGINT => Ok(Self::SIGINT),
-            libc::SIGQUIT => Ok(Self::SIGQUIT),
-            libc::SIGILL => Ok(Self::SIGILL),
-            libc::SIGTRAP => Ok(Self::SIGTRAP),
-            libc::SIGABRT => Ok(Self::SIGABRT),
-            libc::SIGBUS => Ok(Self::SIGBUS),
-            libc::SIGFPE => Ok(Self::SIGFPE),
-            libc::SIGKILL => Ok(Self::SIGKILL),
-            libc::SIGUSR1 => Ok(Self::SIGUSR1),
-            libc::SIGSEGV => Ok(Self::SIGSEGV),
-            libc::SIGUSR2 => Ok(Self::SIGUSR2),
-            libc::SIGPIPE => Ok(Self::SIGPIPE),
-            libc::SIGALRM => Ok(Self::SIGALRM),
-            libc::SIGTERM => Ok(Self::SIGTERM),
-            libc::SIGCHLD => Ok(Self::SIGCHLD),
-            libc::SIGCONT => Ok(Self::SIGCONT),
-            libc::SIGWINCH => Ok(Self::SIGWINCH),
-            libc::SIGTSTP => Ok(Self::SIGTSTP),
-            libc::SIGTTIN => Ok(Self::SIGTTIN),
-            libc::SIGTTOU => Ok(Self::SIGTTOU),
-            libc::SIGSYS => Ok(Self::SIGSYS),
-            _ => Err(value),
-        }
-    }
-}
-
-pub(super) const SIGABRT: Signal = Signal::SIGABRT;
-pub(super) const SIGBUS: Signal = Signal::SIGBUS;
-pub(super) const SIGCHLD: Signal = Signal::SIGCHLD;
-pub(super) const SIGFPE: Signal = Signal::SIGFPE;
-pub(super) const SIGILL: Signal = Signal::SIGILL;
-pub(super) const SIGINT: Signal = Signal::SIGINT;
-pub(super) const SIGKILL: Signal = Signal::SIGKILL;
-pub(super) const SIGPIPE: Signal = Signal::SIGPIPE;
-pub(super) const SIGQUIT: Signal = Signal::SIGQUIT;
-pub(super) const SIGSEGV: Signal = Signal::SIGSEGV;
-pub(super) const SIGSYS: Signal = Signal::SIGSYS;
-pub(super) const SIGTERM: Signal = Signal::SIGTERM;
-pub(super) const SIGTRAP: Signal = Signal::SIGTRAP;
-pub(super) const SIGTTIN: Signal = Signal::SIGTTIN;
-pub(super) const SIGTTOU: Signal = Signal::SIGTTOU;
+pub(super) use Signal::{
+    SIGABRT, SIGBUS, SIGCHLD, SIGFPE, SIGILL, SIGINT, SIGKILL, SIGPIPE, SIGQUIT, SIGSEGV, SIGSYS,
+    SIGTERM, SIGTRAP, SIGTTIN, SIGTTOU,
+};
 
 pub(crate) struct DiagnosticWriteGuard {
-    restore_mask: libc::sigset_t,
-    pending_before: libc::sigset_t,
+    restore_mask: SigSet,
+    pending_before: SigSet,
 }
 
 impl DiagnosticWriteGuard {
     // Uses only stack storage and signal-safe calls, including in a forked child.
     pub(crate) fn new() -> Option<Self> {
-        let mut blocked = unsafe { zeroed() };
-        let mut previous_mask = unsafe { zeroed() };
-        // SAFETY: all signal sets point to valid writable storage.
-        unsafe {
-            libc::sigemptyset(&raw mut blocked);
-            libc::sigaddset(&raw mut blocked, libc::SIGPIPE);
-            libc::sigaddset(&raw mut blocked, libc::SIGXFSZ);
-        }
-        if unsafe {
-            libc::pthread_sigmask(libc::SIG_BLOCK, &raw const blocked, &raw mut previous_mask)
-        } != 0
-        {
-            return None;
-        }
+        let mut blocked = SigSet::empty();
+        blocked.add_raw(libc::SIGPIPE);
+        blocked.add_raw(libc::SIGXFSZ);
         let mut guard = Self {
-            restore_mask: previous_mask,
-            pending_before: unsafe { zeroed() },
+            restore_mask: blocked.block_on_thread().ok()?,
+            pending_before: SigSet::empty(),
         };
-        if unsafe { libc::sigpending(&raw mut guard.pending_before) } != 0 {
-            // Restore the mask on failure and skip writing: a new pending
-            // signal could otherwise be mistaken for the caller's signal.
-            return None;
-        }
+        // Dropping the guard restores the mask if the pending set cannot be read.
+        guard.pending_before = SigSet::pending().ok()?;
         Some(guard)
     }
 
@@ -191,58 +134,46 @@ impl DiagnosticWriteGuard {
             libc::EFBIG => libc::SIGXFSZ,
             _ => return,
         };
-        if unsafe { libc::sigismember(&raw const self.pending_before, signal) } == 1 {
+        if self.pending_before.contains_raw(signal) {
             return;
         }
-        let mut consume = unsafe { zeroed() };
-        unsafe {
-            libc::sigemptyset(&raw mut consume);
-            libc::sigaddset(&raw mut consume, signal);
-        }
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: the signal remains blocked; consume only a newly pending
+        let mut consume = SigSet::empty();
+        consume.add_raw(signal);
+        // The signal remains blocked; consume only a newly pending
         // write-failure signal before restoring the caller's original mask.
         // Count interruptions too so a denied syscall cannot stall cleanup.
         for _ in 0..64 {
-            let result =
-                unsafe { libc::sigtimedwait(&raw const consume, std::ptr::null_mut(), &timeout) };
-            if result >= 0 {
-                return;
-            }
-            match Errno::last() {
-                Errno::EAGAIN => return,
-                Errno::EINTR => {}
-                _ => break,
+            match consume.wait_nohang() {
+                Ok(_) => return,
+                Err(Errno::EINTR) => {}
+                Err(_) => break,
             }
         }
         // Cleanup can be denied by seccomp. Preserve this blocked bit rather
         // than deliver our write-generated signal into the calling process.
-        unsafe { libc::sigaddset(&raw mut self.restore_mask, signal) };
+        self.restore_mask.add_raw(signal);
     }
 }
 
 impl Drop for DiagnosticWriteGuard {
     fn drop(&mut self) {
-        // SAFETY: restore the captured mask, retaining only signals whose
-        // write-failure cleanup could not finish safely.
-        unsafe {
-            libc::pthread_sigmask(
-                libc::SIG_SETMASK,
-                &raw const self.restore_mask,
-                std::ptr::null_mut(),
-            );
-        }
+        let _ = self.restore_mask.thread_set_mask();
     }
 }
 
 pub(crate) struct DiagnosticWriter {
     fd: OwnedFd,
-    socket: bool,
-    remaining_writes: usize,
+    target: DiagnosticTarget,
+    remaining_retries: usize,
     signals: DiagnosticWriteGuard,
+    buffer: [u8; libc::PIPE_BUF],
+    buffered: usize,
+}
+
+enum DiagnosticTarget {
+    Direct,
+    Socket,
+    InheritedPipe,
 }
 
 impl DiagnosticWriter {
@@ -263,7 +194,7 @@ impl DiagnosticWriter {
             || flags & libc::O_PATH != 0
             || !matches!(flags & libc::O_ACCMODE, libc::O_WRONLY | libc::O_RDWR)
         {
-            // Reopening a pipe must not turn a read-only or path-only stderr
+            // Reopening must not turn a read-only or path-only stderr
             // descriptor into a writable channel that the caller did not pass.
             return None;
         }
@@ -272,81 +203,87 @@ impl DiagnosticWriter {
             return None;
         }
         let kind = original.st_mode & libc::S_IFMT;
-        let fd = if kind == libc::S_IFIFO {
-            // dup would share O_NONBLOCK with the managed command. Reopening
-            // through procfs creates an independent file description instead.
+        // Opening Linux's /dev/ptmx (5:2) would create a new terminal pair.
+        // Leave that descriptor and non-terminal character devices alone.
+        let terminal = kind == libc::S_IFCHR
+            && original.st_rdev != libc::makedev(5, 2)
+            && unsafe { libc::isatty(fd) } == 1;
+        let (fd, target) = if kind == libc::S_IFIFO || terminal {
+            use std::io::Write as _;
+
+            // Isolate O_NONBLOCK from the managed command. Refer to the pinned
+            // fd because a library caller can redirect stderr concurrently.
+            let mut path = [0; 32];
+            write!(&mut &mut path[..], "/proc/self/fd/{fd}").ok()?;
+            let path = CStr::from_bytes_until_nul(&path).ok()?;
             let fd = unsafe {
                 libc::open(
-                    c"/proc/self/fd/2".as_ptr(),
+                    path.as_ptr(),
                     libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
                 )
             };
-            if fd == -1 {
+            if fd >= 0 {
+                // SAFETY: open returned a fresh descriptor owned by this writer.
+                (
+                    unsafe { OwnedFd::from_raw_fd(fd) },
+                    DiagnosticTarget::Direct,
+                )
+            } else if kind == libc::S_IFIFO {
+                (pinned, DiagnosticTarget::InheritedPipe)
+            } else {
                 return None;
             }
-            // SAFETY: open returned a fresh descriptor owned by this writer.
-            let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-            let mut reopened = unsafe { zeroed::<libc::stat>() };
-            if unsafe { libc::fstat(fd, &raw mut reopened) } == -1
-                || reopened.st_mode & libc::S_IFMT != libc::S_IFIFO
-                || reopened.st_dev != original.st_dev
-                || reopened.st_ino != original.st_ino
-            {
-                // A caller may concurrently redirect stderr. Do not write
-                // through a reopened regular file with a fresh offset, or fall
-                // back to the original potentially blocking pipe.
-                return None;
-            }
-            owned
+        } else if kind == libc::S_IFSOCK {
+            (pinned, DiagnosticTarget::Socket)
         } else {
             // Preserve shared offsets and append behavior for regular files.
-            pinned
+            (pinned, DiagnosticTarget::Direct)
         };
         Some(Self {
             fd,
-            socket: kind == libc::S_IFSOCK,
-            remaining_writes: 64,
+            target,
+            remaining_retries: 64,
             signals,
+            buffer: [0; libc::PIPE_BUF],
+            buffered: 0,
         })
     }
 
-    pub(crate) fn write_all(&mut self, mut bytes: &[u8]) -> fmt::Result {
+    fn flush(&mut self) -> fmt::Result {
+        let mut bytes = &self.buffer[..std::mem::take(&mut self.buffered)];
         while !bytes.is_empty() {
-            if self.remaining_writes == 0 {
-                return Err(fmt::Error);
-            }
-            self.remaining_writes -= 1;
             // SAFETY: bytes is valid for this length and the descriptor remains
             // borrowed or owned for the writer's lifetime. Socket flags apply
             // to this send only, leaving the caller's descriptor flags intact.
-            let written = unsafe {
-                if self.socket {
+            let fd = self.fd.as_raw_fd();
+            let written = match self.target {
+                DiagnosticTarget::Socket => byte_count(unsafe {
                     libc::send(
-                        self.fd.as_raw_fd(),
+                        fd,
                         bytes.as_ptr().cast(),
                         bytes.len(),
                         libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                     )
-                } else {
-                    libc::write(self.fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len())
+                }),
+                DiagnosticTarget::Direct => {
+                    byte_count(unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) })
                 }
+                DiagnosticTarget::InheritedPipe => write_inherited_pipe(fd, bytes),
             };
-            if written > 0 {
-                bytes = bytes.get(written.cast_unsigned()..).ok_or(fmt::Error)?;
-                continue;
-            }
-            if written == -1 {
-                let errno = Errno::last();
-                if errno == Errno::EINTR {
-                    continue;
-                }
-                // MSG_NOSIGNAL already suppresses socket write signals; do not
-                // consume a concurrently received external SIGPIPE there.
-                if !self.socket {
-                    self.signals.consume_failure(errno.raw());
+            match written {
+                Ok(count) if count == bytes.len() => break,
+                Ok(0) => return Err(fmt::Error),
+                Ok(count) => bytes = bytes.get(count..).ok_or(fmt::Error)?,
+                Err(Errno::EINTR) => {}
+                Err(errno) => {
+                    // MSG_NOSIGNAL already suppresses socket write signals.
+                    if !matches!(self.target, DiagnosticTarget::Socket) {
+                        self.signals.consume_failure(errno.raw());
+                    }
+                    return Err(fmt::Error);
                 }
             }
-            return Err(fmt::Error);
+            self.remaining_retries = self.remaining_retries.checked_sub(1).ok_or(fmt::Error)?;
         }
         Ok(())
     }
@@ -354,13 +291,91 @@ impl DiagnosticWriter {
 
 impl fmt::Write for DiagnosticWriter {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        self.write_all(value.as_bytes())
+        // Keep a short diagnostic in one pipe write or socket record even when
+        // the formatter produces several fragments. Longer messages stream out.
+        let mut bytes = value.as_bytes();
+        while !bytes.is_empty() {
+            let count = bytes.len().min(self.buffer.len() - self.buffered);
+            let (part, rest) = bytes.split_at(count);
+            self.buffer[self.buffered..self.buffered + count].copy_from_slice(part);
+            self.buffered += count;
+            if self.buffered == self.buffer.len() {
+                self.flush()?;
+            }
+            bytes = rest;
+        }
+        Ok(())
     }
 }
 
-pub(super) struct SignalAction(libc::sigaction);
+impl Drop for DiagnosticWriter {
+    fn drop(&mut self) {
+        let _ = self.flush();
+    }
+}
+
+fn byte_count(result: isize) -> Result<usize> {
+    if result < 0 {
+        Err(Errno::last())
+    } else {
+        Ok(result.cast_unsigned())
+    }
+}
+
+fn write_inherited_pipe(fd: libc::c_int, bytes: &[u8]) -> Result<usize> {
+    let iov = libc::iovec {
+        iov_base: bytes.as_ptr().cast_mut().cast(),
+        iov_len: bytes.len(),
+    };
+    // SAFETY: the iovec borrows bytes for one write. Both offset words are all
+    // ones for offset -1 on 32- and 64-bit Linux. NOWAIT leaves fd flags alone.
+    let written = byte_count(unsafe {
+        libc::syscall(
+            libc::SYS_pwritev2,
+            fd,
+            &raw const iov,
+            1,
+            -1 as libc::c_long,
+            -1 as libc::c_long,
+            libc::RWF_NOWAIT,
+        ) as isize
+    });
+    if !matches!(
+        written,
+        Err(Errno::ENOSYS | Errno::EOPNOTSUPP | Errno::EPERM | Errno::EACCES)
+    ) {
+        return written;
+    }
+    // Older kernels and filtered containers can still relay one bounded chunk
+    // into a free pipe slot without changing or blocking the inherited writer.
+    let mut fds = [-1; 2];
+    errno_unit(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) })?;
+    // SAFETY: pipe2 created two independently owned descriptors.
+    let [reader, writer] = fds.map(|raw| unsafe { OwnedFd::from_raw_fd(raw) });
+    let staged =
+        byte_count(unsafe { libc::write(writer.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) })?;
+    byte_count(unsafe {
+        libc::splice(
+            reader.as_raw_fd(),
+            std::ptr::null_mut(),
+            fd,
+            std::ptr::null_mut(),
+            staged,
+            libc::SPLICE_F_NONBLOCK,
+        )
+    })
+}
+
+pub(super) struct SignalAction {
+    pub(super) signal: libc::c_int,
+    previous: libc::sigaction,
+}
 
 impl SignalAction {
+    pub(super) fn is_ignored(&self) -> bool {
+        self.previous.sa_sigaction == libc::SIG_IGN
+    }
+
     pub(super) fn reset_caught_handlers() -> Result<()> {
         let realtime_min = libc::SIGRTMIN();
         for signal in 1..=libc::SIGRTMAX() {
@@ -400,16 +415,14 @@ impl SignalAction {
         let mut previous = unsafe { zeroed() };
         // SAFETY: both pointers refer to valid sigaction storage.
         errno_unit(unsafe { libc::sigaction(signal, &raw const action, &raw mut previous) })?;
-        Ok(Self(previous))
+        Ok(Self { signal, previous })
     }
 
-    pub(super) fn restore(&self, signal: Signal) -> Result<()> {
-        self.restore_raw(signal as i32)
-    }
-
-    pub(super) fn restore_raw(&self, signal: libc::c_int) -> Result<()> {
+    pub(super) fn restore(&self) -> Result<()> {
         // SAFETY: the action was captured by sigaction for this signal.
-        errno_unit(unsafe { libc::sigaction(signal, &raw const self.0, std::ptr::null_mut()) })
+        errno_unit(unsafe {
+            libc::sigaction(self.signal, &raw const self.previous, std::ptr::null_mut())
+        })
     }
 }
 
@@ -422,10 +435,6 @@ impl SigSet {
         // SAFETY: the pointer is valid for writing an initialized signal set.
         unsafe { libc::sigemptyset(&raw mut set) };
         Self(set)
-    }
-
-    pub(super) fn add(&mut self, signal: Signal) {
-        self.add_raw(signal as i32);
     }
 
     pub(super) fn add_raw(&mut self, signal: libc::c_int) {
@@ -465,14 +474,23 @@ impl SigSet {
     }
 
     pub(super) fn wait_nohang(&self) -> Result<Option<libc::c_int>> {
-        let timeout = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
+        // musl's sigtimedwait can retry EINTR internally, outside the caller's
+        // finite cleanup budget. Ask the kernel once with a zero timeout.
+        let timeout = [0_i64; 2];
+        let mask_size = libc::SIGRTMAX().cast_unsigned().div_ceil(u8::BITS) as usize;
+        // SAFETY: the kernel reads its signal mask prefix and a zero timespec
+        // (the buffer fits both 32- and 64-bit time ABIs). No siginfo is requested.
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_rt_sigtimedwait,
+                self.as_ptr(),
+                std::ptr::null_mut::<libc::siginfo_t>(),
+                timeout.as_ptr(),
+                mask_size,
+            )
         };
-        // SAFETY: the set and timeout are initialized; no siginfo is requested.
-        let result = unsafe { libc::sigtimedwait(self.as_ptr(), std::ptr::null_mut(), &timeout) };
         if result >= 0 {
-            Ok(Some(result))
+            Ok(Some(result as libc::c_int))
         } else {
             match Errno::last() {
                 Errno::EAGAIN => Ok(None),
@@ -482,11 +500,19 @@ impl SigSet {
     }
 
     pub(super) fn thread_get_mask() -> Result<Self> {
+        Self::capture_thread_mask(None)
+    }
+
+    pub(super) fn block_on_thread(&self) -> Result<Self> {
+        Self::capture_thread_mask(Some(self))
+    }
+
+    fn capture_thread_mask(block: Option<&Self>) -> Result<Self> {
         // SAFETY: sigset_t is plain old data and is immediately written by pthread_sigmask.
         let mut set = unsafe { zeroed() };
-        // SAFETY: null new mask means query-only; oldset pointer is valid.
-        let rc =
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut set) };
+        let mask = block.map_or(std::ptr::null(), Self::as_ptr);
+        // SAFETY: a null mask queries only. Any supplied set is valid during the call.
+        let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, mask, &raw mut set) };
         if rc == 0 {
             Ok(Self(set))
         } else {
@@ -511,47 +537,16 @@ impl SigSet {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct PollFlags(libc::c_short);
 
 impl PollFlags {
-    pub(super) const POLLIN: Self = Self(libc::POLLIN);
-    pub(super) const POLLERR: Self = Self(libc::POLLERR);
-    pub(super) const POLLHUP: Self = Self(libc::POLLHUP);
-    pub(super) const POLLNVAL: Self = Self(libc::POLLNVAL);
-
-    pub(super) const fn empty() -> Self {
-        Self(0)
+    pub(super) const fn readable(self) -> bool {
+        self.0 & libc::POLLIN != 0
     }
 
-    pub(super) const fn contains(self, other: Self) -> bool {
-        (self.0 & other.0) == other.0
-    }
-
-    pub(super) const fn intersects(self, other: Self) -> bool {
-        (self.0 & other.0) != 0
-    }
-}
-
-#[repr(transparent)]
-pub(super) struct PollFd(libc::pollfd);
-
-impl PollFd {
-    pub(super) fn new(fd: BorrowedFd<'_>, events: PollFlags) -> Self {
-        Self(libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events: events.0,
-            revents: 0,
-        })
-    }
-
-    pub(super) const fn revents(&self) -> Option<PollFlags> {
-        if self.0.revents == 0 {
-            None
-        } else {
-            Some(PollFlags(self.0.revents))
-        }
+    pub(super) const fn failed(self) -> bool {
+        self.0 & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
     }
 }
 
@@ -563,18 +558,13 @@ impl PollTimeout {
     pub(super) const BLOCK: Self = Self(-1);
     pub(super) const MAX: Self = Self(i32::MAX);
 
+    pub(super) fn from_duration(duration: Duration) -> Self {
+        let millis = duration.as_nanos().div_ceil(1_000_000);
+        i32::try_from(millis).map_or(Self::MAX, Self)
+    }
+
     const fn as_millis(self) -> i32 {
         self.0
-    }
-}
-
-impl TryFrom<Duration> for PollTimeout {
-    type Error = ();
-
-    fn try_from(value: Duration) -> std::result::Result<Self, Self::Error> {
-        let millis = value.as_millis();
-        let bounded = i32::try_from(millis).map_err(|_| ())?;
-        Ok(Self(bounded))
     }
 }
 
@@ -599,8 +589,37 @@ impl SignalFd {
         }
     }
 
+    pub(super) fn poll(&self, timeout: PollTimeout) -> Result<PollFlags> {
+        let mut fd = libc::pollfd {
+            fd: self.fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: fd describes the owned signal descriptor and lives through poll.
+        if unsafe { libc::poll(&raw mut fd, 1, timeout.as_millis()) } == -1 {
+            return Err(Errno::last());
+        }
+        Ok(PollFlags(fd.revents))
+    }
+
     pub(super) fn accepts(&self, signal: libc::c_int) -> bool {
         self.signals.contains_raw(signal)
+    }
+
+    pub(super) fn with_filter<T>(
+        &mut self,
+        signals: &SigSet,
+        read: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
+        let fd = self.fd.as_raw_fd();
+        let set_filter = |signals: &SigSet| {
+            // SAFETY: signalfd updates this existing descriptor in place.
+            errno_unit(unsafe { libc::signalfd(fd, signals.as_ptr(), 0) })
+        };
+        set_filter(signals)?;
+        let result = read(self);
+        set_filter(&self.signals)?;
+        result
     }
 
     pub(super) fn read_signal(&mut self) -> Result<Option<libc::signalfd_siginfo>> {
@@ -631,16 +650,10 @@ impl SignalFd {
     }
 }
 
-impl AsFd for SignalFd {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        self.fd.as_fd()
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WaitStatus {
     Exited(Pid, i32),
-    Signaled(Pid, i32, bool),
+    Signaled(Pid, i32),
     Stopped(Pid, i32),
     Continued(Pid),
     StillAlive,
@@ -651,11 +664,7 @@ impl WaitStatus {
         if libc::WIFEXITED(status) {
             Ok(Self::Exited(pid, libc::WEXITSTATUS(status)))
         } else if libc::WIFSIGNALED(status) {
-            Ok(Self::Signaled(
-                pid,
-                libc::WTERMSIG(status),
-                libc::WCOREDUMP(status),
-            ))
+            Ok(Self::Signaled(pid, libc::WTERMSIG(status)))
         } else if libc::WIFSTOPPED(status) {
             Ok(Self::Stopped(pid, libc::WSTOPSIG(status)))
         } else if libc::WIFCONTINUED(status) {
@@ -689,12 +698,50 @@ pub(super) fn exec_program(program: &CString, argv_ptrs: &[*const libc::c_char])
     Err(Errno::last())
 }
 
-pub(super) fn check_executable_access(path: &CStr) -> Result<()> {
-    // SAFETY: path is NUL-terminated. Check the effective credentials used by
-    // execve, rather than accepting execute bits belonging to another user.
-    errno_unit(unsafe {
-        libc::faccessat(libc::AT_FDCWD, path.as_ptr(), libc::X_OK, libc::AT_EACCESS)
-    })
+pub(super) fn may_execute_at(fd: libc::c_int, path: &CStr) -> Result<bool> {
+    let mut flags = libc::AT_EACCESS;
+    if path.is_empty() {
+        flags |= libc::AT_EMPTY_PATH;
+    }
+    // SAFETY: path is NUL-terminated. An empty path refers to the pinned fd.
+    let result = errno_unit(unsafe {
+        libc::syscall(libc::SYS_faccessat2, fd, path.as_ptr(), libc::X_OK, flags) as libc::c_int
+    });
+    let result = match result {
+        Err(Errno::ENOSYS | Errno::EINVAL | Errno::EPERM) if access_uses_exec_credentials() => {
+            let fd_path;
+            let path = if path.is_empty() {
+                fd_path = CString::new(format!("/proc/self/fd/{fd}")).map_err(|_| Errno::EINVAL)?;
+                &fd_path
+            } else {
+                path
+            };
+            // SAFETY: the pathname refers to the same candidate as the original probe.
+            errno_unit(unsafe { libc::access(path.as_ptr(), libc::X_OK) })
+        }
+        result => result,
+    };
+    match result {
+        Err(Errno::EACCES) => Ok(false),
+        result => result.map(|()| true),
+    }
+}
+
+fn access_uses_exec_credentials() -> bool {
+    let mut header = [0x2008_0522u32, 0]; // Linux capability ABI v3, current thread.
+    let mut data = [[0u32; 3]; 2]; // Effective, permitted, inheritable.
+    // access(2) uses the real IDs and either root's permitted capabilities or none.
+    // SAFETY: the invalid -1 ID queries the filesystem IDs without changing them.
+    // capget receives the header and two writable capability triples required by v3.
+    unsafe {
+        let uid = libc::getuid();
+        libc::setfsuid(libc::uid_t::MAX).cast_unsigned() == uid
+            && libc::setfsgid(libc::gid_t::MAX).cast_unsigned() == libc::getgid()
+            && libc::syscall(libc::SYS_capget, header.as_mut_ptr(), data.as_mut_ptr()) == 0
+            && data
+                .into_iter()
+                .all(|[effective, permitted, _]| effective == if uid == 0 { permitted } else { 0 })
+    }
 }
 
 pub(super) fn set_process_group(pid: Pid, pgid: Pid) -> Result<()> {
@@ -718,57 +765,39 @@ pub(super) fn parent_process_id() -> Pid {
 }
 
 pub(super) fn waitpid_any_nohang() -> Result<WaitStatus> {
-    let mut status = 0;
-    let options = libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED;
-    // SAFETY: we pass a valid mutable pointer and request nonblocking child status updates.
-    let rc = unsafe { libc::waitpid(-1, &raw mut status, options) };
-    match rc {
-        0 => Ok(WaitStatus::StillAlive),
-        -1 => Err(Errno::last()),
-        pid => WaitStatus::from_raw(Pid::from_raw(pid), status),
-    }
+    waitpid(-1, libc::WNOHANG | libc::WUNTRACED | libc::WCONTINUED)
 }
 
 pub(super) fn waitpid_child(pid: Pid) -> Result<WaitStatus> {
-    let mut status = 0;
-    // SAFETY: status is writable and pid identifies the managed child to reap.
-    let rc = unsafe { libc::waitpid(pid.as_raw(), &raw mut status, 0) };
-    if rc == -1 {
-        Err(Errno::last())
-    } else {
-        WaitStatus::from_raw(Pid::from_raw(rc), status)
-    }
+    waitpid(pid.as_raw(), 0)
+}
+
+pub(super) fn child_has_waitable_transition(pid: Pid) -> Result<bool> {
+    let mut info = unsafe { zeroed::<libc::siginfo_t>() };
+    // Inspect a change since the last wait without consuming the next SIGCHLD report.
+    errno_unit(unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid.as_raw().cast_unsigned(),
+            &raw mut info,
+            libc::WNOHANG | libc::WNOWAIT | libc::WCONTINUED | libc::WSTOPPED | libc::WEXITED,
+        )
+    })?;
+    Ok(unsafe { info.si_pid() } != 0)
 }
 
 pub(super) fn waitpid_group_nohang(pgid: Pid) -> Result<WaitStatus> {
+    waitpid(-pgid.as_raw(), libc::WNOHANG)
+}
+
+fn waitpid(selector: libc::pid_t, options: libc::c_int) -> Result<WaitStatus> {
     let mut status = 0;
-    // SAFETY: a negative PID selects children in this process group only.
-    let rc = unsafe { libc::waitpid(-pgid.as_raw(), &raw mut status, libc::WNOHANG) };
-    match rc {
+    // SAFETY: status points to writable storage for the selected child's state.
+    match unsafe { libc::waitpid(selector, &raw mut status, options) } {
         0 => Ok(WaitStatus::StillAlive),
         -1 => Err(Errno::last()),
         pid => WaitStatus::from_raw(Pid::from_raw(pid), status),
     }
-}
-
-pub(super) fn poll_fds(fds: &mut [PollFd], timeout: PollTimeout) -> Result<()> {
-    let nfds = libc::nfds_t::try_from(fds.len()).map_err(|_| Errno::EINVAL)?;
-    for fd in fds.iter_mut() {
-        fd.0.revents = 0;
-    }
-    // SAFETY: PollFd is a transparent wrapper over libc::pollfd, so this slice is a valid
-    // contiguous pollfd array for the duration of the call.
-    let rc = unsafe {
-        libc::poll(
-            fds.as_mut_ptr().cast::<libc::pollfd>(),
-            nfds,
-            timeout.as_millis(),
-        )
-    };
-    if rc == -1 {
-        return Err(Errno::last());
-    }
-    Ok(())
 }
 
 pub(super) fn new_signal_fd(block: &SigSet) -> Result<SignalFd> {
@@ -823,20 +852,31 @@ mod tests {
     }
 
     #[test]
-    fn poll_timeout_from_duration_uses_millis() {
-        assert_eq!(
-            PollTimeout::try_from(Duration::from_millis(25))
-                .unwrap()
-                .as_millis(),
-            25
-        );
+    fn poll_timeout_from_duration_rounds_up_and_caps_at_the_kernel_limit() {
+        for (duration, millis) in [
+            (Duration::ZERO, 0),
+            (Duration::from_nanos(1), 1),
+            (Duration::from_millis(25), 25),
+            (Duration::from_micros(25_001), 26),
+            (
+                Duration::from_millis(i32::MAX as u64) + Duration::from_nanos(1),
+                i32::MAX,
+            ),
+            (Duration::MAX, i32::MAX),
+        ] {
+            assert_eq!(PollTimeout::from_duration(duration).as_millis(), millis);
+        }
     }
 
     #[test]
-    fn poll_flags_detect_intersections() {
-        assert!(PollFlags::POLLIN.contains(PollFlags::POLLIN));
-        assert!(!PollFlags::POLLIN.intersects(PollFlags::POLLERR));
-        assert!(PollFlags::POLLERR.intersects(PollFlags::POLLERR));
+    fn signal_fd_poll_flags_report_readiness_and_errors() {
+        assert!(!PollFlags(0).readable());
+        assert!(!PollFlags(0).failed());
+        assert!(PollFlags(libc::POLLIN).readable());
+        assert!(!PollFlags(libc::POLLIN).failed());
+        for flag in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
+            assert!(PollFlags(libc::POLLIN | flag).failed());
+        }
     }
 
     #[test]
@@ -844,7 +884,7 @@ mod tests {
         let pid = Pid::from_raw(42);
         assert_eq!(
             WaitStatus::from_raw(pid, libc::SIGXCPU).unwrap(),
-            WaitStatus::Signaled(pid, libc::SIGXCPU, false)
+            WaitStatus::Signaled(pid, libc::SIGXCPU)
         );
     }
 

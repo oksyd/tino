@@ -22,28 +22,7 @@ pub(crate) fn escape_path(path: &Path) -> String {
 }
 
 pub(crate) fn escape_bytes(bytes: &[u8]) -> String {
-    let mut escaped = String::with_capacity(bytes.len());
-    for &byte in bytes {
-        match byte {
-            b'\n' => escaped.push_str("\\n"),
-            b'\r' => escaped.push_str("\\r"),
-            b'\t' => escaped.push_str("\\t"),
-            b'\\' => escaped.push_str("\\\\"),
-            b'\'' => escaped.push_str("\\'"),
-            b'"' => escaped.push_str("\\\""),
-            0x20..=0x7e => escaped.push(char::from(byte)),
-            _ => push_hex_byte(&mut escaped, byte),
-        }
-    }
-    escaped
-}
-
-fn push_hex_byte(out: &mut String, byte: u8) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    out.push_str("\\x");
-    out.push(char::from(HEX[usize::from(byte >> 4)]));
-    out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    bytes.escape_ascii().to_string()
 }
 
 #[cfg(test)]

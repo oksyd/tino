@@ -1,15 +1,16 @@
+use std::cell::Cell;
 use std::fmt;
 #[cfg(target_os = "linux")]
 use std::fmt::Write as _;
 #[cfg(not(target_os = "linux"))]
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::mem::DropGuard;
 
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
 enum Level {
-    Warn = 1,
-    Info = 2,
-    Debug = 3,
+    Warn,
+    Info,
+    Debug,
 }
 
 impl Level {
@@ -22,15 +23,18 @@ impl Level {
     }
 }
 
-static MAX_LEVEL: AtomicU8 = AtomicU8::new(Level::Warn as u8);
+thread_local! {
+    static MAX_LEVEL: Cell<Level> = const { Cell::new(Level::Warn) };
+}
 
-pub(crate) fn init(verbosity: u8) {
+pub(crate) fn with_verbosity<T>(verbosity: u8, run: impl FnOnce() -> T) -> T {
     let level = match verbosity {
         0 => Level::Warn,
         1 => Level::Info,
         _ => Level::Debug,
     };
-    MAX_LEVEL.store(level as u8, Ordering::Relaxed);
+    let _restore = DropGuard::new(MAX_LEVEL.replace(level), |previous| MAX_LEVEL.set(previous));
+    run()
 }
 
 pub(crate) fn debug_enabled() -> bool {
@@ -50,58 +54,54 @@ pub(crate) fn debug(args: fmt::Arguments<'_>) {
 }
 
 fn enabled(level: Level) -> bool {
-    (level as u8) <= MAX_LEVEL.load(Ordering::Relaxed)
-}
-
-#[cfg(test)]
-pub(crate) fn reset_for_test() {
-    init(0);
-}
-
-#[cfg(test)]
-pub(crate) fn test_lock() -> std::sync::MutexGuard<'static, ()> {
-    use std::sync::{Mutex, OnceLock};
-
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
-        .lock()
-        .expect("logging test lock poisoned")
+    level <= MAX_LEVEL.get()
 }
 
 fn log(level: Level, args: fmt::Arguments<'_>) {
-    if !enabled(level) {
-        return;
+    if enabled(level) {
+        stderr_line(format_args!("{} tino: {args}", level.as_str()));
     }
+}
 
+pub(crate) fn stderr_line(args: fmt::Arguments<'_>) {
     #[cfg(target_os = "linux")]
     let Some(mut stderr) = crate::platform::unix::sys::DiagnosticWriter::stderr() else {
         return;
     };
     #[cfg(not(target_os = "linux"))]
     let mut stderr = io::stderr().lock();
-    let _ = writeln!(stderr, "{} tino: {}", level.as_str(), args);
+    let _ = writeln!(stderr, "{args}");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn init_maps_verbosity_to_expected_levels() {
-        let _lock = test_lock();
+    fn failed_explain_restores_log_verbosity_for_the_next_call() {
+        let cli = crate::Cli::try_parse_from(["tino", "-vv", "--explain", "--", ""]).unwrap();
+        assert_eq!(crate::run(cli).unwrap_err().exit_code(), 2);
+        assert!(!debug_enabled());
+    }
 
-        reset_for_test();
+    #[test]
+    fn verbose_calls_do_not_enable_debug_on_other_threads() {
+        with_verbosity(2, || {
+            assert!(debug_enabled());
+            assert!(!std::thread::spawn(debug_enabled).join().unwrap());
+        });
+    }
+
+    #[test]
+    fn verbosity_maps_to_expected_levels() {
         assert!(!enabled(Level::Info));
         assert!(!debug_enabled());
 
-        init(1);
-        assert!(enabled(Level::Info));
-        assert!(!debug_enabled());
-
-        init(2);
-        assert!(enabled(Level::Info));
-        assert!(debug_enabled());
-
-        reset_for_test();
+        with_verbosity(1, || {
+            assert!(enabled(Level::Info));
+            assert!(!debug_enabled());
+        });
+        assert!(!enabled(Level::Info));
     }
 }

@@ -1,0 +1,8 @@
+pub const RUNTIME_ENV: [&str; 6] = [
+    "TINO_SUBREAPER",
+    "TINO_KILL_PROCESS_GROUP",
+    "TINO_VERBOSITY",
+    "TINI_SUBREAPER",
+    "TINI_KILL_PROCESS_GROUP",
+    "TINI_VERBOSITY",
+];

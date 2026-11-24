@@ -3,6 +3,7 @@
 import argparse
 import json
 import pathlib
+import urllib.parse
 import urllib.request
 
 
@@ -35,33 +36,31 @@ def main() -> int:
 
     repo_root = pathlib.Path(__file__).resolve().parent.parent
 
-    commit = fetch_json(f"https://api.github.com/repos/moby/profiles/commits/{args.ref}")
+    ref = urllib.parse.quote(args.ref, safe="")
+    commit = fetch_json(f"https://api.github.com/repos/moby/profiles/commits/{ref}")
     sha = commit["sha"]
 
     profile = fetch_json(
         f"https://raw.githubusercontent.com/moby/profiles/{sha}/seccomp/default.json"
     )
 
-    names = [
+    missing = {
         "landlock_add_rule",
         "landlock_create_ruleset",
         "landlock_restrict_self",
-    ]
+    }
 
     syscalls = profile.setdefault("syscalls", [])
-    allowed = False
-    for entry in syscalls:
-        if entry.get("action") != "SCMP_ACT_ALLOW":
-            continue
-        existing = set(entry.get("names") or [])
-        if set(names).issubset(existing):
-            allowed = True
-            break
+    for rule in syscalls:
+        if rule.get("action") == "SCMP_ACT_ALLOW" and not any(
+            rule.get(key) for key in ("args", "includes", "excludes")
+        ):
+            missing.difference_update(rule.get("names") or ())
 
-    if not allowed:
+    if missing:
         syscalls.append(
             {
-                "names": names,
+                "names": sorted(missing),
                 "action": "SCMP_ACT_ALLOW",
                 "comment": "Allow Landlock syscalls for tino access restrictions",
             }

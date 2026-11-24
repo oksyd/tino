@@ -35,10 +35,15 @@ fn require_abi(version: u32) -> bool {
 
 fn run_policy(config: &LandlockConfig, args: &[&str]) -> i32 {
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
-    let (program, argv) = prepare_resolved_command(&args).expect("prepare policy probe");
     let mask = SigSet::thread_get_mask().expect("read test signal mask");
-    let pid = spawn_child(&mask, None, Some(config), false, None, &program, &argv)
+    let signals = ChildSignals {
+        mask: &mask,
+        ignore_sigchld: false,
+        pdeath: None,
+    };
+    let pid = spawn_child(signals, Some(config), false, None, args, None)
         .expect("spawn policy probe")
+        .0
         .as_raw();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -152,18 +157,28 @@ fn disappearing_exec_candidates_do_not_disable_execution_restrictions() {
     let candidate = root.join("allowed");
     std::fs::copy("/bin/true", &candidate).unwrap();
     let mut context = ExecContext::inherited();
-    context
-        .environment
-        .insert("PATH".into(), root.0.as_os_str().to_owned());
-    let candidates = executable_paths_in_search_path("allowed", &context.search_path(), None);
+    Rc::make_mut(&mut context.environment).insert("PATH".into(), root.0.as_os_str().to_owned());
+    let candidates = executable_paths_in_search_path(
+        "allowed",
+        &context.search_path(default_exec_search_path),
+        None,
+    );
     assert_eq!(candidates, vec![candidate.clone()]);
 
     // A PATH match can disappear between discovery and pinning. Optional
     // candidate probing tolerates that race, leaving no executable grants.
     std::fs::remove_file(&candidate).unwrap();
     let mut paths = PinnedPaths::new();
-    insert_exec_search_candidates(&mut paths, candidates, &mut ExecVisits::new(), &context)
-        .unwrap();
+    for mode in [ExecAllowMode::Strict, ExecAllowMode::Auto] {
+        let result = insert_exec_search_candidates(
+            &mut paths,
+            candidates.clone(),
+            &mut ExecVisits::new(),
+            mode,
+            &context,
+        );
+        assert_eq!(result.is_ok(), mode == ExecAllowMode::Auto, "{result:?}");
+    }
     assert!(paths.is_empty());
     let mut config = build_landlock_config(&Cli {
         write_restrict: true,
@@ -236,9 +251,8 @@ fn interpreter_discovery_reads_validated_inode_after_replacement() {
     let pinned = PinnedPath::open(&script, PathRuleKind::Any).unwrap();
     std::fs::rename(&script, root.join("saved")).unwrap();
     std::fs::write(&script, b"#!/bin/false\n").unwrap();
-    let interpreters = detect_exec_interpreters_in_context(&pinned, &ExecContext::inherited())
-        .expect("inspect pinned script");
-    assert!(
-        matches!(&interpreters[..], [ExecInterpreter::Candidate(path)] if path == Path::new("/bin/sh"))
+    assert_eq!(
+        detect_pinned_exec_interpreter(&pinned).expect("inspect pinned script"),
+        Some(ExecInterpreter::Candidate(PathBuf::from("/bin/sh")))
     );
 }

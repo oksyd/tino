@@ -11,36 +11,12 @@ env:
   GHCR_IMAGE: ghcr.io/oksyd/tino
 
 jobs:
-  prepare:
-    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 10
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-
-      - name: Validate image version
-        shell: bash
-        run: |
-          version="$GITHUB_REF_NAME"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "image tag must match MAJOR.MINOR.PATCH: ${version}" >&2
-            exit 1
-          fi
-
-          package_version="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml)"
-          if [ "$package_version" != "$version" ]; then
-            echo "Cargo.toml version ${package_version} does not match image tag ${version}" >&2
-            exit 1
-          fi
-
   build:
-    needs: prepare
     name: build (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    outputs:
+      platform-count: ${{ strategy.job-total }}
     permissions:
       contents: read
       packages: write
@@ -97,9 +73,7 @@ jobs:
           retention-days: 1
 
   publish:
-    needs:
-      - prepare
-      - build
+    needs: build
     name: manifest
     runs-on: ubuntu-26.04
     timeout-minutes: 10
@@ -137,6 +111,8 @@ jobs:
 
       - name: Create and push manifest list
         shell: bash
+        env:
+          EXPECTED_DIGESTS: ${{ needs.build.outputs.platform-count }}
         run: |
           version="$GITHUB_REF_NAME"
           latest_version="$(
@@ -151,13 +127,13 @@ jobs:
           fi
 
           sources=()
-          while IFS= read -r digest_file; do
-            digest="$(basename "$digest_file")"
-            sources+=("${GHCR_IMAGE}@sha256:${digest}")
-          done < <(find "${RUNNER_TEMP}/digests" -type f -printf '%p\n' | sort)
-
-          if [ "${#sources[@]}" -eq 0 ]; then
-            echo "no image digests found" >&2
+          for digest_file in "$RUNNER_TEMP"/digests/*; do
+            if [[ -f "$digest_file" ]]; then
+              sources+=("${GHCR_IMAGE}@sha256:${digest_file##*/}")
+            fi
+          done
+          if [[ ${#sources[@]} != "$EXPECTED_DIGESTS" ]]; then
+            echo "expected $EXPECTED_DIGESTS image digests, found ${#sources[@]}" >&2
             exit 1
           fi
 

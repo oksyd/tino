@@ -36,7 +36,7 @@ jobs:
           "$RUNNER_TEMP/actionlint"
 
       - name: Install Rust toolchain
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy --target x86_64-unknown-linux-musl
 
       - name: Verify package version matches tag
         if: ${{ github.ref_type == 'tag' }}
@@ -46,8 +46,7 @@ jobs:
             echo "release tag must match MAJOR.MINOR.PATCH: ${GITHUB_REF_NAME}" >&2
             exit 1
           fi
-          package_id="$(cargo pkgid --locked)"
-          package_version="${package_id##*#}"
+          package_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
           if [ "$package_version" != "$GITHUB_REF_NAME" ]; then
             echo "Cargo.toml version ${package_version} does not match tag ${GITHUB_REF_NAME}" >&2
             exit 1
@@ -67,7 +66,13 @@ jobs:
 
       - name: Validate bundled seccomp profile
         run: |
-          python3 -c "import json; json.load(open('seccomp-landlock.json', encoding='utf-8')); print('seccomp-landlock.json OK')"
+          cargo package --locked --list | grep -Fx seccomp-landlock.json
+          jq -e '
+            ["landlock_add_rule", "landlock_create_ruleset", "landlock_restrict_self"] -
+            [.syscalls[] | select(.action == "SCMP_ACT_ALLOW" and
+              (.args | length) == 0 and (.includes | length) == 0 and (.excludes | length) == 0)
+             | .names[]?] == []
+          ' seccomp-landlock.json >/dev/null
           test -s seccomp-landlock.upstream.sha
 
       - name: Format
@@ -82,7 +87,10 @@ jobs:
       - name: Run tests
         env:
           TINO_TEST_REQUIRE_LANDLOCK: '1'
-        run: cargo nextest run --all-features --locked
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C linker=rust-lld
+        run: |
+          cargo nextest run --all-features --locked
+          cargo nextest run --all-features --locked --target x86_64-unknown-linux-musl
 
       - name: Run doc tests
         run: cargo test --doc --all-features --locked
@@ -114,11 +122,61 @@ jobs:
           ENTRYPOINT ["/sbin/tino"]
           EOF
 
+      - name: Verify config creation and replacement permissions
+        run: |
+          profile="$RUNNER_TEMP/config-seccomp.json"
+          jq '.syscalls[].names -= ["fsetxattr", "fremovexattr"]' seccomp-landlock.json > "$profile"
+          docker run --rm --security-opt "seccomp=$profile" \
+            --user 65534:65534 --tmpfs /etc/tino:uid=65534,gid=65534,mode=0700 \
+            --entrypoint /bin/sh tino:e2e-shell -ec '
+              config=/etc/tino/tino.conf
+              umask 077
+              /sbin/tino --write-config
+              test "$(stat -c %a "$config")" = 600
+              chmod 200 "$config"
+              /sbin/tino --write-config --subreaper
+              test ! -r "$config"
+              chmod 600 "$config"
+              test "$(cat "$config")" = subreaper
+              chmod 300 /etc/tino
+              status=0
+              /sbin/tino --write-config --pgroup-kill || status=$?
+              test "$status" = 1
+              test "$(cat "$config")" = subreaper
+            '
+
+      - name: Verify PID 1 waits for workers after a stop signal
+        run: |
+          # PID 1 adopts orphans even when PR_SET/GET_CHILD_SUBREAPER (36/37) are blocked.
+          profile="$RUNNER_TEMP/pid1-seccomp.json"
+          jq '.syscalls[].names -= ["prctl"] | .syscalls += [
+            {op:"SCMP_CMP_LT", value:36}, {op:"SCMP_CMP_GT", value:37} |
+            {names:["prctl"], action:"SCMP_ACT_ALLOW", args:[. + {index:0}]}
+          ]' seccomp-landlock.json > "$profile"
+          output=$(docker run --rm --security-opt "seccomp=$profile" tino:e2e-shell -s -e 42 -- sh -ec '
+            mkfifo /tmp/stop-worker
+            (read -r stop < /tmp/stop-worker && sleep 1 && echo drained) &
+            trap "echo stop > /tmp/stop-worker; exit 42" TERM
+            kill -TERM 1
+            wait
+          ')
+          test "$output" = drained
+
       - name: Verify Landlock with Docker seccomp
         run: |
           seccomp_profile="$(pwd)/seccomp-landlock.json"
-          deny_stdout="$(mktemp)"
-          deny_stderr="$(mktemp)"
+
+          docker run --rm --security-opt "seccomp=${seccomp_profile}" \
+            --entrypoint /bin/sh tino:e2e-shell -ec '
+              mkdir -p /usr/local/bin
+              printf "%s\n" "#!/bin/sh" "exit 42" > /usr/local/bin/tino-path-probe
+              printf "%s\n" "#!/usr/bin/env tino-path-probe" > /tmp/tino-entry
+              chmod +x /usr/local/bin/tino-path-probe /tmp/tino-entry
+              unset PATH
+              /sbin/tino -e 42 --exec-allow /bin/sh -- tino-path-probe
+              /sbin/tino -e 42 --exec-allow tino-path-probe -- tino-path-probe
+              /sbin/tino -e 42 --exec-allow /bin/sh -- /tmp/tino-entry
+            '
 
           docker run --rm \
             --security-opt "seccomp=${seccomp_profile}" \
@@ -126,23 +184,43 @@ jobs:
             --write-restrict --write-allow /data/logs -- \
             sh -c 'echo ok > /data/logs/ok && test "$(cat /data/logs/ok)" = ok'
 
-          if docker run --rm \
+          status=0
+          docker run --rm \
             --security-opt "seccomp=${seccomp_profile}" \
             tino:e2e-shell \
             --write-restrict --write-allow /data/logs -- \
-            sh -c 'echo denied > /tmp/deny' >"$deny_stdout" 2>"$deny_stderr"; then
-            echo "expected write outside /data/logs to fail" >&2
-            cat "$deny_stdout" >&2
-            cat "$deny_stderr" >&2
+            sh -c 'echo denied > /tmp/deny || exit 42' || status=$?
+          if [ "$status" -ne 42 ]; then
+            echo "expected the denied write to exit 42, got $status" >&2
             exit 1
           fi
 
+      - name: Check startup when Landlock is unavailable
+        run: |
+          profile="$RUNNER_TEMP/landlock-unavailable.json"
+          jq '.syscalls[].names -= ["landlock_create_ruleset"]' seccomp-landlock.json > "$profile"
+          status=0
+          docker run --rm --security-opt "seccomp=$profile" tino:e2e-shell \
+            --write-restrict -e 1 -- /bin/true || status=$?
+          test "$status" -eq 1
+          docker run --rm --security-opt "seccomp=$profile" tino:e2e-shell \
+            --write-restrict --restrict-warn-only -- /bin/true
+
   docker-publish:
     if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
-    needs:
-      - build
-      - container-e2e
+    needs: container-e2e
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/docker.yaml
+
+  binary-release:
+    if: ${{ github.event_name == 'push' && github.ref_type == 'tag' }}
+    needs: container-e2e
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    uses: ./.github/workflows/release.yaml

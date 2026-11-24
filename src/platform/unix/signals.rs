@@ -3,40 +3,49 @@ use super::sys::{
     SigSet, Signal, SignalAction, SignalFd, current_process_id, new_signal_fd,
     send_process_group_signal, send_process_signal,
 };
-use crate::{Context, Result, bail, logging};
+use crate::{Context, Result, bail, logging, signals::strip_sig_prefix};
 
 const SIGNALS_EXCLUDED_FROM_SIGNALFD: &[Signal] =
     &[SIGFPE, SIGILL, SIGSEGV, SIGBUS, SIGABRT, SIGTRAP, SIGSYS];
 
-pub(super) struct ChildReapingRestore {
+pub(super) struct SignalDispositionRestore {
     action: SignalAction,
     active: bool,
 }
 
-impl ChildReapingRestore {
-    pub(super) fn enable() -> Result<Self> {
+impl SignalDispositionRestore {
+    fn new(action: SignalAction) -> Self {
+        Self {
+            action,
+            active: true,
+        }
+    }
+
+    pub(super) fn was_ignored(&self) -> bool {
+        self.action.is_ignored()
+    }
+
+    pub(super) fn enable_child_reaping() -> Result<Self> {
         SignalAction::set_default(SIGCHLD)
-            .map(|action| Self {
-                action,
-                active: true,
-            })
+            .map(Self::new)
             .context("reset SIGCHLD disposition")
     }
 
-    pub(super) fn finish(mut self) -> Result<()> {
+    pub(super) fn finish(mut self) -> super::sys::Result<()> {
         self.active = false;
-        self.action
-            .restore(SIGCHLD)
-            .context("restore SIGCHLD disposition")
+        self.action.restore()
     }
 }
 
-impl Drop for ChildReapingRestore {
+impl Drop for SignalDispositionRestore {
     fn drop(&mut self) {
         if self.active
-            && let Err(err) = self.action.restore(SIGCHLD)
+            && let Err(err) = self.action.restore()
         {
-            logging::warn(format_args!("restore SIGCHLD disposition failed: {err}"));
+            logging::warn(format_args!(
+                "restore signal {} disposition failed: {err}",
+                self.action.signal
+            ));
         }
     }
 }
@@ -55,75 +64,135 @@ pub(super) fn setup_signal_delivery() -> Result<(SigSet, SignalFd)> {
             );
         }
     }
-    let previous_mask = SigSet::thread_get_mask().context("sigprocmask")?;
     let pending_before = SigSet::pending().context("sigpending")?;
     let mut block = SigSet::all();
     for &signal in SIGNALS_EXCLUDED_FROM_SIGNALFD {
         block.remove(signal);
     }
-    // Excluded signals must not be consumed by signalfd, but they may already
-    // be blocked (and pending) in a library caller or the binary's launcher.
-    // Preserve those bits instead of unexpectedly delivering a fatal signal.
-    let mut supervisor_mask = block.clone();
-    for &signal in SIGNALS_EXCLUDED_FROM_SIGNALFD {
-        if previous_mask.contains_raw(signal as libc::c_int) {
-            supervisor_mask.add(signal);
-        }
-    }
     // Preserve signals already queued for the blocked caller. Later signals
     // with those numbers also remain with that backlog for this run. SIGCHLD
     // stays owned by supervision so inherited pending state cannot stop reaping.
     for signal in 1..=libc::SIGRTMAX() {
-        if signal != SIGCHLD as libc::c_int
-            && previous_mask.contains_raw(signal)
-            && pending_before.contains_raw(signal)
-        {
+        if signal != SIGCHLD as libc::c_int && pending_before.contains_raw(signal) {
             block.remove_raw(signal);
         }
     }
-    supervisor_mask.thread_set_mask().context("sigprocmask")?;
-
-    let signal_fd = match new_signal_fd(&block).context("signalfd") {
-        Ok(signal_fd) => signal_fd,
-        Err(err) => {
-            let _ = previous_mask.thread_set_mask();
-            return Err(err);
-        }
-    };
+    // Acquire the descriptor before changing the caller's mask. Both resources
+    // are ready before the first read, and failure needs no signal rollback.
+    let signal_fd = new_signal_fd(&block).context("signalfd")?;
+    // SIG_BLOCK keeps every caller-owned mask bit, including excluded signals.
+    let previous_mask = block.block_on_thread().context("sigprocmask")?;
 
     Ok((previous_mask, signal_fd))
 }
 
-pub(super) fn signal_by_name(name: &str) -> Option<Signal> {
-    crate::signals::signal_from_str(name)
-}
-
-struct SignalDispositionRestore {
-    signal: libc::c_int,
-    action: SignalAction,
-    active: bool,
-}
-
-impl SignalDispositionRestore {
-    fn finish(mut self) -> Result<()> {
-        self.active = false;
-        self.action
-            .restore_raw(self.signal)
-            .with_context(|| format!("restore signal {} disposition", self.signal))
+pub(crate) fn parse_stop_signal(raw: &str) -> Option<libc::c_int> {
+    let value = raw.trim();
+    // Real-time names depend on libc. Accept the runtime's numeric value.
+    let number = named_signal_number(strip_sig_prefix(value)).or_else(|| parse_decimal(value))?;
+    if !valid_signal_number(number)
+        || (32..libc::SIGRTMIN()).contains(&number)
+        || matches!(
+            number,
+            libc::SIGKILL | libc::SIGSTOP | libc::SIGCHLD | libc::SIGTTIN | libc::SIGTTOU
+        )
+        || SIGNALS_EXCLUDED_FROM_SIGNALFD
+            .iter()
+            .any(|&sig| sig as i32 == number)
+    {
+        return None;
     }
+    Some(number)
 }
 
-impl Drop for SignalDispositionRestore {
-    fn drop(&mut self) {
-        if self.active
-            && let Err(err) = self.action.restore_raw(self.signal)
-        {
-            logging::warn(format_args!(
-                "restore signal {} disposition failed: {err}",
-                self.signal
-            ));
-        }
+pub(super) fn signal_number(raw: &str, rtmin: libc::c_int) -> Option<libc::c_int> {
+    let signal = strip_sig_prefix(raw);
+    named_signal_number(signal)
+        .or_else(|| parse_decimal(signal).filter(|number| valid_signal_number(*number)))
+        .or_else(|| realtime_signal_number(signal, rtmin))
+}
+
+const NAMED_SIGNALS: &[(&str, libc::c_int)] = &[
+    ("HUP", libc::SIGHUP),
+    ("INT", libc::SIGINT),
+    ("QUIT", libc::SIGQUIT),
+    ("ILL", libc::SIGILL),
+    ("TRAP", libc::SIGTRAP),
+    ("ABRT", libc::SIGABRT),
+    ("IOT", libc::SIGABRT),
+    ("BUS", libc::SIGBUS),
+    ("FPE", libc::SIGFPE),
+    ("KILL", libc::SIGKILL),
+    ("USR1", libc::SIGUSR1),
+    ("SEGV", libc::SIGSEGV),
+    ("USR2", libc::SIGUSR2),
+    ("PIPE", libc::SIGPIPE),
+    ("ALRM", libc::SIGALRM),
+    ("TERM", libc::SIGTERM),
+    ("STKFLT", libc::SIGSTKFLT),
+    ("CHLD", libc::SIGCHLD),
+    ("CLD", libc::SIGCHLD),
+    ("CONT", libc::SIGCONT),
+    ("STOP", libc::SIGSTOP),
+    ("TSTP", libc::SIGTSTP),
+    ("TTIN", libc::SIGTTIN),
+    ("TTOU", libc::SIGTTOU),
+    ("URG", libc::SIGURG),
+    ("XCPU", libc::SIGXCPU),
+    ("XFSZ", libc::SIGXFSZ),
+    ("VTALRM", libc::SIGVTALRM),
+    ("PROF", libc::SIGPROF),
+    ("WINCH", libc::SIGWINCH),
+    ("IO", libc::SIGPOLL),
+    ("POLL", libc::SIGPOLL),
+    ("PWR", libc::SIGPWR),
+    ("SYS", libc::SIGSYS),
+];
+
+fn named_signal_number(signal: &str) -> Option<libc::c_int> {
+    NAMED_SIGNALS
+        .iter()
+        .find_map(|&(name, number)| name.eq_ignore_ascii_case(signal).then_some(number))
+}
+
+pub(crate) fn signal_name(number: libc::c_int) -> Option<&'static str> {
+    NAMED_SIGNALS
+        .iter()
+        .find_map(|&(name, value)| (value == number).then_some(name))
+}
+
+fn valid_signal_number(number: libc::c_int) -> bool {
+    (1..=libc::SIGRTMAX()).contains(&number)
+}
+
+fn realtime_signal_number(signal: &str, rtmin: libc::c_int) -> Option<libc::c_int> {
+    let rtmax = libc::SIGRTMAX();
+
+    let signal = signal.to_ascii_uppercase();
+    if signal == "RTMIN" {
+        return Some(rtmin);
     }
+    if signal == "RTMAX" {
+        return Some(rtmax);
+    }
+    if let Some(offset) = signal.strip_prefix("RTMIN+").and_then(parse_decimal) {
+        return rtmin
+            .checked_add(offset)
+            .filter(|number| (rtmin..=rtmax).contains(number));
+    }
+    if let Some(offset) = signal.strip_prefix("RTMAX-").and_then(parse_decimal) {
+        return rtmax
+            .checked_sub(offset)
+            .filter(|number| (rtmin..=rtmax).contains(number));
+    }
+    None
+}
+
+fn parse_decimal(raw: &str) -> Option<libc::c_int> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 fn discard_pending_signal(signal: libc::c_int) -> Result<()> {
@@ -165,11 +234,7 @@ pub(super) fn restore_signal_delivery(previous_mask: &SigSet) -> Result<()> {
             && !previous_mask.contains_raw(signal)
         {
             match SignalAction::set_ignored_raw(signal) {
-                Ok(action) => restore.push(SignalDispositionRestore {
-                    signal,
-                    action,
-                    active: true,
-                }),
+                Ok(action) => restore.push(SignalDispositionRestore::new(action)),
                 Err(_) => {
                     if let Err(err) = discard_pending_signal(signal).with_context(|| {
                             format!("restore signal {signal}: pending signals could not be discarded; left blocked")
@@ -188,8 +253,12 @@ pub(super) fn restore_signal_delivery(previous_mask: &SigSet) -> Result<()> {
     let result = restore_mask
         .thread_set_mask()
         .context("restore signal mask");
-    for action in restore {
-        if let Err(err) = action.finish() {
+    for guard in restore {
+        let signal = guard.action.signal;
+        if let Err(err) = guard
+            .finish()
+            .with_context(|| format!("restore signal {signal} disposition"))
+        {
             failure.get_or_insert(err);
         }
     }
@@ -200,7 +269,7 @@ pub(super) fn restore_signal_delivery(previous_mask: &SigSet) -> Result<()> {
 pub(super) fn read_forwardable_signal(
     signal_fd: &mut SignalFd,
     budget: &mut usize,
-) -> Result<Option<libc::signalfd_siginfo>> {
+) -> super::sys::Result<Option<libc::signalfd_siginfo>> {
     while *budget > 0 {
         let Some(info) = signal_fd.read_signal()? else {
             return Ok(None);
@@ -221,7 +290,7 @@ pub(super) fn read_forwardable_signal(
     Ok(None)
 }
 
-pub(super) fn send_signal(pgid: bool, child: Pid, sig: libc::c_int) {
+pub(super) fn send_signal(pgid: bool, child: Pid, sig: libc::c_int) -> bool {
     let res = if pgid {
         send_process_group_signal(child, sig)
     } else {
@@ -232,4 +301,5 @@ pub(super) fn send_signal(pgid: bool, child: Pid, sig: libc::c_int) {
     {
         logging::warn(format_args!("forward signal {} failed: {}", sig, e));
     }
+    res.is_ok()
 }

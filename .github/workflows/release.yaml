@@ -1,16 +1,10 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - '*.*.*'
+  workflow_call:
 
 permissions:
   contents: read
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 env:
   PROJECT: tino
@@ -20,6 +14,8 @@ jobs:
     name: build-${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    outputs:
+      target-count: ${{ strategy.job-total }}
     env:
       RUSTUP_TOOLCHAIN: 1.100.0
     permissions:
@@ -35,27 +31,27 @@ jobs:
             target: x86_64-unknown-linux-gnu
             platform: linux/amd64
             asset-suffix: linux-x86_64-gnu
-            use-cross: false
+            builder: cargo
           - os: ubuntu-26.04
             target: x86_64-unknown-linux-musl
             platform: linux/amd64
             asset-suffix: linux-x86_64-musl
-            use-cross: true
+            builder: cross
           - os: ubuntu-26.04
             target: arm-unknown-linux-gnueabihf
             platform: linux/arm/v6
             asset-suffix: linux-arm-gnueabihf
-            use-cross: true
+            builder: cross
           - os: ubuntu-26.04
             target: aarch64-unknown-linux-musl
             platform: linux/arm64
             asset-suffix: linux-aarch64-musl
-            use-cross: true
+            builder: cross
           - os: ubuntu-26.04
             target: armv7-unknown-linux-gnueabihf
             platform: linux/arm/v7
             asset-suffix: linux-armv7-gnueabihf
-            use-cross: true
+            builder: cross
 
     steps:
       - name: Checkout
@@ -63,30 +59,8 @@ jobs:
         with:
           fetch-depth: 1
 
-      - name: Set version
-        id: version
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "release tag must match MAJOR.MINOR.PATCH: ${VERSION}" >&2
-            exit 1
-          fi
-          echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
-          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
-
       - name: Install Rust
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target '${{ matrix.target }}'
-
-      - name: Verify package version matches tag
-        shell: bash
-        run: |
-          package_id="$(cargo pkgid --locked)"
-          package_version="${package_id##*#}"
-          if [ "$package_version" != "${{ steps.version.outputs.VERSION }}" ]; then
-            echo "Cargo.toml version ${package_version} does not match tag ${{ steps.version.outputs.VERSION }}" >&2
-            exit 1
-          fi
 
       - name: Restore Rust cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -97,13 +71,8 @@ jobs:
             target
           key: rust-${{ matrix.os }}-${{ runner.arch }}-${{ matrix.target }}-${{ env.RUSTUP_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
 
-      - name: Setup native compilation
-        if: ${{ matrix.use-cross == false }}
-        shell: bash
-        run: echo "CARGO=cargo" >> "$GITHUB_ENV"
-
       - name: Setup cross compilation
-        if: ${{ matrix.use-cross == true }}
+        if: matrix.builder == 'cross'
         shell: bash
         run: |
           dir="$RUNNER_TEMP/cross"
@@ -115,27 +84,19 @@ jobs:
           curl -LSf -o cross.tar.gz "https://github.com/cross-rs/cross/releases/download/${cross_version}/cross-x86_64-unknown-linux-musl.tar.gz"
           echo "${cross_sha256}  cross.tar.gz" | sha256sum -c -
           tar xf cross.tar.gz
-          echo "CARGO=cross" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
-        run: |
-          : "${CARGO:=cargo}"
-          $CARGO build --locked --release --target ${{ matrix.target }}
-          if [ "${{ matrix.os }}" = "windows-latest" ]; then
-            echo "BIN_NAME=${{ env.PROJECT }}.exe" >> "$GITHUB_ENV"
-          else
-            echo "BIN_NAME=${{ env.PROJECT }}" >> "$GITHUB_ENV"
-          fi
+        run: ${{ matrix.builder }} build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           mkdir -p out
-          staging="${{ env.PROJECT }}-${{ env.PROJECT_VERSION }}-${{ matrix.asset-suffix }}"
+          staging="${{ env.PROJECT }}-${GITHUB_REF_NAME}-${{ matrix.asset-suffix }}"
           mkdir "$staging"
-          cp README.md LICENSE "$staging/"
-          cp "target/${{ matrix.target }}/release/${{ env.BIN_NAME }}" "$staging/"
+          cp -R README.md LICENSE assets seccomp-landlock.json "$staging/"
+          cp "target/${{ matrix.target }}/release/$PROJECT" "$staging/"
           asset="out/${staging}.tar.gz"
           tar czf "$asset" "$staging"
           sbom="out/${staging}.spdx.json"
@@ -173,7 +134,8 @@ jobs:
       - name: Upload release bundle
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.target }}
+          name: release-${{ matrix.target }}
+          if-no-files-found: error
           path: |
             ${{ env.ASSET }}
             ${{ env.SBOM }}
@@ -191,36 +153,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set version
-        id: version
-        shell: bash
-        run: |
-          VERSION="${GITHUB_REF#refs/tags/}"
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "release tag must match MAJOR.MINOR.PATCH: ${VERSION}" >&2
-            exit 1
-          fi
-          echo "VERSION=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "PROJECT_VERSION=${VERSION}" >> "$GITHUB_ENV"
-
       - name: Download artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
+          pattern: release-*
+          merge-multiple: true
 
       - name: Generate checksums
         shell: bash
+        working-directory: dist
+        env:
+          EXPECTED_TARGETS: ${{ needs.build.outputs.target-count }}
         run: |
-          cd dist
-          tmpfile="$(mktemp)"
-          while IFS= read -r -d '' file; do
-            line="$(sha256sum "$file")"
-            hash="${line%% *}"
-            printf '%s  %s\n' "$hash" "$(basename "$file")"
-          done < <(
-            find . -maxdepth 2 -type f ! -name SHA256SUMS -print0 | sort -z
-          ) > "$tmpfile"
-          mv "$tmpfile" SHA256SUMS
+          shopt -s nullglob
+          archives=(*.tar.gz)
+          sboms=(*.spdx.json)
+          if [[ ${#archives[@]} != "$EXPECTED_TARGETS" || ${#sboms[@]} != "$EXPECTED_TARGETS" ]]; then
+            echo "expected $EXPECTED_TARGETS archive/SBOM pairs, found ${#archives[@]} archives and ${#sboms[@]} SBOMs" >&2
+            exit 1
+          fi
+          for archive in "${archives[@]}"; do
+            sha256sum "$archive" "${archive%.tar.gz}.spdx.json"
+          done > SHA256SUMS
 
       - name: Generate changelog
         shell: bash
@@ -229,7 +184,8 @@ jobs:
           curl -fsSL -o "$archive" https://github.com/orhun/git-cliff/releases/download/v2.14.2/git-cliff-2.14.2-x86_64-unknown-linux-gnu.tar.gz
           echo "24f397c733add5390fdceee3a2088588ab0d5f944ce00d34cb7029b888cf2db4  $archive" | sha256sum -c -
           tar -xzf "$archive" -C "$RUNNER_TEMP"
-          "$RUNNER_TEMP/git-cliff-2.14.2/git-cliff" --latest --tag '${{ steps.version.outputs.VERSION }}' --strip header --output RELEASE_NOTES.md
+          "$RUNNER_TEMP/git-cliff-2.14.2/git-cliff" --latest --use-branch-tags \
+            --tag-pattern '^[0-9]+\.[0-9]+\.[0-9]+$' --strip header --output RELEASE_NOTES.md
 
       - name: Append release metadata
         shell: bash
@@ -240,11 +196,11 @@ jobs:
             echo
             echo '| OCI platform | Rust target | Release asset |'
             echo '| --- | --- | --- |'
-            echo "| \`linux/amd64\` | \`x86_64-unknown-linux-gnu\` | \`tino-${{ env.PROJECT_VERSION }}-linux-x86_64-gnu.tar.gz\` |"
-            echo "| \`linux/amd64\` | \`x86_64-unknown-linux-musl\` | \`tino-${{ env.PROJECT_VERSION }}-linux-x86_64-musl.tar.gz\` |"
-            echo "| \`linux/arm64\` | \`aarch64-unknown-linux-musl\` | \`tino-${{ env.PROJECT_VERSION }}-linux-aarch64-musl.tar.gz\` |"
-            echo "| \`linux/arm/v6\` | \`arm-unknown-linux-gnueabihf\` | \`tino-${{ env.PROJECT_VERSION }}-linux-arm-gnueabihf.tar.gz\` |"
-            echo "| \`linux/arm/v7\` | \`armv7-unknown-linux-gnueabihf\` | \`tino-${{ env.PROJECT_VERSION }}-linux-armv7-gnueabihf.tar.gz\` |"
+            echo "| \`linux/amd64\` | \`x86_64-unknown-linux-gnu\` | \`tino-${GITHUB_REF_NAME}-linux-x86_64-gnu.tar.gz\` |"
+            echo "| \`linux/amd64\` | \`x86_64-unknown-linux-musl\` | \`tino-${GITHUB_REF_NAME}-linux-x86_64-musl.tar.gz\` |"
+            echo "| \`linux/arm64\` | \`aarch64-unknown-linux-musl\` | \`tino-${GITHUB_REF_NAME}-linux-aarch64-musl.tar.gz\` |"
+            echo "| \`linux/arm/v6\` | \`arm-unknown-linux-gnueabihf\` | \`tino-${GITHUB_REF_NAME}-linux-arm-gnueabihf.tar.gz\` |"
+            echo "| \`linux/arm/v7\` | \`armv7-unknown-linux-gnueabihf\` | \`tino-${GITHUB_REF_NAME}-linux-armv7-gnueabihf.tar.gz\` |"
             echo
             echo '## Archive Layout'
             echo
@@ -254,7 +210,9 @@ jobs:
             echo 'tino-<version>-<os>-<arch>-<abi>/'
             echo '├── tino'
             echo '├── LICENSE'
-            echo '└── README.md'
+            echo '├── README.md'
+            echo '├── assets/logo.svg'
+            echo '└── seccomp-landlock.json'
             echo '```'
             echo
             echo '## Verification'
@@ -272,11 +230,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          tag="${{ steps.version.outputs.VERSION }}"
+          tag="$GITHUB_REF_NAME"
           title="tino ${tag}"
-          mapfile -t assets < <(find dist -maxdepth 2 -type f | sort)
           if gh release view "$tag" >/dev/null 2>&1; then
             echo "release ${tag} already exists; refusing to replace published assets" >&2
             exit 1
           fi
-          gh release create "$tag" "${assets[@]}" --title "$title" --notes-file RELEASE_NOTES.md
+          gh release create "$tag" dist/*.tar.gz dist/*.spdx.json dist/SHA256SUMS \
+            --verify-tag --title "$title" --notes-file RELEASE_NOTES.md
